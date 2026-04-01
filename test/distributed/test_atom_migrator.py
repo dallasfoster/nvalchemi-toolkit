@@ -552,15 +552,14 @@ class TestBuildBatchFromFields:
 
 
 class TestNeedsMigration:
-    """Test AtomMigrator.needs_migration (always returns True in POC)."""
+    """Test AtomMigrator.needs_migration (returns False in POC — disabled)."""
 
-    def test_always_true(self):
-        """needs_migration should return True regardless of input."""
-        # Create a minimal AtomMigrator by bypassing __init__
+    def test_returns_false_for_poc(self):
+        """needs_migration returns False (migration disabled until Verlet skin wired up)."""
         migrator = AtomMigrator.__new__(AtomMigrator)
         positions = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float64)
         batch = _make_batch(positions)
-        assert migrator.needs_migration(batch) is True
+        assert migrator.needs_migration(batch) is False
 
 
 class TestMigrateNoDistributed:

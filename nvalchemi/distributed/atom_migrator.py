@@ -189,10 +189,12 @@ class AtomMigrator:
     def needs_migration(self, local_batch: Batch) -> bool:
         """Check whether any atoms have left their domain.
 
-        For the POC this always returns ``True`` — the caller decides when
-        to invoke migration based on Verlet skin invalidation.
+        For the POC this returns ``False`` — migration is disabled until
+        Verlet skin invalidation detection is wired up.  At 300 K with
+        1 fs timestep, atoms move ~0.03 A/step which is well within the
+        ghost shell for hundreds of steps.
         """
-        return True
+        return False
 
     def migrate(self, local_batch: Batch) -> Batch:
         """Detect atoms that left this rank's domain and redistribute them.
@@ -247,31 +249,34 @@ class AtomMigrator:
         pdim = packed_dim(local_batch)
         dtype = local_batch.positions.dtype
 
-        # 6. Send phase: isend packed atom data to each destination rank.
-        send_reqs: list[dist.Work] = []
-        # Keep references so buffers are not collected before isend completes.
-        _send_bufs: list[torch.Tensor] = []
+        # 6-8. Exchange atom data using batch_isend_irecv to avoid
+        #       NCCL unbatched P2P communicator issues.
+        p2p_ops: list[dist.P2POp] = []
+        _send_bufs: list[torch.Tensor] = []  # prevent GC before send completes
+        recv_buffers: list[torch.Tensor] = []
+        recv_src_ranks: list[int] = []
+
         for r in range(world_size):
-            if r == rank or counts[r].item() == 0:
+            if r == rank:
                 continue
-            buf = pack_atom_fields(local_batch, send_indices[r])
-            _send_bufs.append(buf)
-            send_reqs.append(dist.isend(buf, dst=r, group=self.mesh.get_group()))
+            n_send = counts[r].item()
+            n_recv = recv_counts[r].item()
 
-        # 7. Recv phase: irecv from each rank that is sending atoms to us.
-        recv_buffers: list[torch.Tensor] = [
-            torch.empty(recv_counts[r].item(), pdim, dtype=dtype, device=device)
-            for r in range(world_size)
-            if r == rank or recv_counts[r].item() == 0
-        ]
-        recv_reqs: list[dist.Work] = [
-            dist.irecv(buf, src=r, group=self.mesh.get_group())
-            for r, buf in zip(range(world_size), recv_buffers)
-        ]
+            if n_send > 0:
+                buf = pack_atom_fields(local_batch, send_indices[r])
+                _send_bufs.append(buf)
+                p2p_ops.append(dist.P2POp(dist.isend, buf, r))
 
-        # 8. Wait for all communication to complete.
-        for req in send_reqs + recv_reqs:
-            req.wait()
+            if n_recv > 0:
+                recv_buf = torch.empty(n_recv, pdim, dtype=dtype, device=device)
+                recv_buffers.append(recv_buf)
+                recv_src_ranks.append(r)
+                p2p_ops.append(dist.P2POp(dist.irecv, recv_buf, r))
+
+        if p2p_ops:
+            reqs = dist.batch_isend_irecv(p2p_ops)
+            for req in reqs:
+                req.wait()
 
         # 9. Build the new local batch.
         #    Staying atoms: the slice of sorted_idx that maps to our rank.
