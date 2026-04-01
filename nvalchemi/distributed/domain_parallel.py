@@ -282,9 +282,15 @@ class DomainParallel(BaseDynamics):
             ``(updated_batch, converged)`` matching the ``BaseDynamics``
             return signature.
         """
+        logger.info(
+            "[rank %d] step %d: BEFORE_STEP hooks", self._domain_rank, self.step_count
+        )
         # 1. Outer BEFORE_STEP hooks
         self._call_hooks(DynamicsStage.BEFORE_STEP, batch)
 
+        logger.info(
+            "[rank %d] step %d: ghost exchange", self._domain_rank, self.step_count
+        )
         # 2. Ghost exchange
         if self._ghost_exchanger is not None:
             padded_batch, n_owned = self._ghost_exchanger.exchange(batch)
@@ -293,12 +299,25 @@ class DomainParallel(BaseDynamics):
             n_owned = batch.positions.shape[0]
         self._n_owned = n_owned
 
+        logger.info(
+            "[rank %d] step %d: prepare padded batch",
+            self._domain_rank,
+            self.step_count,
+        )
         # 3. Prepare padded batch (local AABB, pbc=False)
         snapshot = self._prepare_padded_batch(padded_batch)
 
+        logger.info(
+            "[rank %d] step %d: inner dynamics step", self._domain_rank, self.step_count
+        )
         # 4. Inner dynamics step
         padded_batch, converged = self._dynamics.step(padded_batch)
 
+        logger.info(
+            "[rank %d] step %d: unprepare padded batch",
+            self._domain_rank,
+            self.step_count,
+        )
         # 5. Unprepare — restore global geometry
         self._unprepare_padded_batch(padded_batch, snapshot)
 
@@ -308,14 +327,21 @@ class DomainParallel(BaseDynamics):
         else:
             batch = padded_batch
 
+        logger.info(
+            "[rank %d] step %d: migration check", self._domain_rank, self.step_count
+        )
         # 7. Migration (if needed)
         if self._migrator is not None and self._migrator.needs_migration(batch):
             batch = self._migrator.migrate(batch)
 
+        logger.info(
+            "[rank %d] step %d: AFTER_STEP hooks", self._domain_rank, self.step_count
+        )
         # 8. Outer AFTER_STEP hooks
         self._call_hooks(DynamicsStage.AFTER_STEP, batch)
 
         self.step_count += 1
+        logger.info("[rank %d] step %d: complete", self._domain_rank, self.step_count)
 
         return batch, converged
 

@@ -268,6 +268,16 @@ def create_argon_system(
 
 
 def main() -> None:
+    """Main entry point for the distributed LJ NVE example."""
+    # Enable Python logging for distributed module debug output
+    import logging
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
     # ── 1. Distributed init ──────────────────────────────────
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()

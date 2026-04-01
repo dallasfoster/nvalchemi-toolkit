@@ -342,6 +342,10 @@ class GhostExchanger:
         tuple[Batch, int]
             ``(padded_batch, n_owned)``
         """
+        import logging as _logging
+
+        _log = _logging.getLogger(__name__)
+
         # Single-process fallback: no communication needed.
         if not torch.distributed.is_initialized():
             n_owned = local_batch.positions.shape[0]
@@ -351,31 +355,69 @@ class GhostExchanger:
         n_owned = positions.shape[0]
         device = positions.device
 
+        _log.info(
+            "[rank %d] exchange: n_owned=%d, %d neighbors: %s",
+            self.rank,
+            n_owned,
+            len(self.neighbor_ranks),
+            self.neighbor_ranks,
+        )
+
         # Compute ghost masks for all neighbors.
         ghost_masks = self.compute_ghost_masks_batched(positions)
 
-        # --- Send / receive ghost positions with each neighbor ---
-        send_reqs: list[torch.distributed.Work] = []
-        recv_buffers: dict[int, torch.Tensor] = {}
-        recv_count_buffers: Dict[int, torch.Tensor] = {}
-        recv_reqs: list[torch.distributed.Work] = []
+        for nr, mask in ghost_masks.items():
+            _log.info(
+                "[rank %d] ghost mask for neighbor %d: %d ghosts out of %d atoms",
+                self.rank,
+                nr,
+                mask.sum().item(),
+                mask.shape[0],
+            )
 
-        # Phase 1: exchange counts so receivers know buffer sizes.
+        # --- Use batched_isend_irecv to avoid unbatched P2P warnings ---
+
+        # Phase 1: exchange counts.
+        # Synchronize GPU before communication to ensure mask.sum() has completed.
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        _log.info("[rank %d] exchange: Phase 1 — exchanging counts", self.rank)
+
+        send_counts: Dict[int, torch.Tensor] = {}
+        recv_counts: Dict[int, torch.Tensor] = {}
+        p2p_ops: list[torch.distributed.P2POp] = []
+
         for neighbor_rank in self.neighbor_ranks:
             mask = ghost_masks[neighbor_rank]
-            count = mask.sum().reshape(1).to(dtype=torch.int64)
-            send_reqs.append(torch.distributed.isend(count, dst=neighbor_rank))
-            recv_count = torch.zeros(1, dtype=torch.int64, device=device)
-            recv_count_buffers[neighbor_rank] = recv_count
-            recv_reqs.append(torch.distributed.irecv(recv_count, src=neighbor_rank))
+            count_send = mask.sum().reshape(1).to(dtype=torch.int64, device=device)
+            send_counts[neighbor_rank] = count_send
+            count_recv = torch.zeros(1, dtype=torch.int64, device=device)
+            recv_counts[neighbor_rank] = count_recv
+            p2p_ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend, count_send, neighbor_rank
+                )
+            )
+            p2p_ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, count_recv, neighbor_rank
+                )
+            )
 
-        # Wait for all count exchanges.
-        for req in send_reqs + recv_reqs:
-            req.wait()
+        if p2p_ops:
+            reqs = torch.distributed.batch_isend_irecv(p2p_ops)
+            for req in reqs:
+                req.wait()
+
+        for nr, c in recv_counts.items():
+            _log.info(
+                "[rank %d] will receive %d ghosts from rank %d", self.rank, c.item(), nr
+            )
 
         # Phase 2: exchange positions.
-        send_reqs = []
-        recv_reqs = []
+        _log.info("[rank %d] exchange: Phase 2 — exchanging positions", self.rank)
+        recv_buffers: Dict[int, torch.Tensor] = {}
+        p2p_ops = []
 
         for neighbor_rank in self.neighbor_ranks:
             mask = ghost_masks[neighbor_rank]
@@ -389,19 +431,41 @@ class GhostExchanger:
                 )
                 ghost_pos = ghost_pos + shift
 
-            if ghost_pos.numel() > 0:
-                send_reqs.append(
-                    torch.distributed.isend(ghost_pos.contiguous(), dst=neighbor_rank)
-                )
+            n_send = ghost_pos.shape[0]
+            n_recv = recv_counts[neighbor_rank].item()
 
-            n_recv = recv_count_buffers[neighbor_rank].item()
+            _log.info(
+                "[rank %d] neighbor %d: sending %d, receiving %d",
+                self.rank,
+                neighbor_rank,
+                n_send,
+                n_recv,
+            )
+
+            # Always create matching send/recv pairs to avoid deadlock.
+            if n_send > 0:
+                send_buf = ghost_pos.contiguous()
+                p2p_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend, send_buf, neighbor_rank
+                    )
+                )
             if n_recv > 0:
                 recv_buf = torch.zeros(n_recv, 3, dtype=positions.dtype, device=device)
                 recv_buffers[neighbor_rank] = recv_buf
-                recv_reqs.append(torch.distributed.irecv(recv_buf, src=neighbor_rank))
+                p2p_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv, recv_buf, neighbor_rank
+                    )
+                )
 
-        for req in send_reqs + recv_reqs:
-            req.wait()
+        if p2p_ops:
+            _log.info("[rank %d] exchange: %d P2P ops queued", self.rank, len(p2p_ops))
+            reqs = torch.distributed.batch_isend_irecv(p2p_ops)
+            for req in reqs:
+                req.wait()
+
+        _log.info("[rank %d] exchange: Phase 2 complete", self.rank)
 
         # Concatenate all received ghost positions.
         ghost_parts = [
@@ -410,15 +474,18 @@ class GhostExchanger:
 
         if ghost_parts:
             all_ghost_pos = torch.cat(ghost_parts, dim=0)
-            # Build a padded positions tensor: [owned | ghosts].
             padded_positions = torch.cat([positions, all_ghost_pos], dim=0)
         else:
             padded_positions = positions
 
-        # For the POC we update positions in-place on the batch.
-        # A more complete implementation would build a new Batch with all
-        # per-atom fields padded.  For now, we store the padded positions
-        # externally and return the info needed.
+        _log.info(
+            "[rank %d] exchange: done — %d owned + %d ghosts = %d total",
+            self.rank,
+            n_owned,
+            padded_positions.shape[0] - n_owned,
+            padded_positions.shape[0],
+        )
+
         self._n_owned = n_owned
         self._padded_positions = padded_positions
 
