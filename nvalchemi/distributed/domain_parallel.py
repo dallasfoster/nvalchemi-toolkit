@@ -126,19 +126,26 @@ class DomainParallel(BaseDynamics):
         from nvalchemi.distributed.ghost_exchanger import GhostExchanger
         from nvalchemi.distributed.partitioner import SpatialPartitioner
 
-        device = batch.positions.device if batch is not None else torch.device("cpu")
+        # Resolve device: prefer the batch's device, fall back to the
+        # current CUDA device (NCCL requires all tensors on GPU).
+        if batch is not None:
+            device = batch.positions.device
+        elif torch.cuda.is_available():
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            device = torch.device("cpu")
 
         # --- Broadcast cell matrix and PBC from rank 0 ---
         if batch is not None:
-            cell_matrix = batch.cell.squeeze(0).clone()  # (3, 3)
+            cell_matrix = batch.cell.squeeze(0).clone().to(device)  # (3, 3)
             pbc = (
-                batch.pbc.clone()
+                batch.pbc.clone().to(device)
                 if hasattr(batch, "pbc") and batch.pbc is not None
-                else torch.tensor([True, True, True])
+                else torch.tensor([True, True, True], device=device)
             )
         else:
-            cell_matrix = torch.zeros(3, 3, dtype=torch.float64, device=device)
-            pbc = torch.tensor([True, True, True])
+            cell_matrix = torch.zeros(3, 3, dtype=torch.float32, device=device)
+            pbc = torch.tensor([True, True, True], device=device)
 
         if dist.is_initialized():
             dist.broadcast(cell_matrix, src=0)
