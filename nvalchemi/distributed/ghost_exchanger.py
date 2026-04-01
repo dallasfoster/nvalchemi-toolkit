@@ -474,22 +474,75 @@ class GhostExchanger:
 
         if ghost_parts:
             all_ghost_pos = torch.cat(ghost_parts, dim=0)
-            padded_positions = torch.cat([positions, all_ghost_pos], dim=0)
         else:
-            padded_positions = positions
+            all_ghost_pos = torch.zeros(0, 3, dtype=positions.dtype, device=device)
 
+        n_ghosts = all_ghost_pos.shape[0]
         _log.info(
             "[rank %d] exchange: done — %d owned + %d ghosts = %d total",
             self.rank,
             n_owned,
-            padded_positions.shape[0] - n_owned,
-            padded_positions.shape[0],
+            n_ghosts,
+            n_owned + n_ghosts,
         )
 
         self._n_owned = n_owned
-        self._padded_positions = padded_positions
 
-        return local_batch, n_owned
+        if n_ghosts == 0:
+            return local_batch, n_owned
+
+        # Build a padded Batch by creating ghost AtomicData and appending
+        # to the local batch.  Ghost atoms get dummy atomic_numbers and
+        # masses copied from the first owned atom (all same element in
+        # typical LJ/MLIP simulations; a full implementation would exchange
+        # these fields too).
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch as BatchCls
+
+        ghost_data = AtomicData(
+            positions=all_ghost_pos,
+            atomic_numbers=local_batch.atomic_numbers[:1].expand(n_ghosts).clone(),
+            atomic_masses=(
+                local_batch.atomic_masses[:1].expand(n_ghosts).clone()
+                if hasattr(local_batch, "atomic_masses")
+                and local_batch.atomic_masses is not None
+                else torch.ones(n_ghosts, device=device)
+            ),
+            cell=local_batch.cell.clone(),
+            pbc=local_batch.pbc.clone()
+            if hasattr(local_batch, "pbc") and local_batch.pbc is not None
+            else None,
+        )
+
+        # If the local batch has velocities, add zero velocities for ghosts
+        # (ghosts are read-only — their velocities aren't used).
+        if hasattr(local_batch, "velocities") and local_batch.velocities is not None:
+            ghost_data.add_node_property(
+                "velocities",
+                torch.zeros(n_ghosts, 3, dtype=positions.dtype, device=device),
+            )
+
+        # If the local batch has forces, add zero forces for ghosts.
+        if hasattr(local_batch, "forces") and local_batch.forces is not None:
+            ghost_data.add_node_property(
+                "forces", torch.zeros(n_ghosts, 3, dtype=positions.dtype, device=device)
+            )
+
+        ghost_batch = BatchCls.from_data_list([ghost_data], device=device)
+
+        # Build padded batch: clone owned, then append ghosts.
+        # Clone so we don't modify the caller's local_batch.
+        padded_batch = local_batch.clone()
+        padded_batch.append(ghost_batch)
+
+        _log.info(
+            "[rank %d] padded batch: num_nodes=%d num_graphs=%d",
+            self.rank,
+            padded_batch.num_nodes,
+            padded_batch.num_graphs,
+        )
+
+        return padded_batch, n_owned
 
     # ------------------------------------------------------------------
     # Strip
@@ -512,10 +565,19 @@ class GhostExchanger:
         """
         if padded_batch.positions.shape[0] == n_owned:
             return padded_batch
-        # Use index_select on graph indices.  For a single-graph batch
-        # (which is the domain decomposition case), just return it — the
-        # graph-level index_select operates on graph indices not atom
-        # indices.  For the POC we slice the positions tensor directly.
-        # A complete implementation would track ghost atoms at the Batch
-        # level.
-        return padded_batch
+
+        # The padded batch has 2 graphs: [owned (graph 0) | ghosts (graph 1)].
+        # Select only graph 0 to strip the ghost atoms.
+        import logging as _logging
+
+        _log2 = _logging.getLogger(__name__)
+        _log2.info(
+            "[rank %d] strip: %d total atoms → keeping graph 0 (%d owned)",
+            self.rank,
+            padded_batch.num_nodes,
+            n_owned,
+        )
+        stripped = padded_batch.index_select(
+            torch.tensor([0], device=padded_batch.positions.device)
+        )
+        return stripped

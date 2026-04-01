@@ -823,19 +823,31 @@ class TestStrip:
         assert result is mock_batch
 
     def test_strip_with_ghost_atoms_present(self):
-        """When n_owned < total, strip should still return the batch
-        (current POC implementation)."""
+        """When n_owned < total, strip should call index_select to keep graph 0."""
         cell = _make_orthorhombic_cell(20.0, 20.0, 20.0)
         part = _make_partitioner(cell, cutoff=2.0, world_size=2, grid_dims=(2, 1, 1))
         exchanger = _make_ghost_exchanger(part, cutoff=2.0, rank=0)
 
-        mock_batch = MagicMock()
-        # 5 total atoms, 3 owned + 2 ghosts
-        mock_batch.positions = torch.randn(5, 3, dtype=torch.float64)
+        # Build a real 2-graph batch: 3 owned atoms (graph 0) + 2 ghost atoms (graph 1)
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch
 
-        result = exchanger.strip(mock_batch, n_owned=3)
-        # Current POC: returns batch as-is even when ghosts present
-        assert result is mock_batch
+        owned = AtomicData(
+            positions=torch.randn(3, 3),
+            atomic_numbers=torch.ones(3, dtype=torch.int64),
+        )
+        ghost = AtomicData(
+            positions=torch.randn(2, 3),
+            atomic_numbers=torch.ones(2, dtype=torch.int64),
+        )
+        padded = Batch.from_data_list([owned, ghost])
+        assert padded.num_nodes == 5
+        assert padded.num_graphs == 2
+
+        result = exchanger.strip(padded, n_owned=3)
+        # Should keep only graph 0 (the 3 owned atoms)
+        assert result.num_nodes == 3
+        assert result.num_graphs == 1
 
     def test_strip_single_atom_owned(self):
         """Edge case: single owned atom, no ghosts."""
