@@ -18,13 +18,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import Any
 
 import torch
 from pydantic import BaseModel
-
-if TYPE_CHECKING:
-    from torch.distributed import DeviceMesh
 
 
 class HookScope(Enum):
@@ -71,7 +68,7 @@ class DomainConfig(BaseModel):
 
     cutoff: float
     skin: float = 0.0
-    mesh: DeviceMesh | None = None
+    mesh: Any = None  # DeviceMesh at runtime; typed as Any to avoid Pydantic resolution of TYPE_CHECKING import
     mesh_dim: str = "domain"
     ghost_width: float | None = None
     grid_dims: tuple[int, int, int] | None = None

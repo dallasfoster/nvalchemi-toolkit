@@ -415,7 +415,7 @@ class TestPartitionSingleProcess:
         config = DomainConfig(cutoff=3.0, skin=0.5, grid_dims=(1, 1, 1))
         dp = DomainParallel(dynamics=inner, config=config)
 
-        with pytest.raises(AssertionError, match="batch must be provided"):
+        with pytest.raises(ValueError, match="batch must be provided"):
             dp.partition(None)
 
 
