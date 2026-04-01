@@ -157,9 +157,10 @@ class DomainParallel(BaseDynamics):
             dist.broadcast(cell_bcast, src=0)
             dist.broadcast(pbc_bcast, src=0)
 
-        # Squeeze the batch dim for SpatialPartitioner: (3, 3) and (3,)
-        cell_matrix = cell_bcast.squeeze(0)
-        pbc = pbc_bcast.squeeze(0)
+        # Pass batch-convention shapes directly — SpatialPartitioner
+        # normalizes (1, 3, 3) → (3, 3) and (1, 3) → (3,) internally.
+        cell_matrix = cell_bcast
+        pbc = pbc_bcast
 
         # --- Initialize components ---
         self._partitioner = SpatialPartitioner(
@@ -240,10 +241,10 @@ class DomainParallel(BaseDynamics):
         # Build local AtomicData → Batch for this rank's atoms.
         local_data = AtomicData(
             positions=all_positions[my_indices],
-            atomic_numbers=all_atomic_numbers[my_indices].to(torch.int32),
+            atomic_numbers=all_atomic_numbers[my_indices],
             atomic_masses=all_atomic_masses[my_indices],
-            cell=cell_matrix.unsqueeze(0),
-            pbc=pbc.unsqueeze(0) if pbc.ndim == 1 else pbc,
+            cell=cell_matrix if cell_matrix.ndim == 3 else cell_matrix.unsqueeze(0),
+            pbc=pbc if pbc.ndim == 2 else pbc.unsqueeze(0),
         )
         if all_velocities.any():
             local_data.add_node_property("velocities", all_velocities[my_indices])

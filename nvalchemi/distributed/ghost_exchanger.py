@@ -67,7 +67,10 @@ class GhostExchanger:
             self.rank = 0
 
         # Precompute neighbor ranks (at most 26 in 3D with PBC).
-        self.neighbor_ranks: list[int] = partitioner.get_neighbor_ranks(self.rank)
+        # Defensive: exclude self even if the partitioner included it.
+        self.neighbor_ranks: list[int] = [
+            r for r in partitioner.get_neighbor_ranks(self.rank) if r != self.rank
+        ]
 
         # Precompute PBC shift vectors for neighbor pairs that cross
         # periodic boundaries.

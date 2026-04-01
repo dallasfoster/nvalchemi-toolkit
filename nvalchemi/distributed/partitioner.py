@@ -35,9 +35,13 @@ class SpatialPartitioner:
     config : DomainConfig
         Domain decomposition configuration.
     cell_matrix : torch.Tensor
-        ``(3, 3)`` cell / box matrix describing the simulation domain.
+        Cell / box matrix describing the simulation domain.  Accepts
+        either the Batch convention ``(1, 3, 3)`` or the raw ``(3, 3)``
+        shape; leading batch dimensions are squeezed internally.
     pbc : torch.Tensor
-        ``(3,)`` boolean tensor of periodic boundary conditions per axis.
+        Periodic boundary conditions per axis.  Accepts either
+        ``(1, 3)`` (Batch convention) or ``(3,)``; leading batch
+        dimensions are squeezed internally.
     """
 
     def __init__(
@@ -47,8 +51,12 @@ class SpatialPartitioner:
         pbc: torch.Tensor,
     ) -> None:
         self.config = config
-        self.cell_matrix = cell_matrix
-        self.pbc = pbc
+        # Normalize to (3, 3) and (3,) regardless of whether the caller
+        # passed Batch-convention shapes (1, 3, 3) / (1, 3).
+        self.cell_matrix = (
+            cell_matrix.squeeze(0) if cell_matrix.ndim == 3 else cell_matrix
+        )
+        self.pbc = pbc.squeeze(0) if pbc.ndim == 2 else pbc
 
         # Determine world size from mesh or default to 1.
         if config.mesh is not None:
@@ -275,7 +283,10 @@ class SpatialPartitioner:
                     nz = nz % Pz
 
                     neighbor_rank = nx + Px * (ny + Py * nz)
-                    if neighbor_rank not in neighbors:
+                    # Exclude self (can happen when PBC wraps a dimension
+                    # that has only 1 rank, e.g. rank_grid (1, 1, 2) with
+                    # full PBC — dx=±1 along Px=1 wraps back to self).
+                    if neighbor_rank != rank and neighbor_rank not in neighbors:
                         neighbors.append(neighbor_rank)
 
         return neighbors
