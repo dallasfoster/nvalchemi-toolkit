@@ -52,6 +52,19 @@ class HookContext:
         Current epoch number (training only).
     global_rank : int
         Distributed rank of this process.
+    n_owned : int | None
+        Number of owned atoms on this rank (excludes ghost atoms).
+        None when not in domain-parallel mode.
+    domain_mesh : object | None
+        The DeviceMesh for the "domain" dimension. None when not in
+        domain-parallel mode. Typed as object to avoid importing
+        torch.distributed at module level.
+    is_domain_parallel : bool
+        True when executing inside a DomainParallel wrapper.
+    global_cell : torch.Tensor | None
+        The real simulation cell matrix (shape ``(B, 3, 3)``) when
+        ``batch.cell`` has been temporarily replaced with a local
+        bounding box for neighbor list construction. None otherwise.
     """
 
     batch: Batch
@@ -64,3 +77,9 @@ class HookContext:
     converged_mask: torch.Tensor | None = None
     epoch: int | None = None
     global_rank: int = 0
+
+    # Domain decomposition fields (populated by DomainParallel)
+    n_owned: int | None = None
+    domain_mesh: object | None = None  # DeviceMesh at runtime, but avoid hard import
+    is_domain_parallel: bool = False
+    global_cell: torch.Tensor | None = None

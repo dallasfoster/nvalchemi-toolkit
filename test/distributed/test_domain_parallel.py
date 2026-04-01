@@ -1,0 +1,735 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for DomainParallel (single-process, no torch.distributed)."""
+
+from __future__ import annotations
+
+import logging
+from enum import Enum
+from unittest.mock import patch
+
+import pytest
+import torch
+from torch.distributed import DeviceMesh  # noqa: F401 — resolve forward ref
+
+from nvalchemi.data import AtomicData, Batch
+from nvalchemi.distributed.config import DomainConfig, HookScope, _GeometrySnapshot
+from nvalchemi.distributed.domain_parallel import DomainParallel
+from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
+from nvalchemi.dynamics.demo import DemoDynamics
+from nvalchemi.hooks._context import HookContext
+from nvalchemi.models.demo import DemoModelWrapper
+
+# Resolve DeviceMesh forward reference for pydantic validation.
+DomainConfig.model_rebuild(_types_namespace={"DeviceMesh": DeviceMesh})
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_batch(n_atoms: int = 8) -> Batch:
+    """Create a single-graph batch with atoms in a 10x10x10 box."""
+    positions = torch.rand(n_atoms, 3) * 10.0
+    data = AtomicData(
+        atomic_numbers=torch.tensor([6] * n_atoms, dtype=torch.long),
+        positions=positions,
+    )
+    batch = Batch.from_data_list([data])
+    batch.forces = torch.zeros(n_atoms, 3)
+    batch.energies = torch.zeros(1, 1)
+    # Set a cell matrix for the batch
+    batch.cell = torch.diag(torch.tensor([10.0, 10.0, 10.0])).unsqueeze(0)
+    batch.pbc = torch.tensor([[True, True, True]])  # (1, 3)
+    return batch
+
+
+def _make_triclinic_batch(n_atoms: int = 8) -> Batch:
+    """Create a single-graph batch with a triclinic cell."""
+    positions = torch.rand(n_atoms, 3) * 10.0
+    data = AtomicData(
+        atomic_numbers=torch.tensor([6] * n_atoms, dtype=torch.long),
+        positions=positions,
+    )
+    batch = Batch.from_data_list([data])
+    batch.forces = torch.zeros(n_atoms, 3)
+    batch.energies = torch.zeros(1, 1)
+    # Triclinic cell: off-diagonal elements
+    cell = torch.tensor(
+        [[10.0, 0.0, 0.0], [2.0, 10.0, 0.0], [1.0, 0.5, 10.0]]
+    ).unsqueeze(0)
+    batch.cell = cell
+    batch.pbc = torch.tensor([[True, True, True]])  # (1, 3)
+    return batch
+
+
+def _make_domain_parallel() -> tuple[DomainParallel, DemoDynamics]:
+    """Create a DomainParallel wrapping a DemoDynamics."""
+    model = DemoModelWrapper()
+    inner = DemoDynamics(model=model, n_steps=10)
+    config = DomainConfig(cutoff=3.0, skin=0.5)
+    dp = DomainParallel(dynamics=inner, config=config)
+    return dp, inner
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestInit:
+    """Test DomainParallel construction."""
+
+    def test_is_base_dynamics(self) -> None:
+        dp, _ = _make_domain_parallel()
+        assert isinstance(dp, BaseDynamics)
+
+    def test_stores_inner_dynamics(self) -> None:
+        dp, inner = _make_domain_parallel()
+        assert dp._dynamics is inner
+
+    def test_stores_config(self) -> None:
+        dp, _ = _make_domain_parallel()
+        assert dp._config.cutoff == 3.0
+        assert dp._config.skin == 0.5
+
+    def test_lazy_components_none(self) -> None:
+        dp, _ = _make_domain_parallel()
+        assert dp._partitioner is None
+        assert dp._ghost_exchanger is None
+        assert dp._migrator is None
+
+    def test_initial_state(self) -> None:
+        dp, _ = _make_domain_parallel()
+        assert dp._n_owned == 0
+        assert dp._geometry_snapshot is None
+        assert dp._domain_rank == 0
+
+    def test_model_shared_with_inner(self) -> None:
+        dp, inner = _make_domain_parallel()
+        assert dp.model is inner.model
+
+
+class TestPrepareUnprepareRoundtrip:
+    """Test _prepare_padded_batch / _unprepare_padded_batch cycle."""
+
+    def test_roundtrip_orthorhombic(self) -> None:
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=10)
+
+        original_positions = batch.positions.clone()
+        original_cell = batch.cell.clone()
+        original_pbc = batch.pbc.clone()
+
+        # Prepare
+        snapshot = dp._prepare_padded_batch(batch)
+
+        # After prepare: pbc should be False
+        assert (~batch.pbc).all()
+
+        # Cell should be orthorhombic (diagonal) based on AABB
+        cell_3x3 = batch.cell.squeeze(0)
+        assert torch.allclose(
+            cell_3x3,
+            torch.diag(cell_3x3.diag()),
+            atol=1e-5,
+        ), "Prepared cell should be diagonal (orthorhombic)"
+
+        # Positions should be shifted to [0, box_lengths)
+        assert batch.positions.min() >= -1e-6
+
+        # Unprepare
+        dp._unprepare_padded_batch(batch, snapshot)
+
+        # Should be restored
+        assert torch.allclose(batch.positions, original_positions, atol=1e-6)
+        assert torch.allclose(batch.cell, original_cell, atol=1e-6)
+        assert (batch.pbc == original_pbc).all()
+
+    def test_roundtrip_preserves_exact_positions(self) -> None:
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=5)
+
+        original_positions = batch.positions.clone()
+        snapshot = dp._prepare_padded_batch(batch)
+        dp._unprepare_padded_batch(batch, snapshot)
+
+        assert torch.allclose(batch.positions, original_positions, atol=1e-7)
+
+
+class TestPrepareTriclinic:
+    """Test that _prepare_padded_batch produces orthorhombic bbox even for triclinic cells."""
+
+    def test_triclinic_produces_orthorhombic_bbox(self) -> None:
+        dp, _ = _make_domain_parallel()
+        batch = _make_triclinic_batch(n_atoms=10)
+
+        original_cell = batch.cell.clone()
+        snapshot = dp._prepare_padded_batch(batch)
+
+        # The prepared cell should be diagonal (orthorhombic AABB)
+        cell_3x3 = batch.cell.squeeze(0)
+        off_diag = cell_3x3 - torch.diag(cell_3x3.diag())
+        assert torch.allclose(
+            off_diag,
+            torch.zeros_like(off_diag),
+            atol=1e-6,
+        ), "Local bbox should be orthorhombic even for triclinic input"
+
+        # pbc should be False
+        assert (~batch.pbc).all()
+
+        # Snapshot should store original triclinic cell
+        assert torch.allclose(snapshot.original_cell, original_cell, atol=1e-6)
+
+    def test_triclinic_roundtrip(self) -> None:
+        dp, _ = _make_domain_parallel()
+        batch = _make_triclinic_batch(n_atoms=10)
+
+        original_positions = batch.positions.clone()
+        original_cell = batch.cell.clone()
+        original_pbc = batch.pbc.clone()
+
+        snapshot = dp._prepare_padded_batch(batch)
+        dp._unprepare_padded_batch(batch, snapshot)
+
+        assert torch.allclose(batch.positions, original_positions, atol=1e-6)
+        assert torch.allclose(batch.cell, original_cell, atol=1e-6)
+        assert (batch.pbc == original_pbc).all()
+
+
+class TestBuildContext:
+    """Test that _build_context populates domain-parallel fields."""
+
+    def test_domain_fields_populated(self) -> None:
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=5)
+
+        dp._n_owned = 5
+        ctx = dp._build_context(batch)
+
+        assert isinstance(ctx, HookContext)
+        assert ctx.is_domain_parallel is True
+        assert ctx.n_owned == 5
+        assert ctx.domain_mesh is None  # No mesh in single-process mode
+
+    def test_global_cell_from_snapshot(self) -> None:
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=5)
+
+        # Set a geometry snapshot
+        dp._geometry_snapshot = _GeometrySnapshot(
+            original_cell=torch.eye(3).unsqueeze(0) * 10.0,
+            original_pbc=torch.tensor([True, True, True]),
+        )
+
+        ctx = dp._build_context(batch)
+        assert ctx.global_cell is not None
+        assert ctx.global_cell.shape == (1, 3, 3)
+
+    def test_global_cell_none_without_snapshot(self) -> None:
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=5)
+
+        dp._geometry_snapshot = None
+        ctx = dp._build_context(batch)
+        assert ctx.global_cell is None
+
+    def test_step_count_forwarded(self) -> None:
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=5)
+
+        dp.step_count = 42
+        ctx = dp._build_context(batch)
+        assert ctx.step_count == 42
+
+
+class TestPropertiesDelegate:
+    """Test that __needs_keys__ and __provides_keys__ delegate to inner dynamics."""
+
+    def test_needs_keys_delegates(self) -> None:
+        dp, inner = _make_domain_parallel()
+        assert dp.__needs_keys__ == inner.__needs_keys__
+
+    def test_provides_keys_delegates(self) -> None:
+        dp, inner = _make_domain_parallel()
+        assert dp.__provides_keys__ == inner.__provides_keys__
+
+    def test_needs_keys_reflects_inner_changes(self) -> None:
+        """If inner dynamics __needs_keys__ is modified, DomainParallel reflects it."""
+        dp, inner = _make_domain_parallel()
+        # DemoDynamics uses class-level sets; check they match
+        original = inner.__needs_keys__.copy()
+        assert dp.__needs_keys__ == original
+
+
+# ---------------------------------------------------------------------------
+# Mock dynamics that bypasses model evaluation
+# ---------------------------------------------------------------------------
+
+
+class _MockDynamics(BaseDynamics):
+    """A minimal dynamics that just returns the batch unchanged.
+
+    Does not call model.forward, so it works without a real model.
+    """
+
+    __needs_keys__: set[str] = set()
+    __provides_keys__: set[str] = set()
+
+    def __init__(self, **kwargs):
+        model = DemoModelWrapper()
+        super().__init__(model=model, **kwargs)
+        self.step_calls: int = 0
+
+    def step(self, batch: Batch) -> tuple[Batch, torch.Tensor | None]:
+        self.step_calls += 1
+        return batch, None
+
+
+class _SimpleHook:
+    """Minimal hook for testing _call_hooks."""
+
+    def __init__(
+        self,
+        stage: DynamicsStage,
+        frequency: int = 1,
+        scope: HookScope = HookScope.LOCAL,
+    ):
+        self.stage = stage
+        self.frequency = frequency
+        self.scope = scope
+        self.call_count: int = 0
+
+    def __call__(self, ctx: HookContext, stage: Enum) -> None:
+        self.call_count += 1
+
+    def __repr__(self) -> str:
+        return f"_SimpleHook(stage={self.stage}, scope={self.scope})"
+
+
+# ---------------------------------------------------------------------------
+# Partition tests (single-process)
+# ---------------------------------------------------------------------------
+
+
+class TestPartitionSingleProcess:
+    """Test partition() in single-process mode (no torch.distributed).
+
+    Note: the partition() code passes ``batch.pbc`` (shape ``(1,3)``) directly
+    to ``SpatialPartitioner`` which expects shape ``(3,)``.  We patch the
+    partitioner's ``__init__`` to flatten the pbc tensor so the rest of the
+    partitioner logic works correctly in these unit tests.
+    """
+
+    @staticmethod
+    def _patched_partitioner_init(original_init):
+        """Return a wrapped __init__ that flattens pbc before delegating."""
+
+        def _init(self, *, config, cell_matrix, pbc):
+            # Flatten (1,3) -> (3,) so bool(pbc[i]) works inside partitioner
+            original_init(
+                self, config=config, cell_matrix=cell_matrix, pbc=pbc.flatten()
+            )
+
+        return _init
+
+    def test_partition_returns_batch_unchanged(self) -> None:
+        from nvalchemi.distributed.partitioner import SpatialPartitioner
+
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=12)
+        original_positions = batch.positions.clone()
+
+        orig_init = SpatialPartitioner.__init__
+        with patch.object(
+            SpatialPartitioner, "__init__", self._patched_partitioner_init(orig_init)
+        ):
+            local_batch = dp.partition(batch)
+
+        assert torch.allclose(local_batch.positions, original_positions)
+
+    def test_partition_sets_n_owned(self) -> None:
+        from nvalchemi.distributed.partitioner import SpatialPartitioner
+
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=12)
+
+        orig_init = SpatialPartitioner.__init__
+        with patch.object(
+            SpatialPartitioner, "__init__", self._patched_partitioner_init(orig_init)
+        ):
+            dp.partition(batch)
+
+        assert dp._n_owned == 12
+
+    def test_partition_initializes_partitioner(self) -> None:
+        from nvalchemi.distributed.partitioner import SpatialPartitioner
+
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=12)
+
+        orig_init = SpatialPartitioner.__init__
+        with patch.object(
+            SpatialPartitioner, "__init__", self._patched_partitioner_init(orig_init)
+        ):
+            dp.partition(batch)
+
+        assert dp._partitioner is not None
+
+    def test_partition_no_ghost_exchanger_without_mesh(self) -> None:
+        """Without a mesh, ghost_exchanger and migrator stay None."""
+        from nvalchemi.distributed.partitioner import SpatialPartitioner
+
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=12)
+
+        orig_init = SpatialPartitioner.__init__
+        with patch.object(
+            SpatialPartitioner, "__init__", self._patched_partitioner_init(orig_init)
+        ):
+            dp.partition(batch)
+
+        assert dp._ghost_exchanger is None
+        assert dp._migrator is None
+
+    def test_partition_asserts_batch_not_none(self) -> None:
+        """In single-process mode, batch=None triggers the assertion after
+        partitioner init. We use grid_dims to avoid the singular-matrix error
+        from the zero cell_matrix fallback."""
+        model = DemoModelWrapper()
+        inner = DemoDynamics(model=model, n_steps=10)
+        config = DomainConfig(cutoff=3.0, skin=0.5, grid_dims=(1, 1, 1))
+        dp = DomainParallel(dynamics=inner, config=config)
+
+        with pytest.raises(AssertionError, match="batch must be provided"):
+            dp.partition(None)
+
+
+# ---------------------------------------------------------------------------
+# Step tests (single-process)
+# ---------------------------------------------------------------------------
+
+
+class TestStepSingleProcess:
+    """Test step() in single-process mode with a mock inner dynamics."""
+
+    def _make_dp_with_mock(self) -> tuple[DomainParallel, _MockDynamics]:
+        mock_inner = _MockDynamics(n_steps=10)
+        config = DomainConfig(cutoff=3.0, skin=0.5)
+        dp = DomainParallel(dynamics=mock_inner, config=config)
+        return dp, mock_inner
+
+    def test_step_delegates_to_inner(self) -> None:
+        dp, mock_inner = self._make_dp_with_mock()
+        batch = _make_batch(n_atoms=8)
+
+        result_batch, converged = dp.step(batch)
+
+        assert mock_inner.step_calls == 1
+        assert result_batch is not None
+
+    def test_step_increments_step_count(self) -> None:
+        dp, _ = self._make_dp_with_mock()
+        batch = _make_batch(n_atoms=8)
+
+        assert dp.step_count == 0
+        dp.step(batch)
+        assert dp.step_count == 1
+        dp.step(batch)
+        assert dp.step_count == 2
+
+    def test_step_prepare_unprepare_roundtrip(self) -> None:
+        """Positions should be restored to global coords after step."""
+        dp, _ = self._make_dp_with_mock()
+        batch = _make_batch(n_atoms=8)
+        original_cell = batch.cell.clone()
+        original_pbc = batch.pbc.clone()
+
+        result_batch, _ = dp.step(batch)
+
+        # After step, cell and pbc should be restored
+        assert torch.allclose(result_batch.cell, original_cell, atol=1e-5)
+        assert (result_batch.pbc == original_pbc).all()
+
+    def test_step_sets_n_owned(self) -> None:
+        dp, _ = self._make_dp_with_mock()
+        batch = _make_batch(n_atoms=8)
+
+        dp.step(batch)
+
+        assert dp._n_owned == 8
+
+    def test_step_without_ghost_exchanger(self) -> None:
+        """Without ghost_exchanger, padded_batch == batch and strip is a no-op."""
+        dp, mock_inner = self._make_dp_with_mock()
+        batch = _make_batch(n_atoms=8)
+
+        # Ensure no ghost exchanger
+        assert dp._ghost_exchanger is None
+
+        result_batch, _ = dp.step(batch)
+        assert result_batch is not None
+        assert mock_inner.step_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Gather tests
+# ---------------------------------------------------------------------------
+
+
+class TestGatherWithoutDist:
+    """Test gather() when torch.distributed is not initialized."""
+
+    def test_gather_returns_none(self) -> None:
+        dp, _ = _make_domain_parallel()
+        result = dp.gather()
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Run tests
+# ---------------------------------------------------------------------------
+
+
+class TestRunMethod:
+    """Test run() method."""
+
+    def _make_dp_with_mock(
+        self, n_steps: int | None = None
+    ) -> tuple[DomainParallel, _MockDynamics]:
+        mock_inner = _MockDynamics(n_steps=10)
+        config = DomainConfig(cutoff=3.0, skin=0.5)
+        dp = DomainParallel(dynamics=mock_inner, config=config, n_steps=n_steps)
+        return dp, mock_inner
+
+    def test_run_executes_n_steps(self) -> None:
+        dp, mock_inner = self._make_dp_with_mock()
+        batch = _make_batch(n_atoms=8)
+
+        result = dp.run(batch, n_steps=5)
+
+        assert mock_inner.step_calls == 5
+        assert result is not None
+
+    def test_run_uses_constructor_n_steps(self) -> None:
+        dp, mock_inner = self._make_dp_with_mock(n_steps=3)
+        batch = _make_batch(n_atoms=8)
+
+        dp.run(batch)
+
+        assert mock_inner.step_calls == 3
+
+    def test_run_prefers_argument_over_constructor(self) -> None:
+        dp, mock_inner = self._make_dp_with_mock(n_steps=100)
+        batch = _make_batch(n_atoms=8)
+
+        dp.run(batch, n_steps=2)
+
+        assert mock_inner.step_calls == 2
+
+    def test_run_raises_without_n_steps(self) -> None:
+        dp, _ = self._make_dp_with_mock(n_steps=None)
+        batch = _make_batch(n_atoms=8)
+
+        with pytest.raises(ValueError, match="No step count provided"):
+            dp.run(batch)
+
+    def test_run_step_count_increments(self) -> None:
+        dp, _ = self._make_dp_with_mock()
+        batch = _make_batch(n_atoms=8)
+
+        dp.run(batch, n_steps=4)
+
+        assert dp.step_count == 4
+
+
+# ---------------------------------------------------------------------------
+# _call_hooks tests
+# ---------------------------------------------------------------------------
+
+
+class TestCallHooksWithScope:
+    """Test _call_hooks with different HookScope values."""
+
+    def _make_dp_with_hooks(self, hooks: list) -> DomainParallel:
+        mock_inner = _MockDynamics(n_steps=10)
+        config = DomainConfig(cutoff=3.0, skin=0.5)
+        dp = DomainParallel(dynamics=mock_inner, config=config, hooks=hooks)
+        return dp
+
+    def test_local_hook_fires(self) -> None:
+        hook = _SimpleHook(stage=DynamicsStage.BEFORE_STEP, scope=HookScope.LOCAL)
+        dp = self._make_dp_with_hooks([hook])
+        batch = _make_batch(n_atoms=5)
+
+        dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+
+        assert hook.call_count == 1
+
+    def test_global_hook_fires_without_dist(self) -> None:
+        """GLOBAL hooks fire even without dist (the all_reduce is skipped)."""
+        hook = _SimpleHook(stage=DynamicsStage.BEFORE_STEP, scope=HookScope.GLOBAL)
+        dp = self._make_dp_with_hooks([hook])
+        batch = _make_batch(n_atoms=5)
+
+        dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+
+        assert hook.call_count == 1
+
+    def test_rank_zero_hook_logs_warning(self, caplog) -> None:
+        """RANK_ZERO hooks should log a warning and NOT fire."""
+        hook = _SimpleHook(stage=DynamicsStage.BEFORE_STEP, scope=HookScope.RANK_ZERO)
+        dp = self._make_dp_with_hooks([hook])
+        batch = _make_batch(n_atoms=5)
+
+        with caplog.at_level(
+            logging.WARNING, logger="nvalchemi.distributed.domain_parallel"
+        ):
+            dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+
+        assert hook.call_count == 0
+        assert "RANK_ZERO is not yet implemented" in caplog.text
+
+    def test_hook_stage_filtering(self) -> None:
+        """Hooks should only fire for their declared stage."""
+        before_hook = _SimpleHook(
+            stage=DynamicsStage.BEFORE_STEP, scope=HookScope.LOCAL
+        )
+        after_hook = _SimpleHook(stage=DynamicsStage.AFTER_STEP, scope=HookScope.LOCAL)
+        dp = self._make_dp_with_hooks([before_hook, after_hook])
+        batch = _make_batch(n_atoms=5)
+
+        dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+
+        assert before_hook.call_count == 1
+        assert after_hook.call_count == 0
+
+    def test_hook_frequency_gating(self) -> None:
+        """Hooks with frequency > 1 should only fire on matching steps."""
+        hook = _SimpleHook(
+            stage=DynamicsStage.BEFORE_STEP, frequency=3, scope=HookScope.LOCAL
+        )
+        dp = self._make_dp_with_hooks([hook])
+        batch = _make_batch(n_atoms=5)
+
+        # step_count=0 -> 0 % 3 == 0 -> fires
+        dp.step_count = 0
+        dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+        assert hook.call_count == 1
+
+        # step_count=1 -> 1 % 3 != 0 -> skipped
+        dp.step_count = 1
+        dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+        assert hook.call_count == 1
+
+        # step_count=3 -> 3 % 3 == 0 -> fires
+        dp.step_count = 3
+        dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+        assert hook.call_count == 2
+
+    def test_multiple_scopes_together(self) -> None:
+        """LOCAL and GLOBAL hooks fire; RANK_ZERO does not."""
+        local_hook = _SimpleHook(stage=DynamicsStage.BEFORE_STEP, scope=HookScope.LOCAL)
+        global_hook = _SimpleHook(
+            stage=DynamicsStage.BEFORE_STEP, scope=HookScope.GLOBAL
+        )
+        rank_zero_hook = _SimpleHook(
+            stage=DynamicsStage.BEFORE_STEP, scope=HookScope.RANK_ZERO
+        )
+        dp = self._make_dp_with_hooks([local_hook, global_hook, rank_zero_hook])
+        batch = _make_batch(n_atoms=5)
+
+        dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+
+        assert local_hook.call_count == 1
+        assert global_hook.call_count == 1
+        assert rank_zero_hook.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# _prepare_padded_batch multi-graph (line 316 branch)
+# ---------------------------------------------------------------------------
+
+
+class TestPreparePaddedBatchMultiGraph:
+    """Test _prepare_padded_batch with a multi-graph batch (cell.shape[0] > 1)."""
+
+    def test_multi_graph_cell_expansion(self) -> None:
+        """When batch has multiple graphs, local_cell should expand to match."""
+        dp, _ = _make_domain_parallel()
+
+        # Create a 2-graph batch
+        data1 = AtomicData(
+            atomic_numbers=torch.tensor([6, 6, 6], dtype=torch.long),
+            positions=torch.rand(3, 3) * 10.0,
+        )
+        data2 = AtomicData(
+            atomic_numbers=torch.tensor([8, 8], dtype=torch.long),
+            positions=torch.rand(2, 3) * 10.0,
+        )
+        batch = Batch.from_data_list([data1, data2])
+        batch.forces = torch.zeros(5, 3)
+        batch.energies = torch.zeros(2, 1)
+        batch.cell = torch.stack(
+            [
+                torch.diag(torch.tensor([10.0, 10.0, 10.0])),
+                torch.diag(torch.tensor([12.0, 12.0, 12.0])),
+            ]
+        )  # (2, 3, 3)
+        batch.pbc = torch.tensor([[True, True, True], [True, True, True]])
+
+        snapshot = dp._prepare_padded_batch(batch)
+
+        # Cell should have 2 graphs
+        assert batch.cell.shape[0] == 2
+        # Both cells should be the same AABB
+        assert torch.allclose(batch.cell[0], batch.cell[1], atol=1e-6)
+        # pbc should be False for both
+        assert batch.pbc.shape == (2, 3)
+        assert (~batch.pbc).all()
+
+        # Roundtrip
+        dp._unprepare_padded_batch(batch, snapshot)
+        assert batch.cell.shape[0] == 2
+
+
+# ---------------------------------------------------------------------------
+# Rank resolution branches
+# ---------------------------------------------------------------------------
+
+
+class TestRankResolution:
+    """Test rank resolution branches in __init__."""
+
+    def test_rank_zero_without_mesh_or_dist(self) -> None:
+        """Without mesh and without dist initialized, rank should be 0."""
+        model = DemoModelWrapper()
+        inner = DemoDynamics(model=model, n_steps=10)
+        config = DomainConfig(cutoff=3.0, skin=0.5)  # mesh=None
+        dp = DomainParallel(dynamics=inner, config=config)
+
+        assert dp._domain_rank == 0
+
+    def test_mesh_none_falls_through(self) -> None:
+        """When mesh is None and dist not initialized, rank == 0."""
+        config = DomainConfig(cutoff=3.0, skin=0.5, mesh=None)
+        assert config.mesh is None
+
+        model = DemoModelWrapper()
+        inner = DemoDynamics(model=model, n_steps=5)
+        dp = DomainParallel(dynamics=inner, config=config)
+        assert dp._domain_rank == 0
