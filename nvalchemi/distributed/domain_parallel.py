@@ -314,6 +314,10 @@ class DomainParallel(BaseDynamics):
         # 3. Prepare padded batch (local AABB, pbc=False)
         snapshot = self._prepare_padded_batch(padded_batch)
 
+        # Ensure forces and energies exist on the padded batch so
+        # BaseDynamics.compute() can write into them in-place.
+        self._ensure_output_tensors(padded_batch)
+
         logger.info(
             "[rank %d] step %d: inner dynamics step", self._domain_rank, self.step_count
         )
@@ -442,6 +446,33 @@ class DomainParallel(BaseDynamics):
         # Restore cell and PBC
         padded_batch.cell = snapshot.original_cell
         padded_batch.pbc = snapshot.original_pbc
+
+    @staticmethod
+    def _ensure_output_tensors(batch: Batch) -> None:
+        """Pre-allocate forces and energies if they don't exist.
+
+        ``BaseDynamics.compute()`` writes model outputs in-place via
+        ``copy_()``, so the destination tensors must already exist on the
+        batch.  Ghost exchange builds a new padded batch each step, which
+        may lack these fields.
+        """
+        n_total = batch.num_nodes
+        n_graphs = batch.num_graphs
+        device = batch.positions.device
+        dtype = batch.positions.dtype
+        if not hasattr(batch, "forces") or batch.forces is None:
+            batch.forces = torch.zeros(n_total, 3, dtype=dtype, device=device)
+        elif batch.forces.shape[0] != n_total:
+            # Forces exist but wrong size (e.g., from pre-ghost-exchange batch)
+            batch.forces = torch.zeros(n_total, 3, dtype=dtype, device=device)
+        if not hasattr(batch, "energies") or batch.energies is None:
+            batch.energies = torch.zeros(
+                n_graphs, 1, dtype=torch.float64, device=device
+            )
+        elif batch.energies.shape[0] != n_graphs:
+            batch.energies = torch.zeros(
+                n_graphs, 1, dtype=torch.float64, device=device
+            )
 
     # ------------------------------------------------------------------
     # Gather
@@ -583,18 +614,7 @@ class DomainParallel(BaseDynamics):
         # Prepare local bbox
         snapshot = self._prepare_padded_batch(padded_batch)
 
-        # Ensure forces and energies tensors exist on the padded batch so
-        # that BaseDynamics.compute() can write into them in-place via copy_().
-        n_total = padded_batch.num_nodes
-        n_graphs = padded_batch.num_graphs
-        device = padded_batch.positions.device
-        dtype = padded_batch.positions.dtype
-        if not hasattr(padded_batch, "forces") or padded_batch.forces is None:
-            padded_batch.forces = torch.zeros(n_total, 3, dtype=dtype, device=device)
-        if not hasattr(padded_batch, "energies") or padded_batch.energies is None:
-            padded_batch.energies = torch.zeros(
-                n_graphs, 1, dtype=torch.float64, device=device
-            )
+        self._ensure_output_tensors(padded_batch)
 
         # Fire BEFORE_COMPUTE hooks (NeighborListHook builds the neighbor list)
         self._dynamics._call_hooks(DynamicsStage.BEFORE_COMPUTE, padded_batch)
