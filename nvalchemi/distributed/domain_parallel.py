@@ -77,6 +77,7 @@ class DomainParallel(BaseDynamics):
         # Runtime state
         self._n_owned: int = 0
         self._geometry_snapshot: _GeometrySnapshot | None = None
+        self._forces_primed: bool = False
 
         # Determine rank from mesh, or fall back to dist / 0.
         if config.mesh is not None:
@@ -282,6 +283,12 @@ class DomainParallel(BaseDynamics):
             ``(updated_batch, converged)`` matching the ``BaseDynamics``
             return signature.
         """
+        # Auto-prime forces on first step if not already done (handles
+        # the case where user calls step() in a loop instead of run()).
+        if not self._forces_primed:
+            batch = self._prime_forces(batch)
+            self._forces_primed = True
+
         logger.info(
             "[rank %d] step %d: BEFORE_STEP hooks", self._domain_rank, self.step_count
         )
@@ -549,6 +556,53 @@ class DomainParallel(BaseDynamics):
                 hook(ctx, stage)
 
     # ------------------------------------------------------------------
+    # Force priming
+    # ------------------------------------------------------------------
+
+    def _prime_forces(self, batch: Batch) -> Batch:
+        """Run one ghost-exchange + compute pass to initialize forces.
+
+        Velocity Verlet's ``pre_update`` uses forces from the previous
+        step.  On the very first step there are no forces yet, so we
+        run the neighbor list hook + model forward once to populate
+        ``batch.forces`` and ``batch.energies`` before the step loop.
+
+        This mirrors ``FusedStage.run()`` which calls ``compute()``
+        before the first ``step()``.
+        """
+        logger.info("[rank %d] priming forces (initial compute)", self._domain_rank)
+
+        # Ghost exchange
+        if self._ghost_exchanger is not None:
+            padded_batch, n_owned = self._ghost_exchanger.exchange(batch)
+        else:
+            padded_batch = batch
+            n_owned = batch.positions.shape[0]
+        self._n_owned = n_owned
+
+        # Prepare local bbox
+        snapshot = self._prepare_padded_batch(padded_batch)
+
+        # Fire BEFORE_COMPUTE hooks (NeighborListHook builds the neighbor list)
+        self._dynamics._call_hooks(DynamicsStage.BEFORE_COMPUTE, padded_batch)
+        # Model forward pass — populates forces and energies
+        self._dynamics.compute(padded_batch)
+        # Fire AFTER_COMPUTE hooks (force clamping, etc.)
+        self._dynamics._call_hooks(DynamicsStage.AFTER_COMPUTE, padded_batch)
+
+        # Unprepare — restore global coords
+        self._unprepare_padded_batch(padded_batch, snapshot)
+
+        # Strip ghosts — forces on owned atoms are what we keep
+        if self._ghost_exchanger is not None:
+            batch = self._ghost_exchanger.strip(padded_batch, n_owned)
+        else:
+            batch = padded_batch
+
+        logger.info("[rank %d] force priming complete", self._domain_rank)
+        return batch
+
+    # ------------------------------------------------------------------
     # Run
     # ------------------------------------------------------------------
 
@@ -580,6 +634,14 @@ class DomainParallel(BaseDynamics):
             )
         self._open_hooks()
         try:
+            # Prime forces before the first step so that pre_update (the
+            # first half-kick in velocity Verlet) has forces to work with.
+            # This mirrors FusedStage.run() which calls compute() before
+            # the step loop.
+            if not self._forces_primed:
+                batch = self._prime_forces(batch)
+                self._forces_primed = True
+
             for _ in range(resolved):
                 batch, _converged = self.step(batch)
         finally:
