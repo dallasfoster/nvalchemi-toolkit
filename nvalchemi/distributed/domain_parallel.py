@@ -136,20 +136,30 @@ class DomainParallel(BaseDynamics):
             device = torch.device("cpu")
 
         # --- Broadcast cell matrix and PBC from rank 0 ---
+        # Shapes follow AtomicData/Batch convention:
+        #   cell: (1, 3, 3)   pbc: (1, 3)
+        # All tensors must have matching shape, dtype, and device across
+        # ranks for NCCL broadcast.
         if batch is not None:
-            cell_matrix = batch.cell.squeeze(0).clone().to(device)  # (3, 3)
-            pbc = (
-                batch.pbc.clone().to(device)
+            cell_bcast = batch.cell.clone().to(
+                device=device, dtype=torch.float32
+            )  # (1, 3, 3)
+            pbc_bcast = (
+                batch.pbc.clone().to(device=device)
                 if hasattr(batch, "pbc") and batch.pbc is not None
-                else torch.tensor([True, True, True], device=device)
+                else torch.ones(1, 3, dtype=torch.bool, device=device)
             )
         else:
-            cell_matrix = torch.zeros(3, 3, dtype=torch.float32, device=device)
-            pbc = torch.tensor([True, True, True], device=device)
+            cell_bcast = torch.zeros(1, 3, 3, dtype=torch.float32, device=device)
+            pbc_bcast = torch.ones(1, 3, dtype=torch.bool, device=device)
 
         if dist.is_initialized():
-            dist.broadcast(cell_matrix, src=0)
-            dist.broadcast(pbc, src=0)
+            dist.broadcast(cell_bcast, src=0)
+            dist.broadcast(pbc_bcast, src=0)
+
+        # Squeeze the batch dim for SpatialPartitioner: (3, 3) and (3,)
+        cell_matrix = cell_bcast.squeeze(0)
+        pbc = pbc_bcast.squeeze(0)
 
         # --- Initialize components ---
         self._partitioner = SpatialPartitioner(
