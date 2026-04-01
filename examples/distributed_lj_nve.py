@@ -236,7 +236,7 @@ def create_argon_system(
     positions = torch.tensor(positions, dtype=torch.float32)
     n_atoms = positions.shape[0]
 
-    atomic_numbers = torch.full((n_atoms,), 18, dtype=torch.int32)
+    atomic_numbers = torch.full((n_atoms,), 18, dtype=torch.int64)
     atomic_masses = torch.full((n_atoms,), 39.948, dtype=torch.float32)
 
     # Maxwell-Boltzmann velocities at 300 K
@@ -247,8 +247,8 @@ def create_argon_system(
     velocities -= velocities.mean(dim=0)  # zero COM velocity
 
     box_length = n_atoms_per_side * lattice_constant
-    cell = torch.eye(3, dtype=torch.float32) * box_length
-    pbc = torch.ones(3, dtype=torch.bool)
+    cell = torch.eye(3, dtype=torch.float32).reshape(1, 3, 3) * box_length
+    pbc = torch.ones(3, dtype=torch.bool).reshape(1, 3)
 
     data = AtomicData(
         positions=positions,
@@ -282,7 +282,7 @@ def main() -> None:
         rank,
         "CUDA: {} ({})",
         torch.cuda.get_device_name(local_rank),
-        f"{torch.cuda.get_device_properties(local_rank).total_mem / 1e9:.1f} GB",
+        f"{torch.cuda.get_device_properties(local_rank).total_memory / 1e9:.1f} GB",
     )
     log(rank, "PyTorch: {} CUDA: {}", torch.__version__, torch.version.cuda)
 
@@ -314,14 +314,14 @@ def main() -> None:
     )
 
     # ── 4. Dynamics ──────────────────────────────────────────
-    nl_hook = NeighborListHook(config=neighbor_config, skin=1.0)
+    nl_hook = NeighborListHook(config=neighbor_config, skin=4.25)
     nve = NVE(model=model, dt=1.0, hooks=[nl_hook])
-    log(rank, "NVE integrator: dt=1.0 fs, skin=1.0 A")
+    log(rank, "NVE integrator: dt=1.0 fs, skin=4.25 A")
 
     # ── 5. Domain config ─────────────────────────────────────
     config = DomainConfig(
         cutoff=neighbor_config.cutoff,
-        skin=1.0,
+        skin=4.25,
         mesh=mesh,
         mesh_dim="domain",
     )
@@ -355,6 +355,7 @@ def main() -> None:
 
     # ── 8. Create system on rank 0 ──────────────────────────
     if rank == 0:
+        log(rank, "Creating Argon system:")
         data = create_argon_system(n_atoms_per_side=10)
         batch = Batch.from_data_list([data], device=device)
         log(rank, "Created Argon system:")
@@ -380,7 +381,7 @@ def main() -> None:
         log(
             rank,
             "Partitioner: cells_per_dim={} rank_grid={} world_size={}",
-            tuple(p.cells_per_dim.tolist()),
+            tuple(p.cells_per_dim),
             p.rank_grid,
             p.world_size,
         )
@@ -422,7 +423,7 @@ def main() -> None:
     dist.barrier()
 
     # ── 10. Run NVE ──────────────────────────────────────────
-    n_steps = 50
+    n_steps = 500
     log(rank, ">>> Running {} NVE steps...", n_steps)
     log(rank, "=" * 80)
 
@@ -473,10 +474,10 @@ def main() -> None:
             max(step_times),
         )
         # Exclude first step (includes compilation/warmup)
-        if len(step_times) > 1:
+        if len(step_times) > 10:
             log(
                 rank,
-                "  Step time (excl. first): mean={:.4f}s",
+                "  Step time (excl. first 10): mean={:.4f}s",
                 statistics.mean(step_times[1:]),
             )
 
