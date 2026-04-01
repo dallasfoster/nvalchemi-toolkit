@@ -341,3 +341,228 @@ def test_atom_count_conservation():
     mp.spawn(
         _worker, args=(WORLD_SIZE, _test_atom_count_conservation), nprocs=WORLD_SIZE
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 4: Partition distributes atoms
+# ---------------------------------------------------------------------------
+
+
+def _test_partition_distributes_atoms(rank: int, world_size: int) -> None:
+    """Verify that after partition(), each rank has a disjoint subset of atoms."""
+    device = torch.device(f"cuda:{rank}")
+    data = _create_argon_system(n_atoms=100, seed=42)
+    initial_n = data.positions.shape[0]
+
+    from torch.distributed import DeviceMesh
+
+    mesh = DeviceMesh("cuda", list(range(world_size)), mesh_dim_names=("domain",))
+    model = _make_model(device)
+    nve = _make_nve(model)
+    config = DomainConfig(cutoff=8.5, skin=1.0, mesh=mesh, mesh_dim="domain")
+    dd = DomainParallel(nve, config=config)
+
+    batch = Batch.from_data_list([data], device=device) if rank == 0 else None
+    local_batch = dd.partition(batch)
+
+    # Each rank should have some atoms
+    n_local = local_batch.num_nodes
+    assert n_local > 0, f"Rank {rank} has no atoms"
+
+    # Total across ranks should equal initial
+    count = torch.tensor([n_local], device=device)
+    dist.all_reduce(count)
+    assert count.item() == initial_n
+
+    # Local batch should have cell and pbc
+    assert local_batch.cell is not None
+    assert local_batch.pbc is not None
+
+
+@_skip_no_multi_gpu
+def test_partition_distributes_atoms():
+    """After partition(), each rank has atoms and totals match initial count."""
+    mp.spawn(
+        _worker,
+        args=(WORLD_SIZE, _test_partition_distributes_atoms),
+        nprocs=WORLD_SIZE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Ghost exchange produces padded batch
+# ---------------------------------------------------------------------------
+
+
+def _test_ghost_exchange_produces_padded_batch(rank: int, world_size: int) -> None:
+    """Verify that after ghost exchange, the padded batch has >= owned atoms."""
+    device = torch.device(f"cuda:{rank}")
+    data = _create_argon_system(n_atoms=100, seed=42)
+
+    from torch.distributed import DeviceMesh
+
+    mesh = DeviceMesh("cuda", list(range(world_size)), mesh_dim_names=("domain",))
+    model = _make_model(device)
+    nve = _make_nve(model)
+    config = DomainConfig(cutoff=8.5, skin=1.0, mesh=mesh, mesh_dim="domain")
+    dd = DomainParallel(nve, config=config)
+
+    batch = Batch.from_data_list([data], device=device) if rank == 0 else None
+    local_batch = dd.partition(batch)
+    n_owned = local_batch.num_nodes
+
+    padded, n_own = dd._ghost_exchanger.exchange(local_batch)
+
+    assert n_own == n_owned
+    # Padded batch should have at least as many atoms as owned (ghosts appended)
+    assert padded.num_nodes >= n_owned
+    if padded.num_nodes > n_owned:
+        assert padded.num_graphs == 2
+    else:
+        assert padded.num_graphs == 1
+    # Padded batch should have positions, atomic_numbers
+    assert padded.positions.shape[0] == padded.num_nodes
+    assert padded.atomic_numbers.shape[0] == padded.num_nodes
+
+
+@_skip_no_multi_gpu
+def test_ghost_exchange_produces_padded_batch():
+    """Ghost exchange should produce a padded batch with ghosts appended."""
+    mp.spawn(
+        _worker,
+        args=(WORLD_SIZE, _test_ghost_exchange_produces_padded_batch),
+        nprocs=WORLD_SIZE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 6: _prime_forces populates batch
+# ---------------------------------------------------------------------------
+
+
+def _test_prime_forces_populates_batch(rank: int, world_size: int) -> None:
+    """Verify that _prime_forces() populates forces and energies on the batch."""
+    device = torch.device(f"cuda:{rank}")
+    data = _create_argon_system(n_atoms=100, seed=42)
+
+    from torch.distributed import DeviceMesh
+
+    mesh = DeviceMesh("cuda", list(range(world_size)), mesh_dim_names=("domain",))
+    model = _make_model(device)
+    nve = _make_nve(model)
+    config = DomainConfig(cutoff=8.5, skin=1.0, mesh=mesh, mesh_dim="domain")
+    dd = DomainParallel(nve, config=config)
+
+    batch = Batch.from_data_list([data], device=device) if rank == 0 else None
+    local_batch = dd.partition(batch)
+
+    # Before priming: no forces
+    assert not hasattr(local_batch, "forces") or local_batch.forces is None
+
+    # Prime
+    local_batch = dd._prime_forces(local_batch)
+
+    # After priming: forces should exist
+    assert local_batch.forces is not None
+    assert local_batch.forces.shape == (local_batch.num_nodes, 3)
+    assert local_batch.energies is not None
+
+
+@_skip_no_multi_gpu
+def test_prime_forces_populates_batch():
+    """_prime_forces() must populate forces and energies on the local batch."""
+    mp.spawn(
+        _worker,
+        args=(WORLD_SIZE, _test_prime_forces_populates_batch),
+        nprocs=WORLD_SIZE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: step() completes without error
+# ---------------------------------------------------------------------------
+
+
+def _test_step_completes(rank: int, world_size: int) -> None:
+    """Verify that dd.step() completes without error for 5 steps."""
+    device = torch.device(f"cuda:{rank}")
+    data = _create_argon_system(n_atoms=100, seed=42)
+
+    from torch.distributed import DeviceMesh
+
+    mesh = DeviceMesh("cuda", list(range(world_size)), mesh_dim_names=("domain",))
+    model = _make_model(device)
+    nve = _make_nve(model)
+    config = DomainConfig(cutoff=8.5, skin=1.0, mesh=mesh, mesh_dim="domain")
+    dd = DomainParallel(nve, config=config)
+
+    batch = Batch.from_data_list([data], device=device) if rank == 0 else None
+    local_batch = dd.partition(batch)
+
+    for _i in range(5):
+        local_batch, _converged = dd.step(local_batch)
+
+    assert local_batch.num_nodes > 0
+    assert local_batch.forces is not None
+
+
+@_skip_no_multi_gpu
+def test_step_completes():
+    """dd.step() must complete 5 steps without crashing."""
+    mp.spawn(
+        _worker,
+        args=(WORLD_SIZE, _test_step_completes),
+        nprocs=WORLD_SIZE,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: prepare/unprepare roundtrip distributed
+# ---------------------------------------------------------------------------
+
+
+def _test_prepare_unprepare_roundtrip_distributed(rank: int, world_size: int) -> None:
+    """Verify the bbox prepare/unprepare cycle preserves positions across ranks."""
+    device = torch.device(f"cuda:{rank}")
+    data = _create_argon_system(n_atoms=100, seed=42)
+
+    from torch.distributed import DeviceMesh
+
+    mesh = DeviceMesh("cuda", list(range(world_size)), mesh_dim_names=("domain",))
+    model = _make_model(device)
+    nve = _make_nve(model)
+    config = DomainConfig(cutoff=8.5, skin=1.0, mesh=mesh, mesh_dim="domain")
+    dd = DomainParallel(nve, config=config)
+
+    batch = Batch.from_data_list([data], device=device) if rank == 0 else None
+    local_batch = dd.partition(batch)
+
+    original_positions = local_batch.positions.clone()
+    original_cell = local_batch.cell.clone()
+    original_pbc = local_batch.pbc.clone()
+
+    # Prepare
+    snapshot = dd._prepare_padded_batch(local_batch)
+
+    # After prepare: pbc should be False
+    assert (~local_batch.pbc).all()
+
+    # Unprepare
+    dd._unprepare_padded_batch(local_batch, snapshot)
+
+    # Positions should be restored
+    torch.testing.assert_close(
+        local_batch.positions, original_positions, atol=1e-6, rtol=1e-6
+    )
+    torch.testing.assert_close(local_batch.cell, original_cell, atol=1e-6, rtol=1e-6)
+    assert (local_batch.pbc == original_pbc).all()
+
+
+@_skip_no_multi_gpu
+def test_prepare_unprepare_roundtrip_distributed():
+    """Prepare/unprepare must preserve positions on every rank."""
+    mp.spawn(
+        _worker,
+        args=(WORLD_SIZE, _test_prepare_unprepare_roundtrip_distributed),
+        nprocs=WORLD_SIZE,
+    )

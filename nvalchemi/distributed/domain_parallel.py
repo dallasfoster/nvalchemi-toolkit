@@ -583,6 +583,19 @@ class DomainParallel(BaseDynamics):
         # Prepare local bbox
         snapshot = self._prepare_padded_batch(padded_batch)
 
+        # Ensure forces and energies tensors exist on the padded batch so
+        # that BaseDynamics.compute() can write into them in-place via copy_().
+        n_total = padded_batch.num_nodes
+        n_graphs = padded_batch.num_graphs
+        device = padded_batch.positions.device
+        dtype = padded_batch.positions.dtype
+        if not hasattr(padded_batch, "forces") or padded_batch.forces is None:
+            padded_batch.forces = torch.zeros(n_total, 3, dtype=dtype, device=device)
+        if not hasattr(padded_batch, "energies") or padded_batch.energies is None:
+            padded_batch.energies = torch.zeros(
+                n_graphs, 1, dtype=torch.float64, device=device
+            )
+
         # Fire BEFORE_COMPUTE hooks (NeighborListHook builds the neighbor list)
         self._dynamics._call_hooks(DynamicsStage.BEFORE_COMPUTE, padded_batch)
         # Model forward pass — populates forces and energies
