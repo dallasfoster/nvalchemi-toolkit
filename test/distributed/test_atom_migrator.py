@@ -552,14 +552,45 @@ class TestBuildBatchFromFields:
 
 
 class TestNeedsMigration:
-    """Test AtomMigrator.needs_migration (returns False in POC — disabled)."""
+    """Test AtomMigrator.needs_migration checks actual rank assignments."""
 
-    def test_returns_false_for_poc(self):
-        """needs_migration returns False (migration disabled until Verlet skin wired up)."""
-        migrator = AtomMigrator.__new__(AtomMigrator)
-        positions = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float64)
+    def _make_migrator(self, partitioner, rank: int = 0, world_size: int = 2):
+        """Build an AtomMigrator with a mock mesh."""
+        from unittest.mock import MagicMock
+
+        config = DomainConfig(cutoff=5.0)
+        mock_mesh = MagicMock()
+        mock_mesh.get_local_rank.return_value = rank
+        mock_mesh.size.return_value = world_size
+        return AtomMigrator(partitioner=partitioner, config=config, mesh=mock_mesh)
+
+    def test_returns_false_when_all_in_domain(self):
+        """needs_migration returns False when all atoms belong to this rank."""
+        cell = _make_orthorhombic_cell(20.0, 20.0, 20.0)
+        part = _make_partitioner(cell, cutoff=5.0, world_size=2, grid_dims=(2, 1, 1))
+        migrator = self._make_migrator(part, rank=0, world_size=2)
+
+        # All atoms in rank 0's domain (x < 10)
+        positions = torch.tensor(
+            [[1.0, 5.0, 5.0], [3.0, 5.0, 5.0], [9.0, 5.0, 5.0]],
+            dtype=torch.float64,
+        )
         batch = _make_batch(positions)
         assert migrator.needs_migration(batch) is False
+
+    def test_returns_true_when_atom_crossed(self):
+        """needs_migration returns True when an atom has left this rank's domain."""
+        cell = _make_orthorhombic_cell(20.0, 20.0, 20.0)
+        part = _make_partitioner(cell, cutoff=5.0, world_size=2, grid_dims=(2, 1, 1))
+        migrator = self._make_migrator(part, rank=0, world_size=2)
+
+        # Atom at x=11 is in rank 1's domain
+        positions = torch.tensor(
+            [[1.0, 5.0, 5.0], [5.0, 5.0, 5.0], [11.0, 5.0, 5.0]],
+            dtype=torch.float64,
+        )
+        batch = _make_batch(positions)
+        assert migrator.needs_migration(batch) is True
 
 
 class TestAtomMigratorInit:

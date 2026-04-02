@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
 from torch.distributed import DeviceMesh  # noqa: F401 — forward ref
 
@@ -711,97 +710,116 @@ class TestExchangeNoDist:
         assert n_owned == 100
 
 
-@pytest.mark.skip(
-    reason="exchange() now uses batch_isend_irecv which validates real dist functions; needs real 2-GPU test"
-)
 class TestExchangeWithMockedDist:
-    """Test exchange() internals by mocking torch.distributed calls."""
+    """Test exchange() internals by mocking torch.distributed calls.
 
-    def test_exchange_with_no_ghosts(self):
-        """When all atoms are far from boundaries, no ghosts should be sent/received."""
+    Uses ``batch_isend_irecv``-compatible mocking.
+    """
+
+    @staticmethod
+    def _mock_p2p_op(op_fn, tensor, peer, group=None, tag=0):
+        """Return a lightweight object that mimics a P2POp."""
+        m = MagicMock()
+        m.op = op_fn
+        m.tensor = tensor
+        m.peer = peer
+        return m
+
+    def test_exchange_no_ghosts_center_atoms(self):
+        """When all atoms are far from boundaries, exchange returns batch
+        with 0 ghosts (only count P2P ops, no position P2P ops)."""
         cell = _make_orthorhombic_cell(40.0, 40.0, 40.0)
         part = _make_partitioner(cell, cutoff=2.0, world_size=2, grid_dims=(2, 1, 1))
         exchanger = _make_ghost_exchanger(part, cutoff=2.0, rank=0)
 
-        mock_batch = MagicMock()
-        # Atoms in the center of rank 0's domain — no ghosts
-        mock_batch.positions = torch.tensor([[10.0, 20.0, 20.0]], dtype=torch.float64)
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch
 
-        mock_work = MagicMock()
-        mock_work.wait.return_value = None
+        # Atom in the center of rank 0's domain — no ghosts for rank 1.
+        data = AtomicData(
+            positions=torch.tensor([[10.0, 20.0, 20.0]], dtype=torch.float64),
+            atomic_numbers=torch.tensor([6], dtype=torch.long),
+        )
+        local_batch = Batch.from_data_list([data])
+
+        mock_req = MagicMock()
+        mock_req.wait.return_value = None
 
         with (
             patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.isend", return_value=mock_work),
-            patch("torch.distributed.irecv", return_value=mock_work),
+            patch(
+                "torch.distributed.P2POp",
+                side_effect=self._mock_p2p_op,
+            ),
+            patch(
+                "torch.distributed.batch_isend_irecv",
+                return_value=[mock_req, mock_req],
+            ),
         ):
-            result_batch, n_owned = exchanger.exchange(mock_batch)
+            result_batch, n_owned = exchanger.exchange(local_batch)
 
         assert n_owned == 1
-        assert result_batch is mock_batch
-        # No ghosts received, so padded_positions should equal original
-        torch.testing.assert_close(exchanger._padded_positions, mock_batch.positions)
+        # No ghosts received (recv_counts are 0 since we mocked irecv
+        # to leave the count buffer at 0), so result should be the same batch.
+        assert result_batch is local_batch
 
-    def test_exchange_with_ghosts_sent(self):
-        """When atoms are near a boundary, isend/irecv should be called."""
-        cell = _make_orthorhombic_cell(40.0, 40.0, 40.0)
+    def test_exchange_with_ghosts_builds_padded_batch(self):
+        """When atoms are near a boundary and the remote side sends ghosts,
+        the padded batch should contain owned + ghost atoms."""
+        cell = _make_orthorhombic_cell(20.0, 20.0, 20.0)
         part = _make_partitioner(cell, cutoff=2.0, world_size=2, grid_dims=(2, 1, 1))
         exchanger = _make_ghost_exchanger(part, cutoff=2.0, rank=0)
 
-        mock_batch = MagicMock()
-        # Atom near boundary at x=19.5 (rank 0 owns [0,20))
-        mock_batch.positions = torch.tensor([[19.5, 20.0, 20.0]], dtype=torch.float64)
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch
 
-        mock_work = MagicMock()
-        mock_work.wait.return_value = None
+        # Atom near boundary (x=9.5) — will be identified as ghost for rank 1.
+        data = AtomicData(
+            positions=torch.tensor([[9.5, 5.0, 5.0]], dtype=torch.float64),
+            atomic_numbers=torch.tensor([6], dtype=torch.long),
+        )
+        local_batch = Batch.from_data_list([data])
 
-        with (
-            patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.isend", return_value=mock_work) as mock_isend,
-            patch("torch.distributed.irecv", return_value=mock_work),
-        ):
-            result_batch, n_owned = exchanger.exchange(mock_batch)
+        mock_req = MagicMock()
+        mock_req.wait.return_value = None
 
-        assert n_owned == 1
-        # isend should have been called (count exchange + position exchange)
-        assert mock_isend.call_count >= 1
+        call_count = [0]
 
-    def test_exchange_with_received_ghosts(self):
-        """When neighbor sends ghost atoms, padded_positions should grow."""
-        cell = _make_orthorhombic_cell(40.0, 40.0, 40.0)
-        part = _make_partitioner(cell, cutoff=2.0, world_size=2, grid_dims=(2, 1, 1))
-        exchanger = _make_ghost_exchanger(part, cutoff=2.0, rank=0)
-        n_neighbors = len(exchanger.neighbor_ranks)
-
-        mock_batch = MagicMock()
-        mock_batch.positions = torch.tensor([[10.0, 20.0, 20.0]], dtype=torch.float64)
-
-        mock_work = MagicMock()
-        mock_work.wait.return_value = None
-
-        ghosts_per_neighbor = 2
-
-        def fake_irecv(tensor, src):
-            """Simulate receiving ghost count or positions from neighbor."""
-            if tensor.shape == (1,):
-                # Count exchange: simulate ghosts incoming
-                tensor.fill_(ghosts_per_neighbor)
-            elif len(tensor.shape) == 2 and tensor.shape[1] == 3:
-                # Position exchange: fill with ghost positions
-                tensor.fill_(99.0)
-            return mock_work
+        def mock_batch_isend_irecv(ops):
+            """Mock that simulates receiving 1 ghost from the neighbor."""
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # Phase 1 (count exchange): fill recv count buffers with 1.
+                for op in ops:
+                    t = op.tensor
+                    if t.shape == (1,) and t.sum().item() == 0:
+                        # This is a recv buffer — fill with 1 ghost.
+                        t.fill_(1)
+            elif call_count[0] == 2:
+                # Phase 2 (position exchange): fill recv position buffer.
+                for op in ops:
+                    t = op.tensor
+                    if t.ndim == 2 and t.shape[1] == 3 and t.sum().item() == 0:
+                        t[0] = torch.tensor([15.0, 5.0, 5.0], dtype=t.dtype)
+            return [mock_req] * len(ops)
 
         with (
             patch("torch.distributed.is_initialized", return_value=True),
-            patch("torch.distributed.isend", return_value=mock_work),
-            patch("torch.distributed.irecv", side_effect=fake_irecv),
+            patch(
+                "torch.distributed.P2POp",
+                side_effect=self._mock_p2p_op,
+            ),
+            patch(
+                "torch.distributed.batch_isend_irecv",
+                side_effect=mock_batch_isend_irecv,
+            ),
         ):
-            result_batch, n_owned = exchanger.exchange(mock_batch)
+            result_batch, n_owned = exchanger.exchange(local_batch)
 
         assert n_owned == 1
-        expected_total = 1 + ghosts_per_neighbor * n_neighbors
-        assert exchanger._padded_positions.shape[0] == expected_total
-        assert exchanger._n_owned == 1
+        # The padded batch should have owned + ghost atoms.
+        assert result_batch.num_nodes == 2  # 1 owned + 1 ghost
+        assert result_batch.num_graphs == 1  # single-graph batch
 
 
 # ---------------------------------------------------------------------------

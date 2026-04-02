@@ -189,12 +189,11 @@ class AtomMigrator:
     def needs_migration(self, local_batch: Batch) -> bool:
         """Check whether any atoms have left their domain.
 
-        For the POC this returns ``False`` — migration is disabled until
-        Verlet skin invalidation detection is wired up.  At 300 K with
-        1 fs timestep, atoms move ~0.03 A/step which is well within the
-        ghost shell for hundreds of steps.
+        Returns ``True`` if any atom's current position maps to a
+        different rank than ``self.rank``.
         """
-        return False
+        new_ranks = self.partitioner.assign_atoms_to_ranks(local_batch.positions)
+        return (new_ranks != self.rank).any().item()
 
     def migrate(self, local_batch: Batch) -> Batch:
         """Detect atoms that left this rank's domain and redistribute them.
@@ -278,21 +277,48 @@ class AtomMigrator:
             for req in reqs:
                 req.wait()
 
-        # 9. Build the new local batch.
+        # 9. Build the new local batch as a single-graph Batch.
         #    Staying atoms: the slice of sorted_idx that maps to our rank.
         staying_idx = send_indices[rank]
 
-        new_batch = local_batch.index_select(
-            _graph_indices_for_atoms(local_batch, staying_idx)
-        )
+        # Collect staying-atom fields from the current batch.
+        staying_fields: dict[str, torch.Tensor] = {}
+        for name in _ALL_FIELDS:
+            t = getattr(local_batch, name, None)
+            if t is None:
+                continue
+            staying_fields[name] = t[staying_idx]
 
-        # If we received atoms, unpack them and build a temporary batch to
-        # append.  For the POC we construct per-atom AtomicData and batch them.
+        # If we received atoms, unpack and concatenate with staying atoms.
         if recv_buffers:
             all_received = torch.cat(recv_buffers, dim=0)
             incoming_fields = unpack_atom_fields(all_received, layout)
-            incoming_batch = _build_batch_from_fields(incoming_fields, device)
-            new_batch.append(incoming_batch)
+            combined_fields: dict[str, torch.Tensor] = {}
+            for name in staying_fields:
+                if name in incoming_fields:
+                    combined_fields[name] = torch.cat(
+                        [staying_fields[name], incoming_fields[name]], dim=0
+                    )
+                else:
+                    combined_fields[name] = staying_fields[name]
+            # Include any incoming-only fields (unlikely but safe).
+            for name in incoming_fields:
+                if name not in combined_fields:
+                    combined_fields[name] = incoming_fields[name]
+        else:
+            combined_fields = staying_fields
+
+        # Build a fresh single-graph Batch from the combined fields,
+        # preserving cell and pbc from the original batch.
+        new_batch = _build_batch_from_fields(combined_fields, device)
+
+        # Preserve system-level fields.
+        if hasattr(local_batch, "cell") and local_batch.cell is not None:
+            new_batch.cell = local_batch.cell.clone()
+        if hasattr(local_batch, "pbc") and local_batch.pbc is not None:
+            new_batch.pbc = local_batch.pbc.clone()
+        if hasattr(local_batch, "energies") and local_batch.energies is not None:
+            new_batch.energies = local_batch.energies.clone()
 
         return new_batch
 

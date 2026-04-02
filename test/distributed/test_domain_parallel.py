@@ -843,51 +843,48 @@ class TestEnsureOutputTensors:
         torch.testing.assert_close(batch.forces, original_forces)
         torch.testing.assert_close(batch.energies, original_energies)
 
-    def test_forces_wrong_size_via_padded_batch(self) -> None:
-        """Simulate the ghost-exchange scenario: a padded batch is built from
-        a larger set of atoms, but forces from the pre-exchange batch have
-        the wrong size. We verify _ensure_output_tensors handles this case
-        by building two batches of different sizes."""
-        # Build a small batch with 3 atoms + forces
-        data_small = AtomicData(
-            positions=torch.randn(3, 3),
-            atomic_numbers=torch.tensor([6] * 3, dtype=torch.long),
-        )
-        data_small.add_node_property("forces", torch.randn(3, 3))
-        batch_small = Batch.from_data_list([data_small])
-        assert batch_small.forces.shape == (3, 3)
+    def test_forces_wrong_size_reallocated(self) -> None:
+        """When forces exist but have wrong atom count, they should be reallocated.
 
-        # Build a larger padded batch (simulating ghost exchange grew the batch)
-        data_large = AtomicData(
-            positions=torch.randn(5, 3),
-            atomic_numbers=torch.tensor([6] * 5, dtype=torch.long),
-        )
-        batch_large = Batch.from_data_list([data_large])
-        # This batch has no forces — _ensure_output_tensors should add them
-        DomainParallel._ensure_output_tensors(batch_large)
-        assert batch_large.forces.shape == (5, 3)
+        The Batch storage validates shapes on assignment, so we simulate the
+        wrong-size condition via a lightweight mock that mimics the Batch
+        interface used by _ensure_output_tensors.
+        """
+        from unittest.mock import MagicMock
 
-    def test_energies_wrong_num_graphs_via_multi_graph(self) -> None:
-        """Test energies reallocation with a multi-graph batch where we set
-        energies with the correct num_graphs first, then verify the method
-        does not touch them."""
-        data1 = AtomicData(
-            positions=torch.randn(3, 3),
-            atomic_numbers=torch.tensor([6] * 3, dtype=torch.long),
-        )
-        data2 = AtomicData(
-            positions=torch.randn(2, 3),
-            atomic_numbers=torch.tensor([8] * 2, dtype=torch.long),
-        )
-        batch = Batch.from_data_list([data1, data2])
-        batch.forces = torch.zeros(5, 3)
-        batch.energies = torch.zeros(2, 1, dtype=torch.float64)
+        mock_batch = MagicMock()
+        mock_batch.num_nodes = 5
+        mock_batch.num_graphs = 1
+        mock_batch.positions = torch.randn(5, 3)
+        mock_batch.forces = torch.randn(3, 3)  # wrong size
+        mock_batch.energies = torch.zeros(1, 1, dtype=torch.float64)
 
-        DomainParallel._ensure_output_tensors(batch)
+        DomainParallel._ensure_output_tensors(mock_batch)
 
-        # Both should have correct shapes for 2 graphs, 5 atoms
-        assert batch.forces.shape == (5, 3)
-        assert batch.energies.shape == (2, 1)
+        # Forces should have been reassigned to shape (5, 3)
+        assert mock_batch.forces.shape == (5, 3)
+        assert (mock_batch.forces == 0).all()
+
+    def test_energies_wrong_size_reallocated(self) -> None:
+        """When energies exist but have wrong graph count, they should be reallocated.
+
+        Uses a mock to simulate the shape mismatch since Batch storage
+        validates tensor sizes on assignment.
+        """
+        from unittest.mock import MagicMock
+
+        mock_batch = MagicMock()
+        mock_batch.num_nodes = 5
+        mock_batch.num_graphs = 1
+        mock_batch.positions = torch.randn(5, 3)
+        mock_batch.forces = torch.randn(5, 3)  # correct size
+        mock_batch.energies = torch.zeros(2, 1, dtype=torch.float64)  # wrong size
+
+        DomainParallel._ensure_output_tensors(mock_batch)
+
+        # Energies should have been reassigned to shape (1, 1)
+        assert mock_batch.energies.shape == (1, 1)
+        assert (mock_batch.energies == 0).all()
 
 
 # ---------------------------------------------------------------------------
@@ -1046,3 +1043,76 @@ class TestPrimeForces:
         # mock_inner.step_count should be 2 (one per step call)
         # If _prime_forces ran twice, there would be extra calls to compute
         assert mock_inner.step_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _invalidate_nl_ref tests
+# ---------------------------------------------------------------------------
+
+
+class TestInvalidateNlRef:
+    """Test _invalidate_nl_ref resets NeighborListHook reference positions."""
+
+    def test_resets_ref_positions(self) -> None:
+        """When inner dynamics has a NeighborListHook, _ref_positions should be None'd."""
+        from nvalchemi.dynamics.hooks.neighbor_list import NeighborListHook
+
+        dp, inner = _make_domain_parallel()
+
+        # Use __new__ to bypass __init__ of NeighborListHook.
+        nl_hook = NeighborListHook.__new__(NeighborListHook)
+        nl_hook._ref_positions = torch.randn(5, 3)
+        inner.hooks = [nl_hook]
+
+        dp._invalidate_nl_ref()
+
+        assert nl_hook._ref_positions is None
+
+    def test_no_nl_hook_is_noop(self) -> None:
+        """When inner dynamics has no NeighborListHook, _invalidate_nl_ref is a no-op."""
+        dp, inner = _make_domain_parallel()
+        # inner.hooks is empty by default
+        dp._invalidate_nl_ref()  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# _apply_aabb multi-graph tests
+# ---------------------------------------------------------------------------
+
+
+class TestApplyAABBMultiGraph:
+    """Test _apply_aabb with multi-graph batch (cell expansion branch)."""
+
+    def test_multi_graph_cell_expanded(self) -> None:
+        """When batch has 2 graphs, local_cell should expand to 2 entries."""
+        dp, _ = _make_domain_parallel()
+
+        data1 = AtomicData(
+            atomic_numbers=torch.tensor([6, 6, 6], dtype=torch.long),
+            positions=torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]),
+        )
+        data2 = AtomicData(
+            atomic_numbers=torch.tensor([8, 8], dtype=torch.long),
+            positions=torch.tensor([[2.0, 3.0, 4.0], [5.0, 6.0, 7.0]]),
+        )
+        batch = Batch.from_data_list([data1, data2])
+        batch.cell = torch.stack(
+            [
+                torch.diag(torch.tensor([10.0, 10.0, 10.0])),
+                torch.diag(torch.tensor([12.0, 12.0, 12.0])),
+            ]
+        )  # (2, 3, 3)
+
+        # Set a geometry snapshot so _apply_aabb can update pos_min.
+        dp._geometry_snapshot = _GeometrySnapshot(
+            original_cell=batch.cell.clone(),
+            original_pbc=torch.tensor([[True, True, True], [True, True, True]]),
+            pos_min=torch.zeros(3),
+        )
+
+        dp._apply_aabb(batch)
+
+        # Cell should have 2 graphs
+        assert batch.cell.shape[0] == 2
+        # All positions should be non-negative (shifted to origin)
+        assert (batch.positions >= -0.02).all()  # allow for epsilon
