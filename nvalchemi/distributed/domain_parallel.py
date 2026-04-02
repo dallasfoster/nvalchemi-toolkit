@@ -50,7 +50,7 @@ class _AABBPrepareHook:
     fresh ``Batch`` in a different local coordinate frame.
     """
 
-    stage = DynamicsStage.BEFORE_COMPUTE
+    stage = DynamicsStage.AFTER_PRE_UPDATE
     frequency: int = 1
 
     def __init__(self, domain_parallel: DomainParallel) -> None:
@@ -682,6 +682,11 @@ class DomainParallel(BaseDynamics):
 
         self._ensure_output_tensors(padded_batch)
 
+        # Fire AFTER_PRE_UPDATE to trigger _AABBPrepareHook (computes
+        # AABB and shifts positions to local origin).  No pre_update
+        # ran, but the hook handles this correctly — it just computes
+        # the AABB from current positions.
+        self._dynamics._call_hooks(DynamicsStage.AFTER_PRE_UPDATE, padded_batch)
         # Fire BEFORE_COMPUTE hooks (NeighborListHook builds the neighbor list)
         self._dynamics._call_hooks(DynamicsStage.BEFORE_COMPUTE, padded_batch)
         # Model forward pass — populates forces and energies
