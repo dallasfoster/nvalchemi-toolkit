@@ -78,6 +78,14 @@ class DomainParallel(BaseDynamics):
         self._geometry_snapshot: _GeometrySnapshot | None = None
         self._forces_primed: bool = False
 
+        # AABB / NL persistence state.
+        # Caching pos_min between steps keeps the local coordinate frame
+        # stable so the NeighborListHook's skin check computes correct
+        # displacements.  The NL ref is only invalidated when the padded
+        # batch size changes (ghost count changed).
+        self._cached_pos_min: torch.Tensor | None = None
+        self._prev_n_padded: int = 0
+
         # Determine rank from mesh, or fall back to dist / 0.
         if config.mesh is not None:
             try:
@@ -505,8 +513,17 @@ class DomainParallel(BaseDynamics):
         dyn._call_hooks(DynamicsStage.AFTER_PRE_UPDATE, padded_batch)
 
         # --- AABB geometry: compute cell from current positions ---
-        self._apply_aabb(padded_batch)
-        self._invalidate_nl_ref()
+        # Only recompute the AABB origin and invalidate the NL when the
+        # padded batch size changes (ghost count changed).  When the size
+        # is stable, reuse the cached origin to keep the coordinate frame
+        # consistent — this lets the NL skin check work correctly and
+        # avoids forced rebuilds that cause energy drift.
+        n_padded = padded_batch.num_nodes
+        size_changed = n_padded != self._prev_n_padded
+        self._apply_aabb(padded_batch, force_recompute=size_changed)
+        if size_changed:
+            self._invalidate_nl_ref()
+            self._prev_n_padded = n_padded
 
         # --- Diagnostic: state AFTER pre_update + AABB, BEFORE compute ---
         if step < 50 and step % 5 == 0:
@@ -571,21 +588,34 @@ class DomainParallel(BaseDynamics):
         dyn.step_count += 1
         return padded_batch, converged
 
-    def _apply_aabb(self, batch: Batch) -> None:
+    def _apply_aabb(self, batch: Batch, force_recompute: bool = False) -> None:
         """Compute the AABB cell from current positions and shift to origin.
 
         Called between ``pre_update`` and ``compute`` so the cell-list
         neighbor builder always sees positions within ``[0, box_length)``.
-        Updates ``self._geometry_snapshot.pos_min`` for later restoration.
+
+        When ``force_recompute`` is False and a cached ``pos_min`` exists,
+        the cached origin is reused to keep the local coordinate frame
+        stable across steps.  This allows the NeighborListHook's skin
+        check to compute correct displacements, avoiding forced rebuilds.
+        The AABB cell is padded by ``skin`` to accommodate atom movement
+        between rebuilds.
         """
         positions = batch.positions
-        pos_min = positions.min(dim=0).values
-        pos_max = positions.max(dim=0).values
+        skin = self._config.skin
 
-        # Small epsilon so atoms at the exact boundary are inside.
-        eps = 0.01
-        pos_min = pos_min - eps
-        box_lengths = (pos_max - pos_min + eps).clamp(min=1e-6)
+        if self._cached_pos_min is not None and not force_recompute:
+            # Reuse cached origin — keeps the coordinate frame stable
+            # so the NL skin check works correctly.
+            pos_min = self._cached_pos_min
+        else:
+            # Fresh AABB computation: pad by skin so atoms can move
+            # within the cell between NL rebuilds.
+            pos_min = positions.min(dim=0).values - skin - 0.01
+            self._cached_pos_min = pos_min
+
+        pos_max = positions.max(dim=0).values
+        box_lengths = (pos_max - pos_min + skin + 0.01).clamp(min=1e-6)
 
         local_cell = torch.diag(box_lengths).unsqueeze(0)
         if batch.cell.shape[0] > 1:
@@ -950,9 +980,11 @@ class DomainParallel(BaseDynamics):
         self._ensure_output_tensors(padded_batch)
 
         # Compute AABB and shift positions (no pre_update needed for
-        # priming — positions haven't moved).
-        self._apply_aabb(padded_batch)
+        # priming — positions haven't moved).  Force fresh computation
+        # to initialize the cached AABB state.
+        self._apply_aabb(padded_batch, force_recompute=True)
         self._invalidate_nl_ref()
+        self._prev_n_padded = padded_batch.num_nodes
 
         # Build neighbor list + model forward.
         self._dynamics._call_hooks(DynamicsStage.BEFORE_COMPUTE, padded_batch)
