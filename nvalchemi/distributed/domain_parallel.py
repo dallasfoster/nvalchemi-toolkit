@@ -375,6 +375,41 @@ class DomainParallel(BaseDynamics):
         else:
             batch = padded_batch
 
+        # --- Diagnostic: after strip, compare owned energy/forces ---
+        if self.step_count < 50 and self.step_count % 5 == 0:
+            _e = batch.energies
+            _f = batch.forces
+            _p = batch.positions
+            _v = (
+                batch.velocities
+                if hasattr(batch, "velocities") and batch.velocities is not None
+                else None
+            )
+            # Kinetic energy: 0.5 * m * v^2 (sum over all atoms)
+            if (
+                _v is not None
+                and hasattr(batch, "atomic_masses")
+                and batch.atomic_masses is not None
+            ):
+                ke = (0.5 * batch.atomic_masses.unsqueeze(-1) * _v**2).sum().item()
+            else:
+                ke = 0
+            logger.info(
+                "[rank %d] step %d DIAG after_strip: n_owned=%d E_pot=%.4f KE=%.4f "
+                "E_total=%.4f fmax=%.6f pos_range=[%.2f,%.2f]",
+                self._domain_rank,
+                self.step_count,
+                _p.shape[0],
+                _e.sum().item() if _e is not None else 0,
+                ke,
+                (_e.sum().item() if _e is not None else 0) + ke,
+                _f.norm(dim=-1).max().item()
+                if _f is not None and _f.numel() > 0
+                else 0,
+                _p.min().item(),
+                _p.max().item(),
+            )
+
         # NOTE: Position wrapping (PBC modulo) is intentionally NOT done
         # here.  Wrapping teleports atoms to the opposite side of the box,
         # placing them on the wrong rank with no ghost neighbors until
@@ -444,23 +479,82 @@ class DomainParallel(BaseDynamics):
 
         dyn._call_hooks(DynamicsStage.BEFORE_STEP, padded_batch)
 
+        # --- Diagnostic: state BEFORE pre_update ---
+        step = self.step_count
+        if step < 50 and step % 5 == 0:
+            n_owned = self._n_owned
+            _e = padded_batch.energies
+            _f = padded_batch.forces
+            _p = padded_batch.positions
+            logger.info(
+                "[rank %d] step %d DIAG pre_update_in: n_total=%d n_owned=%d "
+                "E_padded=%.4f fmax_owned=%.6f pos_max=%.2f",
+                self._domain_rank,
+                step,
+                _p.shape[0],
+                n_owned,
+                _e.sum().item() if _e is not None else 0,
+                _f[:n_owned].norm(dim=-1).max().item()
+                if _f is not None and n_owned > 0
+                else 0,
+                _p[:n_owned].abs().max().item(),
+            )
+
         # --- pre_update (velocity Verlet half-kick) ---
         dyn._call_hooks(DynamicsStage.BEFORE_PRE_UPDATE, padded_batch)
         dyn.pre_update(padded_batch)
         dyn._call_hooks(DynamicsStage.AFTER_PRE_UPDATE, padded_batch)
 
         # --- AABB geometry: compute cell from current positions ---
-        # This is the key insertion point.  Positions have been moved
-        # by pre_update, so the AABB now encompasses all current atoms.
-        # The cell-list neighbor builder (fired next) will see positions
-        # that are guaranteed to be inside the cell.
         self._apply_aabb(padded_batch)
         self._invalidate_nl_ref()
+
+        # --- Diagnostic: state AFTER pre_update + AABB, BEFORE compute ---
+        if step < 50 and step % 5 == 0:
+            _p = padded_batch.positions
+            # Check how many neighbors the NL hook will find
+            nm = getattr(padded_batch, "neighbor_matrix", None)
+            nn = getattr(padded_batch, "num_neighbors", None)
+            logger.info(
+                "[rank %d] step %d DIAG pre_compute: pos_range=[%.2f,%.2f] "
+                "has_NL=%s cell_diag=[%.2f,%.2f,%.2f]",
+                self._domain_rank,
+                step,
+                _p.min().item(),
+                _p.max().item(),
+                nm is not None,
+                padded_batch.cell[0, 0, 0].item(),
+                padded_batch.cell[0, 1, 1].item(),
+                padded_batch.cell[0, 2, 2].item(),
+            )
 
         # --- compute (neighbor list build + model forward) ---
         dyn._call_hooks(DynamicsStage.BEFORE_COMPUTE, padded_batch)
         dyn.compute(padded_batch)
         dyn._call_hooks(DynamicsStage.AFTER_COMPUTE, padded_batch)
+
+        # --- Diagnostic: state AFTER compute, BEFORE post_update ---
+        if step < 50 and step % 5 == 0:
+            n_owned = self._n_owned
+            _e = padded_batch.energies
+            _f = padded_batch.forces
+            nn = getattr(padded_batch, "num_neighbors", None)
+            logger.info(
+                "[rank %d] step %d DIAG post_compute: E_padded=%.4f "
+                "fmax_owned=%.6f fmean_owned=%.6f "
+                "avg_neighbors=%.1f min_neighbors=%d",
+                self._domain_rank,
+                step,
+                _e.sum().item() if _e is not None else 0,
+                _f[:n_owned].norm(dim=-1).max().item()
+                if _f is not None and n_owned > 0
+                else 0,
+                _f[:n_owned].norm(dim=-1).mean().item()
+                if _f is not None and n_owned > 0
+                else 0,
+                nn.float().mean().item() if nn is not None else 0,
+                nn.min().item() if nn is not None else 0,
+            )
 
         # --- post_update (velocity Verlet finalize) ---
         dyn._call_hooks(DynamicsStage.BEFORE_POST_UPDATE, padded_batch)
