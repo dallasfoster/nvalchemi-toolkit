@@ -329,22 +329,14 @@ def main() -> None:
     )
 
     # ── 4. Dynamics ──────────────────────────────────────────
-    # skin=0.0 forces a full neighbor list rebuild every step.
-    # This avoids stale neighbor data when the padded batch is rebuilt
-    # fresh each step by GhostExchanger (new Batch object, different
-    # tensor storage — the skin check sees small displacement from
-    # _ref_positions but the actual neighbor_matrix is on the old batch).
-    nl_hook = NeighborListHook(config=neighbor_config, skin=0.0)
+    nl_hook = NeighborListHook(config=neighbor_config, skin=4.25)
     nve = NVE(model=model, dt=1.0, hooks=[nl_hook])
-    log(rank, "NVE integrator: dt=1.0 fs, skin=0.0 A (force rebuild every step)")
+    log(rank, "NVE integrator: dt=1.0 fs, skin=4.25 A")
 
     # ── 5. Domain config ─────────────────────────────────────
-    # ghost_width must be at least cutoff; extra skin for ghost shell
-    # is separate from the NL skin (which is 0 to force rebuilds).
     config = DomainConfig(
         cutoff=neighbor_config.cutoff,
-        skin=0.0,
-        ghost_width=neighbor_config.cutoff + 4.25,  # explicit ghost width
+        skin=4.25,
         mesh=mesh,
         mesh_dim="domain",
     )

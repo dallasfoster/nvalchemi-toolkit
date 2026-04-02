@@ -36,6 +36,67 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _AABBPrepareHook:
+    """Inner hook that recomputes the AABB cell at BEFORE_COMPUTE.
+
+    Registered on the inner dynamics so it fires AFTER ``pre_update``
+    has moved atoms but BEFORE the neighbor-list build and model
+    forward.  This ensures the cell always encompasses the actual
+    positions the cell-list builder will see, avoiding out-of-bounds
+    indices when ``pbc=False``.
+
+    Also invalidates the ``NeighborListHook``'s skin-check reference
+    positions to force a full rebuild, since each step operates on a
+    fresh ``Batch`` in a different local coordinate frame.
+    """
+
+    stage = DynamicsStage.BEFORE_COMPUTE
+    frequency: int = 1
+
+    def __init__(self, domain_parallel: DomainParallel) -> None:
+        self._dp = domain_parallel
+
+    def __call__(self, ctx: HookContext, stage: object) -> None:
+        batch = ctx.batch
+        positions = batch.positions
+
+        # Recompute AABB from current (post-pre_update) positions.
+        pos_min = positions.min(dim=0).values
+        pos_max = positions.max(dim=0).values
+
+        # Small epsilon padding — NOT the 1 Å duct-tape.  Since we
+        # compute the AABB from the actual current positions (after
+        # pre_update has moved atoms), atoms are guaranteed to be
+        # inside.  The epsilon just avoids zero-width cells.
+        eps = 0.01
+        pos_min = pos_min - eps
+        box_lengths = (pos_max - pos_min + eps).clamp(min=1e-6)
+
+        local_cell = torch.diag(box_lengths).unsqueeze(0)
+        batch.cell = local_cell.to(dtype=batch.cell.dtype, device=batch.cell.device)
+
+        # Shift positions so minimum is at origin.
+        batch.positions = positions - pos_min
+
+        # Save pos_min for unprepare (overwrite the pre-step snapshot).
+        if self._dp._geometry_snapshot is not None:
+            self._dp._geometry_snapshot.pos_min = pos_min
+
+        # Invalidate the NeighborListHook's reference positions.
+        # Each step creates a fresh Batch in a different local frame,
+        # so the skin-check displacement is meaningless across steps.
+        self._invalidate_nl_ref_positions()
+
+    def _invalidate_nl_ref_positions(self) -> None:
+        """Reset _ref_positions on the inner NeighborListHook to force rebuild."""
+        from nvalchemi.dynamics.hooks.neighbor_list import NeighborListHook
+
+        for hook in self._dp._dynamics.hooks:
+            if isinstance(hook, NeighborListHook):
+                hook._ref_positions = None
+                break
+
+
 class DomainParallel(BaseDynamics):
     """Wraps any ``BaseDynamics`` subclass with spatial domain decomposition.
 
@@ -78,6 +139,11 @@ class DomainParallel(BaseDynamics):
         self._n_owned: int = 0
         self._geometry_snapshot: _GeometrySnapshot | None = None
         self._forces_primed: bool = False
+
+        # Register the AABB-prepare hook on the INNER dynamics so it
+        # fires at BEFORE_COMPUTE (after pre_update has moved atoms).
+        self._aabb_hook = _AABBPrepareHook(self)
+        self._dynamics.register_hook(self._aabb_hook)
 
         # Determine rank from mesh, or fall back to dist / 0.
         if config.mesh is not None:
@@ -318,74 +384,11 @@ class DomainParallel(BaseDynamics):
         # BaseDynamics.compute() can write into them in-place.
         self._ensure_output_tensors(padded_batch)
 
-        # --- DEBUG: log state before inner step ---
-        if self.step_count < 2:
-            _f = padded_batch.forces
-            _p = padded_batch.positions
-            _v = (
-                padded_batch.velocities
-                if hasattr(padded_batch, "velocities")
-                and padded_batch.velocities is not None
-                else None
-            )
-            logger.info(
-                "[rank %d] step %d: PRE-INNER n=%d f_range=[%.4e,%.4e] f_mean=%.4e p_range=[%.2f,%.2f] v_range=[%.4e,%.4e]",
-                self._domain_rank,
-                self.step_count,
-                _p.shape[0],
-                _f.min().item() if _f is not None else 0,
-                _f.max().item() if _f is not None else 0,
-                _f.abs().mean().item() if _f is not None else 0,
-                _p.min().item(),
-                _p.max().item(),
-                _v.min().item() if _v is not None else 0,
-                _v.max().item() if _v is not None else 0,
-            )
-
-        # --- DEBUG: log neighbor matrix state ---
-        if self.step_count < 2:
-            nm = getattr(padded_batch, "neighbor_matrix", None)
-            nn = getattr(padded_batch, "num_neighbors", None)
-            if nm is not None:
-                logger.info(
-                    "[rank %d] step %d: neighbor_matrix shape=%s dtype=%s nnz=%d total_neighbors=%s",
-                    self._domain_rank,
-                    self.step_count,
-                    tuple(nm.shape),
-                    nm.dtype,
-                    (nm != -1).sum().item() if nm.numel() > 0 else 0,
-                    nn.sum().item() if nn is not None else "N/A",
-                )
-            else:
-                logger.info(
-                    "[rank %d] step %d: NO neighbor_matrix on padded batch!",
-                    self._domain_rank,
-                    self.step_count,
-                )
-
         logger.info(
             "[rank %d] step %d: inner dynamics step", self._domain_rank, self.step_count
         )
         # 4. Inner dynamics step
         padded_batch, converged = self._dynamics.step(padded_batch)
-
-        # --- DEBUG: log state after inner step ---
-        if self.step_count < 2:
-            _f = padded_batch.forces
-            _p = padded_batch.positions
-            _e = padded_batch.energies
-            logger.info(
-                "[rank %d] step %d: POST-INNER n=%d f_range=[%.4e,%.4e] f_mean=%.4e p_range=[%.2f,%.2f] E=%.4e",
-                self._domain_rank,
-                self.step_count,
-                _p.shape[0],
-                _f.min().item() if _f is not None else 0,
-                _f.max().item() if _f is not None else 0,
-                _f.abs().mean().item() if _f is not None else 0,
-                _p.min().item(),
-                _p.max().item(),
-                _e.sum().item() if _e is not None else 0,
-            )
 
         logger.info(
             "[rank %d] step %d: unprepare padded batch",
@@ -424,13 +427,23 @@ class DomainParallel(BaseDynamics):
     # ------------------------------------------------------------------
 
     def _prepare_padded_batch(self, padded_batch: Batch) -> _GeometrySnapshot:
-        """Replace the batch cell with a local bounding box and shift positions.
+        """Save the original cell and PBC, then set ``pbc=False``.
 
-        Saves the original cell and PBC so they can be restored after the
-        inner dynamics step.  The local bounding box is computed as the
-        axis-aligned bounding box (AABB) of all atom positions (owned +
-        ghost), and ``pbc`` is set to ``False`` so the inner neighbor list
-        builder uses open boundaries within the subdomain.
+        The actual AABB cell and position shift happen later, at
+        ``BEFORE_COMPUTE``, via :class:`_AABBPrepareHook`.  This ensures
+        the cell is computed from the **current** positions (after
+        ``pre_update`` has moved atoms), so the cell-list builder always
+        sees positions within the cell.
+
+        Here we only:
+
+        1. Save the original cell and PBC for later restoration.
+        2. Set ``pbc=False`` so the inner neighbor list builder uses
+           open boundaries within the subdomain.
+        3. Compute an initial AABB and shift for ``pre_update`` to use
+           (forces are translation-invariant, so exact AABB doesn't
+           matter for the half-kick — only for the cell-list build that
+           comes after, which the hook handles).
 
         Parameters
         ----------
@@ -444,7 +457,7 @@ class DomainParallel(BaseDynamics):
         """
         positions = padded_batch.positions  # (N, 3)
 
-        # Save originals
+        # Save originals.
         original_cell = padded_batch.cell.clone()
         original_pbc = (
             padded_batch.pbc.clone()
@@ -452,54 +465,36 @@ class DomainParallel(BaseDynamics):
             else torch.ones(1, 3, dtype=torch.bool, device=positions.device)
         )
 
-        # Compute AABB
-        pos_min = positions.min(dim=0).values  # (3,)
-        pos_max = positions.max(dim=0).values  # (3,)
-        box_lengths = pos_max - pos_min
+        # Compute initial AABB (will be recomputed by _AABBPrepareHook
+        # after pre_update, but needed here for the position shift).
+        pos_min = positions.min(dim=0).values
+        pos_max = positions.max(dim=0).values
+        box_lengths = (pos_max - pos_min).clamp(min=1e-6)
 
         logger.info(
-            "[rank %d] prepare: %d atoms, AABB [%.2f,%.2f,%.2f]→[%.2f,%.2f,%.2f] box=[%.2f,%.2f,%.2f] num_graphs=%d",
+            "[rank %d] prepare: %d atoms, pos_range=[%.2f,%.2f,%.2f]→[%.2f,%.2f,%.2f] num_graphs=%d",
             self._domain_rank,
             positions.shape[0],
             *pos_min.tolist(),
             *pos_max.tolist(),
-            *box_lengths.tolist(),
             padded_batch.num_graphs,
         )
 
-        # Add padding to the AABB so atoms can't escape the cell during
-        # the inner step's pre_update (velocity Verlet half-kick).  With
-        # pbc=False, atoms outside the cell cause the cell-list neighbor
-        # builder to produce out-of-bounds indices.  1 Å padding per side
-        # is generous for typical MD velocities (v_max * dt ≈ 0.04 Å).
-        aabb_padding = 1.0
-        pos_min = pos_min - aabb_padding
-        pos_max = pos_max + aabb_padding
-        box_lengths = pos_max - pos_min
-
-        # Clamp to avoid zero-width boxes
-        eps = 1e-6
-        box_lengths = box_lengths.clamp(min=eps)
-
-        # Build orthorhombic cell from AABB
-        local_cell = torch.diag(box_lengths).unsqueeze(0)  # (1, 3, 3)
-        # Expand to match batch dimension if needed
+        # Set cell to initial AABB (will be overwritten by the hook).
+        local_cell = torch.diag(box_lengths).unsqueeze(0)
         if padded_batch.cell.shape[0] > 1:
             local_cell = local_cell.expand(padded_batch.cell.shape[0], -1, -1)
-
-        # Replace cell and PBC
         padded_batch.cell = local_cell.to(
             dtype=padded_batch.cell.dtype, device=padded_batch.cell.device
         )
 
-        # Set pbc=False (open boundaries within the subdomain).
-        # pbc shape is (B, 3) to match Batch conventions.
-        n_graphs = padded_batch.cell.shape[0]
+        # Set pbc=False.
+        n_graphs = max(1, padded_batch.cell.shape[0])
         padded_batch.pbc = torch.zeros(
             n_graphs, 3, dtype=torch.bool, device=positions.device
         )
 
-        # Shift positions to [0, box_lengths) origin
+        # Shift positions to local origin.
         padded_batch.positions = positions - pos_min
 
         snapshot = _GeometrySnapshot(
@@ -715,18 +710,7 @@ class DomainParallel(BaseDynamics):
         else:
             batch = padded_batch
 
-        # --- DEBUG: log primed forces ---
-        _f = batch.forces
-        _e = batch.energies
-        logger.info(
-            "[rank %d] force priming complete: n=%d f_range=[%.4e,%.4e] fmax_norm=%.4e E=%.4e",
-            self._domain_rank,
-            batch.positions.shape[0],
-            _f.min().item() if _f is not None else 0,
-            _f.max().item() if _f is not None else 0,
-            _f.norm(dim=-1).max().item() if _f is not None else 0,
-            _e.sum().item() if _e is not None else 0,
-        )
+        logger.info("[rank %d] force priming complete", self._domain_rank)
         return batch
 
     # ------------------------------------------------------------------
