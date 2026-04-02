@@ -218,7 +218,6 @@ class AtomMigrator:
             return local_batch
 
         world_size = self.world_size
-        rank = self.rank
         device = local_batch.positions.device
 
         # 1. Recompute rank assignments for all local atoms.
@@ -238,75 +237,36 @@ class AtomMigrator:
             sorted_idx[offsets[r] : offsets[r + 1]] for r in range(world_size)
         ]
 
-        # 4. Exchange counts via all_to_all_single so every rank knows how
-        #    many atoms it will receive from each other rank.
-        recv_counts = torch.empty_like(counts)
-        dist.all_to_all_single(recv_counts, counts, group=self.mesh.get_group())
+        # 4. Build sizes matrix via all_gather: sizes[i][j] = atoms rank i sends to rank j.
+        group = self.mesh.get_group()
+        all_counts_list = [torch.zeros_like(counts) for _ in range(world_size)]
+        dist.all_gather(all_counts_list, counts, group=group)
+        sizes = [c.tolist() for c in all_counts_list]
 
         # 5. Determine field layout and packed dimension.
         layout = _compute_field_layout(local_batch)
-        pdim = packed_dim(local_batch)
-        dtype = local_batch.positions.dtype
 
-        # 6-8. Exchange atom data using batch_isend_irecv to avoid
-        #       NCCL unbatched P2P communicator issues.
-        p2p_ops: list[dist.P2POp] = []
-        _send_bufs: list[torch.Tensor] = []  # prevent GC before send completes
-        recv_buffers: list[torch.Tensor] = []
-        recv_src_ranks: list[int] = []
+        # 6. Pack ALL local atoms (indexed_all_to_all_v indexes into the full tensor).
+        packed = pack_atom_fields(
+            local_batch,
+            torch.arange(local_batch.positions.shape[0], device=device),
+        )
 
-        for r in range(world_size):
-            if r == rank:
-                continue
-            n_send = counts[r].item()
-            n_recv = recv_counts[r].item()
+        # 7. Single collective exchange via indexed_all_to_all_v.
+        #    send_indices[r] = atoms going to rank r (including self for staying atoms).
+        from physicsnemo.distributed.utils import indexed_all_to_all_v_wrapper
 
-            if n_send > 0:
-                buf = pack_atom_fields(local_batch, send_indices[r])
-                _send_bufs.append(buf)
-                p2p_ops.append(dist.P2POp(dist.isend, buf, r))
+        received = indexed_all_to_all_v_wrapper(
+            tensor=packed,
+            indices=send_indices,
+            sizes=sizes,
+            dim=0,
+            group=group,
+        )
 
-            if n_recv > 0:
-                recv_buf = torch.empty(n_recv, pdim, dtype=dtype, device=device)
-                recv_buffers.append(recv_buf)
-                recv_src_ranks.append(r)
-                p2p_ops.append(dist.P2POp(dist.irecv, recv_buf, r))
-
-        if p2p_ops:
-            reqs = dist.batch_isend_irecv(p2p_ops)
-            for req in reqs:
-                req.wait()
-
-        # 9. Build the new local batch as a single-graph Batch.
-        #    Staying atoms: the slice of sorted_idx that maps to our rank.
-        staying_idx = send_indices[rank]
-
-        # Collect staying-atom fields from the current batch.
-        staying_fields: dict[str, torch.Tensor] = {}
-        for name in _ALL_FIELDS:
-            t = getattr(local_batch, name, None)
-            if t is None:
-                continue
-            staying_fields[name] = t[staying_idx]
-
-        # If we received atoms, unpack and concatenate with staying atoms.
-        if recv_buffers:
-            all_received = torch.cat(recv_buffers, dim=0)
-            incoming_fields = unpack_atom_fields(all_received, layout)
-            combined_fields: dict[str, torch.Tensor] = {}
-            for name in staying_fields:
-                if name in incoming_fields:
-                    combined_fields[name] = torch.cat(
-                        [staying_fields[name], incoming_fields[name]], dim=0
-                    )
-                else:
-                    combined_fields[name] = staying_fields[name]
-            # Include any incoming-only fields (unlikely but safe).
-            for name in incoming_fields:
-                if name not in combined_fields:
-                    combined_fields[name] = incoming_fields[name]
-        else:
-            combined_fields = staying_fields
+        # 8. Unpack the received tensor — it contains ALL atoms this rank
+        #    should now own (staying + incoming from other ranks).
+        combined_fields = unpack_atom_fields(received, layout)
 
         # Build a fresh single-graph Batch from the combined fields,
         # preserving cell and pbc from the original batch.

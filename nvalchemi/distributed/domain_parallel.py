@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import logging
-import warnings
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -191,26 +190,21 @@ class DomainParallel(BaseDynamics):
             self._n_owned = batch.positions.shape[0]
             return batch
 
-        # Multi-process: POC approach — broadcast the full batch from rank 0,
-        # then each rank selects only its own atoms.  A production
-        # implementation would use scatter_v for efficiency.
+        # Multi-process: use scatter_v to distribute atoms from rank 0.
+        from physicsnemo.distributed.utils import scatter_v_wrapper
+
         from nvalchemi.data.atomic_data import AtomicData
         from nvalchemi.data.batch import Batch as BatchCls
 
+        group = self._config.mesh.get_group() if self._config.mesh is not None else None
+        world_size = dist.get_world_size(group=group)
+
+        # Rank 0: assign atoms to ranks, sort by rank, compute per-rank sizes.
         if self._domain_rank == 0:
             if batch is None:
                 raise ValueError("batch must be provided on rank 0")
+
             n_atoms = batch.positions.shape[0]
-            n_atoms_t = torch.tensor([n_atoms], dtype=torch.int64, device=device)
-        else:
-            n_atoms_t = torch.tensor([0], dtype=torch.int64, device=device)
-
-        # Broadcast atom count so all ranks can allocate receive buffers.
-        dist.broadcast(n_atoms_t, src=0)
-        n_atoms = n_atoms_t.item()
-
-        # Broadcast per-atom data: positions, velocities, atomic_numbers, atomic_masses.
-        if self._domain_rank == 0:
             all_positions = batch.positions.clone()
             all_velocities = (
                 batch.velocities.clone()
@@ -223,35 +217,91 @@ class DomainParallel(BaseDynamics):
                 if hasattr(batch, "atomic_masses") and batch.atomic_masses is not None
                 else torch.ones(n_atoms, device=device)
             )
+
+            rank_assignment = self._partitioner.assign_atoms_to_ranks(all_positions)
+            rank_assignment = rank_assignment.to(torch.int64)
+            sorted_idx = torch.argsort(rank_assignment)
+            per_rank_counts = torch.bincount(rank_assignment, minlength=world_size)
+            per_rank_sizes = per_rank_counts.tolist()
+
+            # Sort all fields by rank assignment.
+            sorted_positions = all_positions[sorted_idx]
+            sorted_velocities = all_velocities[sorted_idx]
+            sorted_atomic_numbers = all_atomic_numbers[sorted_idx]
+            sorted_atomic_masses = all_atomic_masses[sorted_idx]
+            has_velocities = (
+                hasattr(batch, "velocities")
+                and batch.velocities is not None
+                and batch.velocities.any()
+            )
         else:
-            all_positions = torch.zeros(n_atoms, 3, device=device)
-            all_velocities = torch.zeros(n_atoms, 3, device=device)
-            all_atomic_numbers = torch.zeros(n_atoms, dtype=torch.int64, device=device)
-            all_atomic_masses = torch.zeros(n_atoms, device=device)
+            # Dummy tensors for non-root ranks (scatter_v_wrapper requires a tensor).
+            sorted_positions = torch.zeros(0, 3, device=device)
+            sorted_velocities = torch.zeros(0, 3, device=device)
+            sorted_atomic_numbers = torch.zeros(0, dtype=torch.int64, device=device)
+            sorted_atomic_masses = torch.zeros(0, device=device)
+            per_rank_sizes = [0] * world_size
+            has_velocities = False
 
-        dist.broadcast(all_positions, src=0)
-        dist.broadcast(all_velocities, src=0)
-        dist.broadcast(all_atomic_numbers, src=0)
-        dist.broadcast(all_atomic_masses, src=0)
+        # Broadcast per_rank_sizes and has_velocities so all ranks know them.
+        sizes_tensor = torch.tensor(per_rank_sizes, dtype=torch.int64, device=device)
+        dist.broadcast(sizes_tensor, src=0, group=group)
+        per_rank_sizes = sizes_tensor.tolist()
 
-        # Assign atoms to ranks and select this rank's atoms.
-        rank_assignment = self._partitioner.assign_atoms_to_ranks(all_positions)
-        my_mask = rank_assignment == self._domain_rank
-        my_indices = torch.where(my_mask)[0]
+        has_vel_tensor = torch.tensor(
+            [int(has_velocities)], dtype=torch.int32, device=device
+        )
+        dist.broadcast(has_vel_tensor, src=0, group=group)
+        has_velocities = has_vel_tensor.item() > 0
 
-        # Build local AtomicData → Batch for this rank's atoms.
+        # Scatter per-atom data from rank 0 to all ranks.
+        local_positions = scatter_v_wrapper(
+            tensor=sorted_positions,
+            sizes=per_rank_sizes,
+            dim=0,
+            src=0,
+            group=group,
+        )
+        local_velocities = scatter_v_wrapper(
+            tensor=sorted_velocities,
+            sizes=per_rank_sizes,
+            dim=0,
+            src=0,
+            group=group,
+        )
+        # For 1-D tensors, unsqueeze before scatter_v then squeeze after.
+        local_atomic_numbers = scatter_v_wrapper(
+            tensor=sorted_atomic_numbers.unsqueeze(-1)
+            if sorted_atomic_numbers.ndim == 1
+            else sorted_atomic_numbers,
+            sizes=per_rank_sizes,
+            dim=0,
+            src=0,
+            group=group,
+        ).squeeze(-1)
+        local_atomic_masses = scatter_v_wrapper(
+            tensor=sorted_atomic_masses.unsqueeze(-1)
+            if sorted_atomic_masses.ndim == 1
+            else sorted_atomic_masses,
+            sizes=per_rank_sizes,
+            dim=0,
+            src=0,
+            group=group,
+        ).squeeze(-1)
+
+        # Build local AtomicData -> Batch for this rank's atoms.
         local_data = AtomicData(
-            positions=all_positions[my_indices],
-            atomic_numbers=all_atomic_numbers[my_indices],
-            atomic_masses=all_atomic_masses[my_indices],
+            positions=local_positions,
+            atomic_numbers=local_atomic_numbers,
+            atomic_masses=local_atomic_masses,
             cell=cell_matrix if cell_matrix.ndim == 3 else cell_matrix.unsqueeze(0),
             pbc=pbc if pbc.ndim == 2 else pbc.unsqueeze(0),
         )
-        if all_velocities.any():
-            local_data.add_node_property("velocities", all_velocities[my_indices])
+        if has_velocities:
+            local_data.add_node_property("velocities", local_velocities)
 
         local_batch = BatchCls.from_data_list([local_data], device=device)
-        self._n_owned = my_indices.shape[0]
+        self._n_owned = local_positions.shape[0]
         return local_batch
 
     # ------------------------------------------------------------------
@@ -325,13 +375,14 @@ class DomainParallel(BaseDynamics):
         else:
             batch = padded_batch
 
-        # 6b. Wrap positions back into the periodic box.
-        # The inner step moves atoms with pbc=False (open boundaries),
-        # so atoms can drift outside the global cell.  Without wrapping,
-        # atoms on opposite sides of the PBC boundary lose interactions
-        # (appear 34 Å apart instead of 3.8 Å), causing energy drift
-        # and eventual explosion.
-        self._wrap_positions(batch)
+        # NOTE: Position wrapping (PBC modulo) is intentionally NOT done
+        # here.  Wrapping teleports atoms to the opposite side of the box,
+        # placing them on the wrong rank with no ghost neighbors until
+        # migration runs.  This creates zero-force artifacts worse than
+        # the slow drift from unwrapped positions.  The ghost shell
+        # (12.75 Å) accommodates ~200 steps of drift at 50 K.  For
+        # longer runs, the proper fix is NL persistence across steps
+        # (Phase 2) to eliminate the energy drift that causes heating.
 
         logger.info(
             "[rank %d] step %d: migration check", self._domain_rank, self.step_count
@@ -455,29 +506,6 @@ class DomainParallel(BaseDynamics):
         if self._geometry_snapshot is not None:
             self._geometry_snapshot.pos_min = pos_min
 
-    @staticmethod
-    def _wrap_positions(batch: Batch) -> None:
-        """Wrap atom positions back into the periodic box.
-
-        After the inner step (which runs with ``pbc=False``), atoms may
-        have drifted outside the global cell.  This wraps them back using
-        fractional-coordinate modulo, which is correct for both
-        orthorhombic and triclinic cells.
-        """
-        cell = batch.cell  # (1, 3, 3)
-        pbc = batch.pbc  # (1, 3) bool
-        if cell is None or pbc is None or not pbc.any():
-            return
-
-        cell_3x3 = cell.squeeze(0)  # (3, 3)
-        inv_cell = torch.linalg.inv(cell_3x3)
-
-        # Convert to fractional, wrap periodic dims, convert back.
-        frac = batch.positions @ inv_cell.T  # (N, 3)
-        pbc_mask = pbc.squeeze(0)  # (3,) bool
-        frac[:, pbc_mask] = frac[:, pbc_mask] % 1.0
-        batch.positions = frac @ cell_3x3
-
     def _invalidate_nl_ref(self) -> None:
         """Reset the NeighborListHook's reference positions.
 
@@ -557,29 +585,140 @@ class DomainParallel(BaseDynamics):
     # Gather
     # ------------------------------------------------------------------
 
-    def gather(self) -> Batch | None:
-        """All-gather local batches back to a full batch on rank 0.
+    def gather(self, local_batch: Batch, dst: int = 0) -> Batch | None:
+        """Gather local batches back to a full batch on rank *dst*.
 
-        For the POC this uses ``isend``/``irecv`` — each rank sends to
-        rank 0, which assembles the results.
+        Uses ``physicsnemo.distributed.utils.gather_v_wrapper`` to
+        variable-length gather per-atom tensors from all ranks.
+
+        Parameters
+        ----------
+        local_batch : Batch
+            This rank's owned-atom batch.
+        dst : int
+            Destination rank that receives the full batch.
 
         Returns
         -------
         Batch | None
-            The full batch on rank 0, ``None`` on other ranks.
+            The full batch on rank *dst*, ``None`` on other ranks.
         """
         if not dist.is_initialized():
-            # Single-process: nothing to gather.
+            return local_batch
+
+        from physicsnemo.distributed.utils import gather_v_wrapper
+
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch as BatchCls
+
+        device = local_batch.positions.device
+        group = self._config.mesh.get_group() if self._config.mesh is not None else None
+
+        # Collect per-rank atom counts so gather_v_wrapper knows the sizes.
+        n_local = torch.tensor(
+            [local_batch.positions.shape[0]], dtype=torch.int64, device=device
+        )
+        world_size = dist.get_world_size()
+        all_counts = [
+            torch.zeros(1, dtype=torch.int64, device=device) for _ in range(world_size)
+        ]
+        dist.all_gather(all_counts, n_local, group=group)
+        per_rank_sizes = [c.item() for c in all_counts]
+
+        # Gather per-atom fields.
+        positions = gather_v_wrapper(
+            tensor=local_batch.positions,
+            sizes=per_rank_sizes,
+            dim=0,
+            dst=dst,
+            group=group,
+        )
+        atomic_numbers = gather_v_wrapper(
+            tensor=local_batch.atomic_numbers.unsqueeze(-1).to(torch.int64)
+            if local_batch.atomic_numbers.ndim == 1
+            else local_batch.atomic_numbers.to(torch.int64),
+            sizes=per_rank_sizes,
+            dim=0,
+            dst=dst,
+            group=group,
+        )
+        atomic_masses = gather_v_wrapper(
+            tensor=(
+                local_batch.atomic_masses.unsqueeze(-1)
+                if hasattr(local_batch, "atomic_masses")
+                and local_batch.atomic_masses is not None
+                and local_batch.atomic_masses.ndim == 1
+                else local_batch.atomic_masses
+                if hasattr(local_batch, "atomic_masses")
+                and local_batch.atomic_masses is not None
+                else torch.ones(local_batch.positions.shape[0], 1, device=device)
+            ),
+            sizes=per_rank_sizes,
+            dim=0,
+            dst=dst,
+            group=group,
+        )
+
+        has_velocities = (
+            hasattr(local_batch, "velocities") and local_batch.velocities is not None
+        )
+        velocities = gather_v_wrapper(
+            tensor=local_batch.velocities
+            if has_velocities
+            else torch.zeros_like(local_batch.positions),
+            sizes=per_rank_sizes,
+            dim=0,
+            dst=dst,
+            group=group,
+        )
+
+        has_forces = hasattr(local_batch, "forces") and local_batch.forces is not None
+        forces = gather_v_wrapper(
+            tensor=local_batch.forces
+            if has_forces
+            else torch.zeros_like(local_batch.positions),
+            sizes=per_rank_sizes,
+            dim=0,
+            dst=dst,
+            group=group,
+        )
+
+        if self._domain_rank != dst:
             return None
 
-        # POC: placeholder — full gather requires serializing Batch tensors
-        # across ranks.  For now, log a warning and return None.
-        warnings.warn(
-            "DomainParallel.gather() is not yet fully implemented in the POC. "
-            "Returning None.",
-            stacklevel=2,
+        # Build the full batch on the destination rank.
+        # Squeeze back 1-D fields that were unsqueezed for gather.
+        if (
+            atomic_numbers is not None
+            and atomic_numbers.ndim == 2
+            and atomic_numbers.shape[-1] == 1
+        ):
+            atomic_numbers = atomic_numbers.squeeze(-1)
+        if (
+            atomic_masses is not None
+            and atomic_masses.ndim == 2
+            and atomic_masses.shape[-1] == 1
+        ):
+            atomic_masses = atomic_masses.squeeze(-1)
+
+        data = AtomicData(
+            positions=positions,
+            atomic_numbers=atomic_numbers,
+            atomic_masses=atomic_masses,
+            cell=local_batch.cell.clone()
+            if hasattr(local_batch, "cell") and local_batch.cell is not None
+            else None,
+            pbc=local_batch.pbc.clone()
+            if hasattr(local_batch, "pbc") and local_batch.pbc is not None
+            else None,
         )
-        return None
+        if has_velocities and velocities is not None:
+            data.add_node_property("velocities", velocities)
+        if has_forces and forces is not None:
+            data.add_node_property("forces", forces)
+
+        full_batch = BatchCls.from_data_list([data], device=device)
+        return full_batch
 
     # ------------------------------------------------------------------
     # Hook overrides
@@ -655,11 +794,10 @@ class DomainParallel(BaseDynamics):
                 hook(ctx, stage)
 
             elif scope == HookScope.RANK_ZERO:
-                logger.warning(
-                    "HookScope.RANK_ZERO is not yet implemented in the POC. "
-                    "Hook %r will be skipped on all ranks.",
-                    hook,
-                )
+                full_batch = self.gather(batch, dst=0)
+                if self._domain_rank == 0 and full_batch is not None:
+                    ctx_full = self._build_context(full_batch)
+                    hook(ctx_full, stage)
 
             else:
                 # LOCAL (default): run on every rank.

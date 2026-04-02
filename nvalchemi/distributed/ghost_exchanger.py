@@ -406,133 +406,107 @@ class GhostExchanger:
                 dm.shape[0],
             )
 
-        # --- Use batched_isend_irecv to avoid unbatched P2P warnings ---
+        # --- Use indexed_all_to_all_v for collective ghost exchange ---
 
-        # Build per-neighbor send buffers: direct ghosts (unshifted) then
-        # PBC ghosts (shifted).  Atoms in both masks are sent TWICE — once
-        # at each image — so the receiver sees both.
-        send_buffers_all: dict[int, torch.Tensor] = {}
-        for neighbor_rank in self.neighbor_ranks:
-            direct_mask, pbc_mask = ghost_masks[neighbor_rank]
-            parts: list[torch.Tensor] = []
+        # Build an extended positions tensor: [original | PBC-shifted copies].
+        # indexed_all_to_all_v indexes into the original tensor, so we
+        # pre-shift PBC ghost positions and append them.
+        pbc_parts: list[torch.Tensor] = []
+        pbc_index_maps: dict[int, torch.Tensor] = {}  # nr -> indices into extended
+        pbc_offset = positions.shape[0]
 
-            # Direct ghosts — no shift.
-            if direct_mask.any():
-                parts.append(positions[direct_mask])
-
-            # PBC ghosts — apply shift.
+        for nr in self.neighbor_ranks:
+            direct_mask, pbc_mask = ghost_masks[nr]
             if pbc_mask.any():
-                shift_key = (self.rank, neighbor_rank)
+                shift_key = (self.rank, nr)
                 pbc_pos = positions[pbc_mask]
                 if shift_key in self._pbc_shifts:
                     shift = self._pbc_shifts[shift_key].to(
                         device=device, dtype=pbc_pos.dtype
                     )
                     pbc_pos = pbc_pos + shift
-                parts.append(pbc_pos)
+                n_pbc = pbc_pos.shape[0]
+                pbc_index_maps[nr] = torch.arange(
+                    pbc_offset, pbc_offset + n_pbc, device=device, dtype=torch.int64
+                )
+                pbc_offset += n_pbc
+                pbc_parts.append(pbc_pos)
 
-            if parts:
-                buf = torch.cat(parts, dim=0)
-                send_buffers_all[neighbor_rank] = buf
+        if pbc_parts:
+            extended_positions = torch.cat([positions, *pbc_parts], dim=0)
+        else:
+            extended_positions = positions
+
+        # Build per-rank send indices into the extended tensor.
+        group = self.mesh.get_group() if hasattr(self.mesh, "get_group") else None
+        world_size = torch.distributed.get_world_size(group=group)
+
+        send_indices: list[torch.Tensor] = []
+        for r in range(world_size):
+            if r not in ghost_masks:
+                # Not a neighbor (or self) — send nothing.
+                send_indices.append(torch.empty(0, dtype=torch.int64, device=device))
+                continue
+            direct_mask, pbc_mask = ghost_masks[r]
+            parts_idx: list[torch.Tensor] = []
+
+            # Direct ghost indices — reference into [0, N_owned).
+            if direct_mask.any():
+                parts_idx.append(torch.where(direct_mask)[0])
+
+            # PBC ghost indices — reference into [N_owned, N_extended).
+            if r in pbc_index_maps:
+                parts_idx.append(pbc_index_maps[r])
+
+            if parts_idx:
+                idx = torch.cat(parts_idx, dim=0)
+            else:
+                idx = torch.empty(0, dtype=torch.int64, device=device)
+            send_indices.append(idx)
+
+        for r in range(world_size):
+            if send_indices[r].numel() > 0:
+                buf = extended_positions[send_indices[r]]
                 _log.info(
                     "[rank %d]   send buf for %d: %d atoms  Z_range=[%.2f, %.2f]",
                     self.rank,
-                    neighbor_rank,
+                    r,
                     buf.shape[0],
                     buf[:, 2].min().item(),
                     buf[:, 2].max().item(),
                 )
-            else:
-                send_buffers_all[neighbor_rank] = torch.zeros(
-                    0, 3, dtype=positions.dtype, device=device
-                )
 
-        # Phase 1: exchange counts.
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        _log.info("[rank %d] exchange: Phase 1 — exchanging counts", self.rank)
+        # Build sizes matrix via all_gather: sizes[i][j] = atoms rank i sends to rank j.
+        local_counts = torch.zeros(world_size, dtype=torch.int64, device=device)
+        for r in range(world_size):
+            local_counts[r] = send_indices[r].shape[0]
 
-        send_counts: dict[int, torch.Tensor] = {}
-        recv_counts: dict[int, torch.Tensor] = {}
-        p2p_ops: list[torch.distributed.P2POp] = []
+        all_counts_list = [torch.zeros_like(local_counts) for _ in range(world_size)]
+        torch.distributed.all_gather(all_counts_list, local_counts, group=group)
+        sizes = [c.tolist() for c in all_counts_list]
 
-        for neighbor_rank in self.neighbor_ranks:
-            n_send = send_buffers_all[neighbor_rank].shape[0]
-            count_send = torch.tensor([n_send], dtype=torch.int64, device=device)
-            send_counts[neighbor_rank] = count_send
-            count_recv = torch.zeros(1, dtype=torch.int64, device=device)
-            recv_counts[neighbor_rank] = count_recv
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, count_send, neighbor_rank
-                )
-            )
-            p2p_ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.irecv, count_recv, neighbor_rank
-                )
-            )
+        _log.info(
+            "[rank %d] exchange: indexed_all_to_all_v — sending %s",
+            self.rank,
+            [s[self.rank] if self.rank < len(s) else 0 for s in sizes],
+        )
 
-        if p2p_ops:
-            reqs = torch.distributed.batch_isend_irecv(p2p_ops)
-            for req in reqs:
-                req.wait()
+        from physicsnemo.distributed.utils import indexed_all_to_all_v_wrapper
 
-        for nr, c in recv_counts.items():
-            _log.info(
-                "[rank %d] will receive %d ghosts from rank %d", self.rank, c.item(), nr
-            )
+        received = indexed_all_to_all_v_wrapper(
+            tensor=extended_positions,
+            indices=send_indices,
+            sizes=sizes,
+            dim=0,
+            group=group,
+        )
 
-        # Phase 2: exchange positions.
-        _log.info("[rank %d] exchange: Phase 2 — exchanging positions", self.rank)
-        recv_buffers: dict[int, torch.Tensor] = {}
-        p2p_ops = []
+        # The received tensor contains all ghost positions sent TO this rank
+        # from all other ranks. It does NOT include self-sent data (sizes[rank][rank]
+        # should be 0 since we don't ghost to ourselves).
+        all_ghost_pos = received
 
-        for neighbor_rank in self.neighbor_ranks:
-            send_buf = send_buffers_all[neighbor_rank]
-            n_send = send_buf.shape[0]
-            n_recv = recv_counts[neighbor_rank].item()
-
-            _log.info(
-                "[rank %d] neighbor %d: sending %d, receiving %d",
-                self.rank,
-                neighbor_rank,
-                n_send,
-                n_recv,
-            )
-
-            if n_send > 0:
-                p2p_ops.append(
-                    torch.distributed.P2POp(
-                        torch.distributed.isend, send_buf.contiguous(), neighbor_rank
-                    )
-                )
-            if n_recv > 0:
-                recv_buf = torch.zeros(n_recv, 3, dtype=positions.dtype, device=device)
-                recv_buffers[neighbor_rank] = recv_buf
-                p2p_ops.append(
-                    torch.distributed.P2POp(
-                        torch.distributed.irecv, recv_buf, neighbor_rank
-                    )
-                )
-
-        if p2p_ops:
-            _log.info("[rank %d] exchange: %d P2P ops queued", self.rank, len(p2p_ops))
-            reqs = torch.distributed.batch_isend_irecv(p2p_ops)
-            for req in reqs:
-                req.wait()
-
-        _log.info("[rank %d] exchange: Phase 2 complete", self.rank)
-
-        # Concatenate all received ghost positions.
-        ghost_parts = [
-            recv_buffers[nr] for nr in self.neighbor_ranks if nr in recv_buffers
-        ]
-
-        if ghost_parts:
-            all_ghost_pos = torch.cat(ghost_parts, dim=0)
-        else:
-            all_ghost_pos = torch.zeros(0, 3, dtype=positions.dtype, device=device)
+        _log.info("[rank %d] exchange: collective complete", self.rank)
 
         n_ghosts = all_ghost_pos.shape[0]
         if n_ghosts > 0:
@@ -686,34 +660,32 @@ class GhostExchanger:
 
         # Build a fresh AtomicData from the owned slice of each field.
         data = AtomicData(
-            positions=padded_batch.positions[:n_owned].clone(),
-            atomic_numbers=padded_batch.atomic_numbers[:n_owned].clone(),
+            positions=padded_batch.positions[:n_owned],
+            atomic_numbers=padded_batch.atomic_numbers[:n_owned],
         )
 
         if (
             hasattr(padded_batch, "atomic_masses")
             and padded_batch.atomic_masses is not None
         ):
-            data.atomic_masses = padded_batch.atomic_masses[:n_owned].clone()
+            data.atomic_masses = padded_batch.atomic_masses[:n_owned]
 
         if hasattr(padded_batch, "velocities") and padded_batch.velocities is not None:
-            data.add_node_property(
-                "velocities", padded_batch.velocities[:n_owned].clone()
-            )
+            data.add_node_property("velocities", padded_batch.velocities[:n_owned])
 
         if hasattr(padded_batch, "forces") and padded_batch.forces is not None:
-            data.add_node_property("forces", padded_batch.forces[:n_owned].clone())
+            data.add_node_property("forces", padded_batch.forces[:n_owned])
 
         # Preserve cell and pbc from the padded batch.
         if hasattr(padded_batch, "cell") and padded_batch.cell is not None:
-            data.cell = padded_batch.cell.clone()
+            data.cell = padded_batch.cell
         if hasattr(padded_batch, "pbc") and padded_batch.pbc is not None:
-            data.pbc = padded_batch.pbc.clone()
+            data.pbc = padded_batch.pbc
 
         stripped = BatchCls.from_data_list([data], device=device)
 
         # Copy system-level energies if present.
         if hasattr(padded_batch, "energies") and padded_batch.energies is not None:
-            stripped.energies = padded_batch.energies.clone()
+            stripped.energies = padded_batch.energies
 
         return stripped

@@ -713,21 +713,12 @@ class TestExchangeNoDist:
 class TestExchangeWithMockedDist:
     """Test exchange() internals by mocking torch.distributed calls.
 
-    Uses ``batch_isend_irecv``-compatible mocking.
+    Uses ``indexed_all_to_all_v_wrapper``-compatible mocking.
     """
-
-    @staticmethod
-    def _mock_p2p_op(op_fn, tensor, peer, group=None, tag=0):
-        """Return a lightweight object that mimics a P2POp."""
-        m = MagicMock()
-        m.op = op_fn
-        m.tensor = tensor
-        m.peer = peer
-        return m
 
     def test_exchange_no_ghosts_center_atoms(self):
         """When all atoms are far from boundaries, exchange returns batch
-        with 0 ghosts (only count P2P ops, no position P2P ops)."""
+        with 0 ghosts."""
         cell = _make_orthorhombic_cell(40.0, 40.0, 40.0)
         part = _make_partitioner(cell, cutoff=2.0, world_size=2, grid_dims=(2, 1, 1))
         exchanger = _make_ghost_exchanger(part, cutoff=2.0, rank=0)
@@ -742,25 +733,28 @@ class TestExchangeWithMockedDist:
         )
         local_batch = Batch.from_data_list([data])
 
-        mock_req = MagicMock()
-        mock_req.wait.return_value = None
+        def mock_all_gather(tensor_list, tensor, group=None):
+            """Mock all_gather: rank 0 sends 0 ghosts, rank 1 sends 0 ghosts."""
+            for t in tensor_list:
+                t.zero_()
+
+        def mock_indexed_all_to_all_v(tensor, indices, sizes, dim=0, group=None):
+            """Mock: return empty tensor (no ghosts received)."""
+            return torch.zeros(0, 3, dtype=tensor.dtype, device=tensor.device)
 
         with (
             patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_gather", side_effect=mock_all_gather),
             patch(
-                "torch.distributed.P2POp",
-                side_effect=self._mock_p2p_op,
-            ),
-            patch(
-                "torch.distributed.batch_isend_irecv",
-                return_value=[mock_req, mock_req],
+                "physicsnemo.distributed.utils.indexed_all_to_all_v_wrapper",
+                side_effect=mock_indexed_all_to_all_v,
             ),
         ):
             result_batch, n_owned = exchanger.exchange(local_batch)
 
         assert n_owned == 1
-        # No ghosts received (recv_counts are 0 since we mocked irecv
-        # to leave the count buffer at 0), so result should be the same batch.
+        # No ghosts received, so result should be the same batch.
         assert result_batch is local_batch
 
     def test_exchange_with_ghosts_builds_padded_batch(self):
@@ -780,38 +774,28 @@ class TestExchangeWithMockedDist:
         )
         local_batch = Batch.from_data_list([data])
 
-        mock_req = MagicMock()
-        mock_req.wait.return_value = None
+        def mock_all_gather(tensor_list, tensor, group=None):
+            """Mock all_gather: simulate rank 1 sending 1 ghost to rank 0."""
+            # tensor_list[0] = rank 0's send counts, tensor_list[1] = rank 1's send counts
+            # Rank 0 sends to rank 1 (the actual local_counts), copy it.
+            tensor_list[0].copy_(tensor)
+            # Rank 1 sends 1 ghost to rank 0.
+            tensor_list[1].zero_()
+            tensor_list[1][0] = 1  # rank 1 sends 1 atom to rank 0
 
-        call_count = [0]
-
-        def mock_batch_isend_irecv(ops):
-            """Mock that simulates receiving 1 ghost from the neighbor."""
-            call_count[0] += 1
-            if call_count[0] == 1:
-                # Phase 1 (count exchange): fill recv count buffers with 1.
-                for op in ops:
-                    t = op.tensor
-                    if t.shape == (1,) and t.sum().item() == 0:
-                        # This is a recv buffer — fill with 1 ghost.
-                        t.fill_(1)
-            elif call_count[0] == 2:
-                # Phase 2 (position exchange): fill recv position buffer.
-                for op in ops:
-                    t = op.tensor
-                    if t.ndim == 2 and t.shape[1] == 3 and t.sum().item() == 0:
-                        t[0] = torch.tensor([15.0, 5.0, 5.0], dtype=t.dtype)
-            return [mock_req] * len(ops)
+        def mock_indexed_all_to_all_v(tensor, indices, sizes, dim=0, group=None):
+            """Mock: return 1 ghost position as if received from rank 1."""
+            return torch.tensor(
+                [[15.0, 5.0, 5.0]], dtype=tensor.dtype, device=tensor.device
+            )
 
         with (
             patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_gather", side_effect=mock_all_gather),
             patch(
-                "torch.distributed.P2POp",
-                side_effect=self._mock_p2p_op,
-            ),
-            patch(
-                "torch.distributed.batch_isend_irecv",
-                side_effect=mock_batch_isend_irecv,
+                "physicsnemo.distributed.utils.indexed_all_to_all_v_wrapper",
+                side_effect=mock_indexed_all_to_all_v,
             ),
         ):
             result_batch, n_owned = exchanger.exchange(local_batch)

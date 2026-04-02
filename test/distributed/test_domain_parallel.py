@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import logging
 from enum import Enum
 from unittest.mock import patch
 
@@ -500,10 +499,12 @@ class TestStepSingleProcess:
 class TestGatherWithoutDist:
     """Test gather() when torch.distributed is not initialized."""
 
-    def test_gather_returns_none(self) -> None:
+    def test_gather_returns_local_batch(self) -> None:
         dp, _ = _make_domain_parallel()
-        result = dp.gather()
-        assert result is None
+        batch = _make_batch()
+        result = dp.gather(batch)
+        # Without dist initialized, gather returns local_batch as-is.
+        assert result is batch
 
 
 # ---------------------------------------------------------------------------
@@ -596,19 +597,17 @@ class TestCallHooksWithScope:
 
         assert hook.call_count == 1
 
-    def test_rank_zero_hook_logs_warning(self, caplog) -> None:
-        """RANK_ZERO hooks should log a warning and NOT fire."""
+    def test_rank_zero_hook_fires_on_rank_zero(self) -> None:
+        """RANK_ZERO hooks should gather and fire on rank 0."""
         hook = _SimpleHook(stage=DynamicsStage.BEFORE_STEP, scope=HookScope.RANK_ZERO)
         dp = self._make_dp_with_hooks([hook])
         batch = _make_batch(n_atoms=5)
 
-        with caplog.at_level(
-            logging.WARNING, logger="nvalchemi.distributed.domain_parallel"
-        ):
-            dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+        # Without dist initialized, gather() returns local_batch and
+        # _domain_rank is 0, so the hook should fire.
+        dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
 
-        assert hook.call_count == 0
-        assert "RANK_ZERO is not yet implemented" in caplog.text
+        assert hook.call_count == 1
 
     def test_hook_stage_filtering(self) -> None:
         """Hooks should only fire for their declared stage."""
@@ -648,7 +647,7 @@ class TestCallHooksWithScope:
         assert hook.call_count == 2
 
     def test_multiple_scopes_together(self) -> None:
-        """LOCAL and GLOBAL hooks fire; RANK_ZERO does not."""
+        """LOCAL, GLOBAL, and RANK_ZERO hooks all fire (single-process)."""
         local_hook = _SimpleHook(stage=DynamicsStage.BEFORE_STEP, scope=HookScope.LOCAL)
         global_hook = _SimpleHook(
             stage=DynamicsStage.BEFORE_STEP, scope=HookScope.GLOBAL
@@ -663,7 +662,9 @@ class TestCallHooksWithScope:
 
         assert local_hook.call_count == 1
         assert global_hook.call_count == 1
-        assert rank_zero_hook.call_count == 0
+        # Without dist initialized, gather() returns local_batch and
+        # _domain_rank is 0, so the RANK_ZERO hook fires.
+        assert rank_zero_hook.call_count == 1
 
 
 # ---------------------------------------------------------------------------

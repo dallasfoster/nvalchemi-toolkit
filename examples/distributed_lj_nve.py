@@ -284,12 +284,14 @@ def main() -> None:
     )
 
     # ── 1. Distributed init ──────────────────────────────────
-    dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = rank
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
+    from physicsnemo.distributed import DistributedManager
+
+    DistributedManager.initialize()
+    dm = DistributedManager()
+    rank = dm.rank
+    world_size = dm.world_size
+    local_rank = dm.local_rank
+    device = dm.device
 
     log(rank, "=== Distributed LJ NVE Example ===")
     log(rank, "world_size={} local_rank={} device={}", world_size, local_rank, device)
@@ -524,8 +526,8 @@ def main() -> None:
 
     # ── 12. Cleanup ──────────────────────────────────────────
     dist.barrier()
-    dist.destroy_process_group()
-    log(rank, "Process group destroyed. Exiting.")
+    DistributedManager.cleanup()
+    log(rank, "DistributedManager cleaned up. Exiting.")
 
 
 if __name__ == "__main__":
