@@ -325,6 +325,14 @@ class DomainParallel(BaseDynamics):
         else:
             batch = padded_batch
 
+        # 6b. Wrap positions back into the periodic box.
+        # The inner step moves atoms with pbc=False (open boundaries),
+        # so atoms can drift outside the global cell.  Without wrapping,
+        # atoms on opposite sides of the PBC boundary lose interactions
+        # (appear 34 Å apart instead of 3.8 Å), causing energy drift
+        # and eventual explosion.
+        self._wrap_positions(batch)
+
         logger.info(
             "[rank %d] step %d: migration check", self._domain_rank, self.step_count
         )
@@ -446,6 +454,29 @@ class DomainParallel(BaseDynamics):
         # Update snapshot so _restore_geometry can undo the shift.
         if self._geometry_snapshot is not None:
             self._geometry_snapshot.pos_min = pos_min
+
+    @staticmethod
+    def _wrap_positions(batch: Batch) -> None:
+        """Wrap atom positions back into the periodic box.
+
+        After the inner step (which runs with ``pbc=False``), atoms may
+        have drifted outside the global cell.  This wraps them back using
+        fractional-coordinate modulo, which is correct for both
+        orthorhombic and triclinic cells.
+        """
+        cell = batch.cell  # (1, 3, 3)
+        pbc = batch.pbc  # (1, 3) bool
+        if cell is None or pbc is None or not pbc.any():
+            return
+
+        cell_3x3 = cell.squeeze(0)  # (3, 3)
+        inv_cell = torch.linalg.inv(cell_3x3)
+
+        # Convert to fractional, wrap periodic dims, convert back.
+        frac = batch.positions @ inv_cell.T  # (N, 3)
+        pbc_mask = pbc.squeeze(0)  # (3,) bool
+        frac[:, pbc_mask] = frac[:, pbc_mask] % 1.0
+        batch.positions = frac @ cell_3x3
 
     def _invalidate_nl_ref(self) -> None:
         """Reset the NeighborListHook's reference positions.
