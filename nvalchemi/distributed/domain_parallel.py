@@ -410,14 +410,13 @@ class DomainParallel(BaseDynamics):
                 _p.max().item(),
             )
 
-        # NOTE: Position wrapping (PBC modulo) is intentionally NOT done
-        # here.  Wrapping teleports atoms to the opposite side of the box,
-        # placing them on the wrong rank with no ghost neighbors until
-        # migration runs.  This creates zero-force artifacts worse than
-        # the slow drift from unwrapped positions.  The ghost shell
-        # (12.75 Å) accommodates ~200 steps of drift at 50 K.  For
-        # longer runs, the proper fix is NL persistence across steps
-        # (Phase 2) to eliminate the energy drift that causes heating.
+        # Wrap positions back into the periodic box.  Without wrapping,
+        # atoms drift outside [0, L] and lose neighbors (especially in
+        # dimensions not split across ranks — X, Y in a 1×1×2 grid).
+        # Wrapping teleports atoms to the opposite side of the box,
+        # but the IMMEDIATELY FOLLOWING migration step moves them to
+        # the correct rank before any force computation occurs.
+        self._wrap_positions(batch)
 
         logger.info(
             "[rank %d] step %d: migration check", self._domain_rank, self.step_count
@@ -614,6 +613,34 @@ class DomainParallel(BaseDynamics):
             if isinstance(hook, NeighborListHook):
                 hook._ref_positions = None
                 break
+
+    @staticmethod
+    def _wrap_positions(batch: Batch) -> None:
+        """Wrap atom positions back into the periodic box.
+
+        After the inner step (which runs with ``pbc=False``), atoms may
+        have drifted outside the global cell.  This wraps them back using
+        fractional-coordinate modulo, which is correct for both
+        orthorhombic and triclinic cells.
+
+        Must be called BEFORE migration so that ``assign_atoms_to_ranks``
+        sees wrapped positions and moves atoms to the correct domain.
+        The subsequent ghost exchange (next step) then provides correct
+        neighbors.
+        """
+        cell = batch.cell  # (1, 3, 3)
+        pbc = batch.pbc  # (1, 3) bool
+        if cell is None or pbc is None or not pbc.any():
+            return
+
+        cell_3x3 = cell.squeeze(0)  # (3, 3)
+        inv_cell = torch.linalg.inv(cell_3x3)
+
+        # Convert to fractional, wrap periodic dims, convert back.
+        frac = batch.positions @ inv_cell.T  # (N, 3)
+        pbc_mask = pbc.squeeze(0)  # (3,) bool
+        frac[:, pbc_mask] = frac[:, pbc_mask] % 1.0
+        batch.positions = frac @ cell_3x3
 
     def _save_geometry(self, padded_batch: Batch) -> _GeometrySnapshot:
         """Save original cell and PBC, then set ``pbc=False``."""
