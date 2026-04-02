@@ -342,6 +342,27 @@ class DomainParallel(BaseDynamics):
                 _v.max().item() if _v is not None else 0,
             )
 
+        # --- DEBUG: log neighbor matrix state ---
+        if self.step_count < 2:
+            nm = getattr(padded_batch, "neighbor_matrix", None)
+            nn = getattr(padded_batch, "num_neighbors", None)
+            if nm is not None:
+                logger.info(
+                    "[rank %d] step %d: neighbor_matrix shape=%s dtype=%s nnz=%d total_neighbors=%s",
+                    self._domain_rank,
+                    self.step_count,
+                    tuple(nm.shape),
+                    nm.dtype,
+                    (nm != -1).sum().item() if nm.numel() > 0 else 0,
+                    nn.sum().item() if nn is not None else "N/A",
+                )
+            else:
+                logger.info(
+                    "[rank %d] step %d: NO neighbor_matrix on padded batch!",
+                    self._domain_rank,
+                    self.step_count,
+                )
+
         logger.info(
             "[rank %d] step %d: inner dynamics step", self._domain_rank, self.step_count
         )
