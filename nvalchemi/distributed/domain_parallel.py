@@ -328,9 +328,24 @@ class DomainParallel(BaseDynamics):
         logger.info(
             "[rank %d] step %d: migration check", self._domain_rank, self.step_count
         )
-        # 7. Migration (if needed)
-        if self._migrator is not None and self._migrator.needs_migration(batch):
-            batch = self._migrator.migrate(batch)
+        # 7. Migration (if needed).
+        # Migration uses collectives (all_to_all_single, batch_isend_irecv),
+        # so ALL ranks must participate.  Synchronize the decision.
+        if self._migrator is not None:
+            needs = self._migrator.needs_migration(batch)
+            if dist.is_initialized():
+                flag = torch.tensor(
+                    [int(needs)], dtype=torch.int32, device=batch.positions.device
+                )
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+                needs = flag.item() > 0
+            if needs:
+                logger.info(
+                    "[rank %d] step %d: migrating atoms",
+                    self._domain_rank,
+                    self.step_count,
+                )
+                batch = self._migrator.migrate(batch)
 
         logger.info(
             "[rank %d] step %d: AFTER_STEP hooks", self._domain_rank, self.step_count
