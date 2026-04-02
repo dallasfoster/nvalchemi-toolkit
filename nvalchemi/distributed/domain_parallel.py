@@ -36,69 +36,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class _AABBPrepareHook:
-    """Inner hook that recomputes the AABB cell at BEFORE_COMPUTE.
-
-    Registered on the inner dynamics so it fires AFTER ``pre_update``
-    has moved atoms but BEFORE the neighbor-list build and model
-    forward.  This ensures the cell always encompasses the actual
-    positions the cell-list builder will see, avoiding out-of-bounds
-    indices when ``pbc=False``.
-
-    Also invalidates the ``NeighborListHook``'s skin-check reference
-    positions to force a full rebuild, since each step operates on a
-    fresh ``Batch`` in a different local coordinate frame.
-    """
-
-    stage = DynamicsStage.AFTER_PRE_UPDATE
-    frequency: int = 1
-
-    def __init__(self, domain_parallel: DomainParallel) -> None:
-        self._dp = domain_parallel
-
-    def __call__(self, ctx: HookContext, stage: object) -> None:
-        batch = ctx.batch
-        positions = batch.positions
-
-        # Recompute AABB from current (post-pre_update) positions.
-        pos_min = positions.min(dim=0).values
-        pos_max = positions.max(dim=0).values
-
-        # Small epsilon padding — NOT the 1 Å duct-tape.  Since we
-        # compute the AABB from the actual current positions (after
-        # pre_update has moved atoms), atoms are guaranteed to be
-        # inside.  The epsilon just avoids zero-width cells.
-        eps = 0.01
-        pos_min = pos_min - eps
-        box_lengths = (pos_max - pos_min + eps).clamp(min=1e-6)
-
-        local_cell = torch.diag(box_lengths).unsqueeze(0)
-        if batch.cell.shape[0] > 1:
-            local_cell = local_cell.expand(batch.cell.shape[0], -1, -1)
-        batch.cell = local_cell.to(dtype=batch.cell.dtype, device=batch.cell.device)
-
-        # Shift positions so minimum is at origin.
-        batch.positions = positions - pos_min
-
-        # Save pos_min for unprepare (overwrite the pre-step snapshot).
-        if self._dp._geometry_snapshot is not None:
-            self._dp._geometry_snapshot.pos_min = pos_min
-
-        # Invalidate the NeighborListHook's reference positions.
-        # Each step creates a fresh Batch in a different local frame,
-        # so the skin-check displacement is meaningless across steps.
-        self._invalidate_nl_ref_positions()
-
-    def _invalidate_nl_ref_positions(self) -> None:
-        """Reset _ref_positions on the inner NeighborListHook to force rebuild."""
-        from nvalchemi.dynamics.hooks.neighbor_list import NeighborListHook
-
-        for hook in self._dp._dynamics.hooks:
-            if isinstance(hook, NeighborListHook):
-                hook._ref_positions = None
-                break
-
-
 class DomainParallel(BaseDynamics):
     """Wraps any ``BaseDynamics`` subclass with spatial domain decomposition.
 
@@ -141,11 +78,6 @@ class DomainParallel(BaseDynamics):
         self._n_owned: int = 0
         self._geometry_snapshot: _GeometrySnapshot | None = None
         self._forces_primed: bool = False
-
-        # Register the AABB-prepare hook on the INNER dynamics so it
-        # fires at BEFORE_COMPUTE (after pre_update has moved atoms).
-        self._aabb_hook = _AABBPrepareHook(self)
-        self._dynamics.register_hook(self._aabb_hook)
 
         # Determine rank from mesh, or fall back to dist / 0.
         if config.mesh is not None:
@@ -375,30 +307,17 @@ class DomainParallel(BaseDynamics):
         self._n_owned = n_owned
 
         logger.info(
-            "[rank %d] step %d: prepare padded batch",
+            "[rank %d] step %d: prepare + inner step",
             self._domain_rank,
             self.step_count,
         )
-        # 3. Prepare padded batch (local AABB, pbc=False)
-        snapshot = self._prepare_padded_batch(padded_batch)
-
-        # Ensure forces and energies exist on the padded batch so
-        # BaseDynamics.compute() can write into them in-place.
+        # 3-5. Prepare, inner step, unprepare — orchestrated directly
+        #      so we can insert AABB computation between pre_update
+        #      and compute (see _run_inner_step).
+        snapshot = self._save_geometry(padded_batch)
         self._ensure_output_tensors(padded_batch)
-
-        logger.info(
-            "[rank %d] step %d: inner dynamics step", self._domain_rank, self.step_count
-        )
-        # 4. Inner dynamics step
-        padded_batch, converged = self._dynamics.step(padded_batch)
-
-        logger.info(
-            "[rank %d] step %d: unprepare padded batch",
-            self._domain_rank,
-            self.step_count,
-        )
-        # 5. Unprepare — restore global geometry
-        self._unprepare_padded_batch(padded_batch, snapshot)
+        padded_batch, converged = self._run_inner_step(padded_batch)
+        self._restore_geometry(padded_batch, snapshot)
 
         # 6. Strip ghost atoms
         if self._ghost_exchanger is not None:
@@ -428,38 +347,109 @@ class DomainParallel(BaseDynamics):
     # Prepare / unprepare padded batch
     # ------------------------------------------------------------------
 
-    def _prepare_padded_batch(self, padded_batch: Batch) -> _GeometrySnapshot:
-        """Save the original cell and PBC, then set ``pbc=False``.
+    # ------------------------------------------------------------------
+    # Inner step orchestration
+    # ------------------------------------------------------------------
 
-        The actual AABB cell and position shift happen later, at
-        ``BEFORE_COMPUTE``, via :class:`_AABBPrepareHook`.  This ensures
-        the cell is computed from the **current** positions (after
-        ``pre_update`` has moved atoms), so the cell-list builder always
-        sees positions within the cell.
+    def _run_inner_step(self, padded_batch: Batch) -> tuple[Batch, torch.Tensor | None]:
+        """Execute the inner dynamics step with AABB geometry management.
 
-        Here we only:
+        Instead of delegating to ``self._dynamics.step()`` as a black box,
+        we replicate the inner step's hook sequence so that the AABB cell
+        and position shift can be inserted between ``pre_update`` (which
+        moves atoms) and ``compute`` (which needs the cell-list).  This
+        avoids the fragile ``_AABBPrepareHook`` and gives ``DomainParallel``
+        explicit control over the geometry lifecycle.
 
-        1. Save the original cell and PBC for later restoration.
-        2. Set ``pbc=False`` so the inner neighbor list builder uses
-           open boundaries within the subdomain.
-        3. Compute an initial AABB and shift for ``pre_update`` to use
-           (forces are translation-invariant, so exact AABB doesn't
-           matter for the half-kick — only for the cell-list build that
-           comes after, which the hook handles).
-
-        Parameters
-        ----------
-        padded_batch : Batch
-            Batch with owned + ghost atoms.
-
-        Returns
-        -------
-        _GeometrySnapshot
-            Saved geometry for ``_unprepare_padded_batch``.
+        The sequence mirrors ``BaseDynamics.step()`` (lines 1800-1818)
+        but inserts ``_apply_aabb`` + ``_invalidate_nl_ref`` after
+        ``pre_update``.
         """
-        positions = padded_batch.positions  # (N, 3)
+        dyn = self._dynamics
+        dyn._ensure_state_initialized(padded_batch)
 
-        # Save originals.
+        dyn._call_hooks(DynamicsStage.BEFORE_STEP, padded_batch)
+
+        # --- pre_update (velocity Verlet half-kick) ---
+        dyn._call_hooks(DynamicsStage.BEFORE_PRE_UPDATE, padded_batch)
+        dyn.pre_update(padded_batch)
+        dyn._call_hooks(DynamicsStage.AFTER_PRE_UPDATE, padded_batch)
+
+        # --- AABB geometry: compute cell from current positions ---
+        # This is the key insertion point.  Positions have been moved
+        # by pre_update, so the AABB now encompasses all current atoms.
+        # The cell-list neighbor builder (fired next) will see positions
+        # that are guaranteed to be inside the cell.
+        self._apply_aabb(padded_batch)
+        self._invalidate_nl_ref()
+
+        # --- compute (neighbor list build + model forward) ---
+        dyn._call_hooks(DynamicsStage.BEFORE_COMPUTE, padded_batch)
+        dyn.compute(padded_batch)
+        dyn._call_hooks(DynamicsStage.AFTER_COMPUTE, padded_batch)
+
+        # --- post_update (velocity Verlet finalize) ---
+        dyn._call_hooks(DynamicsStage.BEFORE_POST_UPDATE, padded_batch)
+        dyn.post_update(padded_batch)
+        dyn._call_hooks(DynamicsStage.AFTER_POST_UPDATE, padded_batch)
+
+        dyn._call_hooks(DynamicsStage.AFTER_STEP, padded_batch)
+
+        # Convergence check (typically a no-op for NVE).
+        converged = dyn._check_convergence(padded_batch)
+        dyn._last_converged = converged
+        if converged is not None:
+            dyn._call_hooks(DynamicsStage.ON_CONVERGE, padded_batch)
+
+        dyn.step_count += 1
+        return padded_batch, converged
+
+    def _apply_aabb(self, batch: Batch) -> None:
+        """Compute the AABB cell from current positions and shift to origin.
+
+        Called between ``pre_update`` and ``compute`` so the cell-list
+        neighbor builder always sees positions within ``[0, box_length)``.
+        Updates ``self._geometry_snapshot.pos_min`` for later restoration.
+        """
+        positions = batch.positions
+        pos_min = positions.min(dim=0).values
+        pos_max = positions.max(dim=0).values
+
+        # Small epsilon so atoms at the exact boundary are inside.
+        eps = 0.01
+        pos_min = pos_min - eps
+        box_lengths = (pos_max - pos_min + eps).clamp(min=1e-6)
+
+        local_cell = torch.diag(box_lengths).unsqueeze(0)
+        if batch.cell.shape[0] > 1:
+            local_cell = local_cell.expand(batch.cell.shape[0], -1, -1)
+        batch.cell = local_cell.to(dtype=batch.cell.dtype, device=batch.cell.device)
+
+        # Shift positions to local origin.
+        batch.positions = positions - pos_min
+
+        # Update snapshot so _restore_geometry can undo the shift.
+        if self._geometry_snapshot is not None:
+            self._geometry_snapshot.pos_min = pos_min
+
+    def _invalidate_nl_ref(self) -> None:
+        """Reset the NeighborListHook's reference positions.
+
+        Each step creates a fresh ``Batch`` in a different local
+        coordinate frame, so the skin-check displacement from a
+        previous step's reference is meaningless.  Resetting forces
+        a full neighbor list rebuild.
+        """
+        from nvalchemi.dynamics.hooks.neighbor_list import NeighborListHook
+
+        for hook in self._dynamics.hooks:
+            if isinstance(hook, NeighborListHook):
+                hook._ref_positions = None
+                break
+
+    def _save_geometry(self, padded_batch: Batch) -> _GeometrySnapshot:
+        """Save original cell and PBC, then set ``pbc=False``."""
+        positions = padded_batch.positions
         original_cell = padded_batch.cell.clone()
         original_pbc = (
             padded_batch.pbc.clone()
@@ -467,24 +457,12 @@ class DomainParallel(BaseDynamics):
             else torch.ones(1, 3, dtype=torch.bool, device=positions.device)
         )
 
-        logger.info(
-            "[rank %d] prepare: %d atoms, num_graphs=%d",
-            self._domain_rank,
-            positions.shape[0],
-            padded_batch.num_graphs,
-        )
-
-        # Set pbc=False (open boundaries within the subdomain).
-        # The AABB cell and position shift are handled by
-        # _AABBPrepareHook at BEFORE_COMPUTE, after pre_update
-        # has moved atoms.
+        # Set pbc=False for open boundaries within the subdomain.
         n_graphs = max(1, padded_batch.cell.shape[0])
         padded_batch.pbc = torch.zeros(
             n_graphs, 3, dtype=torch.bool, device=positions.device
         )
 
-        # pos_min will be set by _AABBPrepareHook; initialize to zero
-        # so unprepare is a no-op if the hook hasn't fired yet.
         snapshot = _GeometrySnapshot(
             original_cell=original_cell,
             original_pbc=original_pbc,
@@ -493,23 +471,12 @@ class DomainParallel(BaseDynamics):
         self._geometry_snapshot = snapshot
         return snapshot
 
-    def _unprepare_padded_batch(
+    def _restore_geometry(
         self, padded_batch: Batch, snapshot: _GeometrySnapshot
     ) -> None:
-        """Restore the original cell, PBC, and position origin.
-
-        Parameters
-        ----------
-        padded_batch : Batch
-            The batch modified by ``_prepare_padded_batch``.
-        snapshot : _GeometrySnapshot
-            Saved geometry from the prepare step.
-        """
-        # Restore positions to global coordinates
+        """Restore original cell, PBC, and undo position shift."""
         if snapshot.pos_min is not None:
             padded_batch.positions = padded_batch.positions + snapshot.pos_min
-
-        # Restore cell and PBC
         padded_batch.cell = snapshot.original_cell
         padded_batch.pbc = snapshot.original_pbc
 
@@ -663,9 +630,6 @@ class DomainParallel(BaseDynamics):
         step.  On the very first step there are no forces yet, so we
         run the neighbor list hook + model forward once to populate
         ``batch.forces`` and ``batch.energies`` before the step loop.
-
-        This mirrors ``FusedStage.run()`` which calls ``compute()``
-        before the first ``step()``.
         """
         logger.info("[rank %d] priming forces (initial compute)", self._domain_rank)
 
@@ -677,25 +641,20 @@ class DomainParallel(BaseDynamics):
             n_owned = batch.positions.shape[0]
         self._n_owned = n_owned
 
-        # Prepare local bbox
-        snapshot = self._prepare_padded_batch(padded_batch)
-
+        snapshot = self._save_geometry(padded_batch)
         self._ensure_output_tensors(padded_batch)
 
-        # Fire AFTER_PRE_UPDATE to trigger _AABBPrepareHook (computes
-        # AABB and shifts positions to local origin).  No pre_update
-        # ran, but the hook handles this correctly — it just computes
-        # the AABB from current positions.
-        self._dynamics._call_hooks(DynamicsStage.AFTER_PRE_UPDATE, padded_batch)
-        # Fire BEFORE_COMPUTE hooks (NeighborListHook builds the neighbor list)
+        # Compute AABB and shift positions (no pre_update needed for
+        # priming — positions haven't moved).
+        self._apply_aabb(padded_batch)
+        self._invalidate_nl_ref()
+
+        # Build neighbor list + model forward.
         self._dynamics._call_hooks(DynamicsStage.BEFORE_COMPUTE, padded_batch)
-        # Model forward pass — populates forces and energies
         self._dynamics.compute(padded_batch)
-        # Fire AFTER_COMPUTE hooks (force clamping, etc.)
         self._dynamics._call_hooks(DynamicsStage.AFTER_COMPUTE, padded_batch)
 
-        # Unprepare — restore global coords
-        self._unprepare_padded_batch(padded_batch, snapshot)
+        self._restore_geometry(padded_batch, snapshot)
 
         # Strip ghosts — forces on owned atoms are what we keep
         if self._ghost_exchanger is not None:

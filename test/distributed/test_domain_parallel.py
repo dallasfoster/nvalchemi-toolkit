@@ -124,9 +124,9 @@ class TestInit:
 
 
 class TestPrepareUnprepareRoundtrip:
-    """Test _prepare_padded_batch / _unprepare_padded_batch cycle.
+    """Test _save_geometry / _restore_geometry cycle.
 
-    Note: _prepare_padded_batch now only saves originals and sets
+    Note: _save_geometry now only saves originals and sets
     pbc=False.  The AABB cell and position shift are done by the
     _AABBPrepareHook at BEFORE_COMPUTE.
     """
@@ -140,7 +140,7 @@ class TestPrepareUnprepareRoundtrip:
         original_pbc = batch.pbc.clone()
 
         # Prepare
-        snapshot = dp._prepare_padded_batch(batch)
+        snapshot = dp._save_geometry(batch)
 
         # After prepare: pbc should be False
         assert (~batch.pbc).all()
@@ -152,7 +152,7 @@ class TestPrepareUnprepareRoundtrip:
         assert torch.allclose(batch.positions, original_positions, atol=1e-6)
 
         # Unprepare
-        dp._unprepare_padded_batch(batch, snapshot)
+        dp._restore_geometry(batch, snapshot)
 
         # Should be fully restored
         assert torch.allclose(batch.positions, original_positions, atol=1e-6)
@@ -164,18 +164,18 @@ class TestPrepareUnprepareRoundtrip:
         batch = _make_batch(n_atoms=5)
 
         original_positions = batch.positions.clone()
-        snapshot = dp._prepare_padded_batch(batch)
-        dp._unprepare_padded_batch(batch, snapshot)
+        snapshot = dp._save_geometry(batch)
+        dp._restore_geometry(batch, snapshot)
 
         assert torch.allclose(batch.positions, original_positions, atol=1e-7)
 
 
 class TestPrepareTriclinic:
-    """Test _prepare_padded_batch saves state and sets pbc=False.
+    """Test _save_geometry saves state and sets pbc=False.
 
     Note: The AABB cell computation and position shift are now handled
     by _AABBPrepareHook (registered at BEFORE_COMPUTE on the inner
-    dynamics), not by _prepare_padded_batch.  These tests verify the
+    dynamics), not by _save_geometry.  These tests verify the
     prepare/unprepare snapshot and pbc behavior.
     """
 
@@ -184,7 +184,7 @@ class TestPrepareTriclinic:
         batch = _make_triclinic_batch(n_atoms=10)
 
         original_cell = batch.cell.clone()
-        snapshot = dp._prepare_padded_batch(batch)
+        snapshot = dp._save_geometry(batch)
 
         # pbc should be False
         assert (~batch.pbc).all()
@@ -200,8 +200,8 @@ class TestPrepareTriclinic:
         original_cell = batch.cell.clone()
         original_pbc = batch.pbc.clone()
 
-        snapshot = dp._prepare_padded_batch(batch)
-        dp._unprepare_padded_batch(batch, snapshot)
+        snapshot = dp._save_geometry(batch)
+        dp._restore_geometry(batch, snapshot)
 
         # Positions unchanged because prepare no longer shifts them
         # (the hook does that at BEFORE_COMPUTE, which isn't called here).
@@ -432,13 +432,18 @@ class TestStepSingleProcess:
         dp = DomainParallel(dynamics=mock_inner, config=config)
         return dp, mock_inner
 
-    def test_step_delegates_to_inner(self) -> None:
+    def test_step_orchestrates_inner(self) -> None:
+        """DomainParallel orchestrates the inner step directly
+        (pre_update → AABB → compute → post_update), incrementing
+        the inner dynamics' step_count."""
         dp, mock_inner = self._make_dp_with_mock()
         batch = _make_batch(n_atoms=8)
 
+        assert mock_inner.step_count == 0
         result_batch, converged = dp.step(batch)
 
-        assert mock_inner.step_calls == 1
+        # Inner step_count incremented by _run_inner_step
+        assert mock_inner.step_count == 1
         assert result_batch is not None
 
     def test_step_increments_step_count(self) -> None:
@@ -482,7 +487,9 @@ class TestStepSingleProcess:
 
         result_batch, _ = dp.step(batch)
         assert result_batch is not None
-        assert mock_inner.step_calls == 1
+        # DomainParallel orchestrates the inner step directly
+        # (not via mock_inner.step()), so step_count increments.
+        assert mock_inner.step_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +528,7 @@ class TestRunMethod:
 
         result = dp.run(batch, n_steps=5)
 
-        assert mock_inner.step_calls == 5
+        assert mock_inner.step_count == 5
         assert result is not None
 
     def test_run_uses_constructor_n_steps(self) -> None:
@@ -530,7 +537,7 @@ class TestRunMethod:
 
         dp.run(batch)
 
-        assert mock_inner.step_calls == 3
+        assert mock_inner.step_count == 3
 
     def test_run_prefers_argument_over_constructor(self) -> None:
         dp, mock_inner = self._make_dp_with_mock(n_steps=100)
@@ -538,7 +545,7 @@ class TestRunMethod:
 
         dp.run(batch, n_steps=2)
 
-        assert mock_inner.step_calls == 2
+        assert mock_inner.step_count == 2
 
     def test_run_raises_without_n_steps(self) -> None:
         dp, _ = self._make_dp_with_mock(n_steps=None)
@@ -660,12 +667,12 @@ class TestCallHooksWithScope:
 
 
 # ---------------------------------------------------------------------------
-# _prepare_padded_batch multi-graph (line 316 branch)
+# _save_geometry multi-graph (line 316 branch)
 # ---------------------------------------------------------------------------
 
 
 class TestPreparePaddedBatchMultiGraph:
-    """Test _prepare_padded_batch with a multi-graph batch (cell.shape[0] > 1)."""
+    """Test _save_geometry with a multi-graph batch (cell.shape[0] > 1)."""
 
     def test_multi_graph_cell_expansion(self) -> None:
         """When batch has multiple graphs, local_cell should expand to match."""
@@ -692,7 +699,7 @@ class TestPreparePaddedBatchMultiGraph:
         batch.pbc = torch.tensor([[True, True, True], [True, True, True]])
 
         original_cell = batch.cell.clone()
-        snapshot = dp._prepare_padded_batch(batch)
+        snapshot = dp._save_geometry(batch)
 
         # Cell should still have 2 graphs (unchanged by prepare;
         # the hook sets the AABB cell later at BEFORE_COMPUTE).
@@ -702,7 +709,7 @@ class TestPreparePaddedBatchMultiGraph:
         assert (~batch.pbc).all()
 
         # Roundtrip
-        dp._unprepare_padded_batch(batch, snapshot)
+        dp._restore_geometry(batch, snapshot)
         assert batch.cell.shape[0] == 2
         assert torch.allclose(batch.cell, original_cell, atol=1e-6)
 
@@ -884,12 +891,12 @@ class TestEnsureOutputTensors:
 
 
 # ---------------------------------------------------------------------------
-# _prepare_padded_batch with missing pbc
+# _save_geometry with missing pbc
 # ---------------------------------------------------------------------------
 
 
 class TestUnprepareWithNullPosMin:
-    """Test _unprepare_padded_batch when pos_min is None in snapshot."""
+    """Test _restore_geometry when pos_min is None in snapshot."""
 
     def test_unprepare_skips_position_shift_when_pos_min_none(self) -> None:
         """When snapshot.pos_min is None, positions should not be shifted."""
@@ -905,7 +912,7 @@ class TestUnprepareWithNullPosMin:
             pos_min=None,
         )
 
-        dp._unprepare_padded_batch(batch, snapshot)
+        dp._restore_geometry(batch, snapshot)
 
         # Positions should be unchanged (no shift applied)
         torch.testing.assert_close(batch.positions, original_positions)
@@ -915,7 +922,7 @@ class TestUnprepareWithNullPosMin:
 
 
 class TestPreparePaddedBatchMissingPBC:
-    """Test _prepare_padded_batch when pbc is not set on the batch."""
+    """Test _save_geometry when pbc is not set on the batch."""
 
     def test_missing_pbc_creates_default(self) -> None:
         """When pbc is not present on the batch, prepare should create a
@@ -932,7 +939,7 @@ class TestPreparePaddedBatchMissingPBC:
         batch.cell = torch.diag(torch.tensor([10.0, 10.0, 10.0])).unsqueeze(0)
         assert not hasattr(batch, "pbc") or batch.pbc is None
 
-        snapshot = dp._prepare_padded_batch(batch)
+        snapshot = dp._save_geometry(batch)
 
         # After prepare, pbc should be False (open boundaries)
         assert batch.pbc is not None
@@ -1036,6 +1043,6 @@ class TestPrimeForces:
         dp.step(batch)
         dp.step(batch)
 
-        # mock_inner.step_calls should be 2 (one per step call)
+        # mock_inner.step_count should be 2 (one per step call)
         # If _prime_forces ran twice, there would be extra calls to compute
-        assert mock_inner.step_calls == 2
+        assert mock_inner.step_count == 2
