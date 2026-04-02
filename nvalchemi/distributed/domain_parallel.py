@@ -467,7 +467,17 @@ class DomainParallel(BaseDynamics):
             padded_batch.num_graphs,
         )
 
-        # Add small padding to avoid zero-width boxes
+        # Add padding to the AABB so atoms can't escape the cell during
+        # the inner step's pre_update (velocity Verlet half-kick).  With
+        # pbc=False, atoms outside the cell cause the cell-list neighbor
+        # builder to produce out-of-bounds indices.  1 Å padding per side
+        # is generous for typical MD velocities (v_max * dt ≈ 0.04 Å).
+        aabb_padding = 1.0
+        pos_min = pos_min - aabb_padding
+        pos_max = pos_max + aabb_padding
+        box_lengths = pos_max - pos_min
+
+        # Clamp to avoid zero-width boxes
         eps = 1e-6
         box_lengths = box_lengths.clamp(min=eps)
 
