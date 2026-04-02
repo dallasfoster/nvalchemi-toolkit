@@ -318,11 +318,53 @@ class DomainParallel(BaseDynamics):
         # BaseDynamics.compute() can write into them in-place.
         self._ensure_output_tensors(padded_batch)
 
+        # --- DEBUG: log state before inner step ---
+        if self.step_count < 2:
+            _f = padded_batch.forces
+            _p = padded_batch.positions
+            _v = (
+                padded_batch.velocities
+                if hasattr(padded_batch, "velocities")
+                and padded_batch.velocities is not None
+                else None
+            )
+            logger.info(
+                "[rank %d] step %d: PRE-INNER n=%d f_range=[%.4e,%.4e] f_mean=%.4e p_range=[%.2f,%.2f] v_range=[%.4e,%.4e]",
+                self._domain_rank,
+                self.step_count,
+                _p.shape[0],
+                _f.min().item() if _f is not None else 0,
+                _f.max().item() if _f is not None else 0,
+                _f.abs().mean().item() if _f is not None else 0,
+                _p.min().item(),
+                _p.max().item(),
+                _v.min().item() if _v is not None else 0,
+                _v.max().item() if _v is not None else 0,
+            )
+
         logger.info(
             "[rank %d] step %d: inner dynamics step", self._domain_rank, self.step_count
         )
         # 4. Inner dynamics step
         padded_batch, converged = self._dynamics.step(padded_batch)
+
+        # --- DEBUG: log state after inner step ---
+        if self.step_count < 2:
+            _f = padded_batch.forces
+            _p = padded_batch.positions
+            _e = padded_batch.energies
+            logger.info(
+                "[rank %d] step %d: POST-INNER n=%d f_range=[%.4e,%.4e] f_mean=%.4e p_range=[%.2f,%.2f] E=%.4e",
+                self._domain_rank,
+                self.step_count,
+                _p.shape[0],
+                _f.min().item() if _f is not None else 0,
+                _f.max().item() if _f is not None else 0,
+                _f.abs().mean().item() if _f is not None else 0,
+                _p.min().item(),
+                _p.max().item(),
+                _e.sum().item() if _e is not None else 0,
+            )
 
         logger.info(
             "[rank %d] step %d: unprepare padded batch",
@@ -642,7 +684,18 @@ class DomainParallel(BaseDynamics):
         else:
             batch = padded_batch
 
-        logger.info("[rank %d] force priming complete", self._domain_rank)
+        # --- DEBUG: log primed forces ---
+        _f = batch.forces
+        _e = batch.energies
+        logger.info(
+            "[rank %d] force priming complete: n=%d f_range=[%.4e,%.4e] fmax_norm=%.4e E=%.4e",
+            self._domain_rank,
+            batch.positions.shape[0],
+            _f.min().item() if _f is not None else 0,
+            _f.max().item() if _f is not None else 0,
+            _f.norm(dim=-1).max().item() if _f is not None else 0,
+            _e.sum().item() if _e is not None else 0,
+        )
         return batch
 
     # ------------------------------------------------------------------
