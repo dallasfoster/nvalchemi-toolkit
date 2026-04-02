@@ -124,7 +124,12 @@ class TestInit:
 
 
 class TestPrepareUnprepareRoundtrip:
-    """Test _prepare_padded_batch / _unprepare_padded_batch cycle."""
+    """Test _prepare_padded_batch / _unprepare_padded_batch cycle.
+
+    Note: _prepare_padded_batch now only saves originals and sets
+    pbc=False.  The AABB cell and position shift are done by the
+    _AABBPrepareHook at BEFORE_COMPUTE.
+    """
 
     def test_roundtrip_orthorhombic(self) -> None:
         dp, _ = _make_domain_parallel()
@@ -140,21 +145,16 @@ class TestPrepareUnprepareRoundtrip:
         # After prepare: pbc should be False
         assert (~batch.pbc).all()
 
-        # Cell should be orthorhombic (diagonal) based on AABB
-        cell_3x3 = batch.cell.squeeze(0)
-        assert torch.allclose(
-            cell_3x3,
-            torch.diag(cell_3x3.diag()),
-            atol=1e-5,
-        ), "Prepared cell should be diagonal (orthorhombic)"
+        # Snapshot should store the original cell
+        assert torch.allclose(snapshot.original_cell, original_cell, atol=1e-6)
 
-        # Positions should be shifted to [0, box_lengths)
-        assert batch.positions.min() >= -1e-6
+        # Positions should be UNCHANGED (the hook shifts them later)
+        assert torch.allclose(batch.positions, original_positions, atol=1e-6)
 
         # Unprepare
         dp._unprepare_padded_batch(batch, snapshot)
 
-        # Should be restored
+        # Should be fully restored
         assert torch.allclose(batch.positions, original_positions, atol=1e-6)
         assert torch.allclose(batch.cell, original_cell, atol=1e-6)
         assert (batch.pbc == original_pbc).all()
@@ -171,23 +171,20 @@ class TestPrepareUnprepareRoundtrip:
 
 
 class TestPrepareTriclinic:
-    """Test that _prepare_padded_batch produces orthorhombic bbox even for triclinic cells."""
+    """Test _prepare_padded_batch saves state and sets pbc=False.
 
-    def test_triclinic_produces_orthorhombic_bbox(self) -> None:
+    Note: The AABB cell computation and position shift are now handled
+    by _AABBPrepareHook (registered at BEFORE_COMPUTE on the inner
+    dynamics), not by _prepare_padded_batch.  These tests verify the
+    prepare/unprepare snapshot and pbc behavior.
+    """
+
+    def test_triclinic_sets_pbc_false(self) -> None:
         dp, _ = _make_domain_parallel()
         batch = _make_triclinic_batch(n_atoms=10)
 
         original_cell = batch.cell.clone()
         snapshot = dp._prepare_padded_batch(batch)
-
-        # The prepared cell should be diagonal (orthorhombic AABB)
-        cell_3x3 = batch.cell.squeeze(0)
-        off_diag = cell_3x3 - torch.diag(cell_3x3.diag())
-        assert torch.allclose(
-            off_diag,
-            torch.zeros_like(off_diag),
-            atol=1e-6,
-        ), "Local bbox should be orthorhombic even for triclinic input"
 
         # pbc should be False
         assert (~batch.pbc).all()
@@ -206,6 +203,8 @@ class TestPrepareTriclinic:
         snapshot = dp._prepare_padded_batch(batch)
         dp._unprepare_padded_batch(batch, snapshot)
 
+        # Positions unchanged because prepare no longer shifts them
+        # (the hook does that at BEFORE_COMPUTE, which isn't called here).
         assert torch.allclose(batch.positions, original_positions, atol=1e-6)
         assert torch.allclose(batch.cell, original_cell, atol=1e-6)
         assert (batch.pbc == original_pbc).all()
@@ -692,12 +691,12 @@ class TestPreparePaddedBatchMultiGraph:
         )  # (2, 3, 3)
         batch.pbc = torch.tensor([[True, True, True], [True, True, True]])
 
+        original_cell = batch.cell.clone()
         snapshot = dp._prepare_padded_batch(batch)
 
-        # Cell should have 2 graphs
+        # Cell should still have 2 graphs (unchanged by prepare;
+        # the hook sets the AABB cell later at BEFORE_COMPUTE).
         assert batch.cell.shape[0] == 2
-        # Both cells should be the same AABB
-        assert torch.allclose(batch.cell[0], batch.cell[1], atol=1e-6)
         # pbc should be False for both
         assert batch.pbc.shape == (2, 3)
         assert (~batch.pbc).all()
@@ -705,6 +704,7 @@ class TestPreparePaddedBatchMultiGraph:
         # Roundtrip
         dp._unprepare_padded_batch(batch, snapshot)
         assert batch.cell.shape[0] == 2
+        assert torch.allclose(batch.cell, original_cell, atol=1e-6)
 
 
 # ---------------------------------------------------------------------------

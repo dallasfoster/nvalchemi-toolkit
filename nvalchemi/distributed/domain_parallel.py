@@ -73,6 +73,8 @@ class _AABBPrepareHook:
         box_lengths = (pos_max - pos_min + eps).clamp(min=1e-6)
 
         local_cell = torch.diag(box_lengths).unsqueeze(0)
+        if batch.cell.shape[0] > 1:
+            local_cell = local_cell.expand(batch.cell.shape[0], -1, -1)
         batch.cell = local_cell.to(dtype=batch.cell.dtype, device=batch.cell.device)
 
         # Shift positions so minimum is at origin.
@@ -465,42 +467,28 @@ class DomainParallel(BaseDynamics):
             else torch.ones(1, 3, dtype=torch.bool, device=positions.device)
         )
 
-        # Compute initial AABB (will be recomputed by _AABBPrepareHook
-        # after pre_update, but needed here for the position shift).
-        pos_min = positions.min(dim=0).values
-        pos_max = positions.max(dim=0).values
-        box_lengths = (pos_max - pos_min).clamp(min=1e-6)
-
         logger.info(
-            "[rank %d] prepare: %d atoms, pos_range=[%.2f,%.2f,%.2f]→[%.2f,%.2f,%.2f] num_graphs=%d",
+            "[rank %d] prepare: %d atoms, num_graphs=%d",
             self._domain_rank,
             positions.shape[0],
-            *pos_min.tolist(),
-            *pos_max.tolist(),
             padded_batch.num_graphs,
         )
 
-        # Set cell to initial AABB (will be overwritten by the hook).
-        local_cell = torch.diag(box_lengths).unsqueeze(0)
-        if padded_batch.cell.shape[0] > 1:
-            local_cell = local_cell.expand(padded_batch.cell.shape[0], -1, -1)
-        padded_batch.cell = local_cell.to(
-            dtype=padded_batch.cell.dtype, device=padded_batch.cell.device
-        )
-
-        # Set pbc=False.
+        # Set pbc=False (open boundaries within the subdomain).
+        # The AABB cell and position shift are handled by
+        # _AABBPrepareHook at BEFORE_COMPUTE, after pre_update
+        # has moved atoms.
         n_graphs = max(1, padded_batch.cell.shape[0])
         padded_batch.pbc = torch.zeros(
             n_graphs, 3, dtype=torch.bool, device=positions.device
         )
 
-        # Shift positions to local origin.
-        padded_batch.positions = positions - pos_min
-
+        # pos_min will be set by _AABBPrepareHook; initialize to zero
+        # so unprepare is a no-op if the hook hasn't fired yet.
         snapshot = _GeometrySnapshot(
             original_cell=original_cell,
             original_pbc=original_pbc,
-            pos_min=pos_min,
+            pos_min=torch.zeros(3, device=positions.device),
         )
         self._geometry_snapshot = snapshot
         return snapshot
