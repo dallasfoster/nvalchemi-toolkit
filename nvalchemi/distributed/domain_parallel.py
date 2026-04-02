@@ -353,10 +353,25 @@ class DomainParallel(BaseDynamics):
         # 1. Outer BEFORE_STEP hooks
         self._call_hooks(DynamicsStage.BEFORE_STEP, batch)
 
+        # 2. Pre-update on the OWNED batch (velocity Verlet half-kick).
+        #    This must happen BEFORE ghost exchange so that ghost atoms
+        #    receive post-half-kick positions.  Without this, ghost atoms
+        #    lag behind owned atoms by ~0.03 Å every step, creating a
+        #    systematic force asymmetry that causes energy drift.
+        dyn = self._dynamics
+        dyn._ensure_state_initialized(batch)
+        dyn._call_hooks(DynamicsStage.BEFORE_PRE_UPDATE, batch)
+        dyn.pre_update(batch)
+        dyn._call_hooks(DynamicsStage.AFTER_PRE_UPDATE, batch)
+
+        # Wrap positions before ghost exchange so ghost atoms receive
+        # wrapped, post-half-kick positions.
+        self._wrap_positions(batch)
+
         logger.info(
             "[rank %d] step %d: ghost exchange", self._domain_rank, self.step_count
         )
-        # 2. Ghost exchange
+        # 3. Ghost exchange — now with post-half-kick positions
         if self._ghost_exchanger is not None:
             padded_batch, n_owned = self._ghost_exchanger.exchange(batch)
         else:
@@ -369,9 +384,7 @@ class DomainParallel(BaseDynamics):
             self._domain_rank,
             self.step_count,
         )
-        # 3-5. Prepare, inner step, unprepare — orchestrated directly
-        #      so we can insert AABB computation between pre_update
-        #      and compute (see _run_inner_step).
+        # 4-5. AABB + compute + post_update on padded batch
         snapshot = self._save_geometry(padded_batch)
         self._ensure_output_tensors(padded_batch)
         padded_batch, converged = self._run_inner_step(padded_batch)
@@ -418,13 +431,9 @@ class DomainParallel(BaseDynamics):
                 _p.max().item(),
             )
 
-        # Wrap positions back into the periodic box.  Without wrapping,
-        # atoms drift outside [0, L] and lose neighbors (especially in
-        # dimensions not split across ranks — X, Y in a 1×1×2 grid).
-        # Wrapping teleports atoms to the opposite side of the box,
-        # but the IMMEDIATELY FOLLOWING migration step moves them to
-        # the correct rank before any force computation occurs.
-        self._wrap_positions(batch)
+        # NOTE: Position wrapping now happens BEFORE ghost exchange
+        # (in step 2 above), not here.  This ensures ghost atoms
+        # receive wrapped, post-half-kick positions.
 
         logger.info(
             "[rank %d] step %d: migration check", self._domain_rank, self.step_count
@@ -468,56 +477,21 @@ class DomainParallel(BaseDynamics):
     # ------------------------------------------------------------------
 
     def _run_inner_step(self, padded_batch: Batch) -> tuple[Batch, torch.Tensor | None]:
-        """Execute the inner dynamics step with AABB geometry management.
+        """Execute compute + post_update on the padded batch.
 
-        Instead of delegating to ``self._dynamics.step()`` as a black box,
-        we replicate the inner step's hook sequence so that the AABB cell
-        and position shift can be inserted between ``pre_update`` (which
-        moves atoms) and ``compute`` (which needs the cell-list).  This
-        avoids the fragile ``_AABBPrepareHook`` and gives ``DomainParallel``
-        explicit control over the geometry lifecycle.
+        ``pre_update`` has already been run on the OWNED batch before
+        ghost exchange (in ``step()``), so ghost atoms already have
+        post-half-kick positions.  This method handles:
 
-        The sequence mirrors ``BaseDynamics.step()`` (lines 1800-1818)
-        but inserts ``_apply_aabb`` + ``_invalidate_nl_ref`` after
-        ``pre_update``.
+        1. AABB cell computation and position shift
+        2. Neighbor list build + model forward (compute)
+        3. Velocity Verlet finalize (post_update)
         """
         dyn = self._dynamics
-        dyn._ensure_state_initialized(padded_batch)
 
         dyn._call_hooks(DynamicsStage.BEFORE_STEP, padded_batch)
 
-        # --- Diagnostic: state BEFORE pre_update ---
-        step = self.step_count
-        if step < 50 and step % 5 == 0:
-            n_owned = self._n_owned
-            _e = padded_batch.energies
-            _f = padded_batch.forces
-            _p = padded_batch.positions
-            logger.info(
-                "[rank %d] step %d DIAG pre_update_in: n_total=%d n_owned=%d "
-                "E_padded=%.4f fmax_owned=%.6f pos_max=%.2f",
-                self._domain_rank,
-                step,
-                _p.shape[0],
-                n_owned,
-                _e.sum().item() if _e is not None else 0,
-                _f[:n_owned].norm(dim=-1).max().item()
-                if _f is not None and n_owned > 0
-                else 0,
-                _p[:n_owned].abs().max().item(),
-            )
-
-        # --- pre_update (velocity Verlet half-kick) ---
-        dyn._call_hooks(DynamicsStage.BEFORE_PRE_UPDATE, padded_batch)
-        dyn.pre_update(padded_batch)
-        dyn._call_hooks(DynamicsStage.AFTER_PRE_UPDATE, padded_batch)
-
         # --- AABB geometry: compute cell from current positions ---
-        # Only recompute the AABB origin and invalidate the NL when the
-        # padded batch size changes (ghost count changed).  When the size
-        # is stable, reuse the cached origin to keep the coordinate frame
-        # consistent — this lets the NL skin check work correctly and
-        # avoids forced rebuilds that cause energy drift.
         n_padded = padded_batch.num_nodes
         size_changed = n_padded != self._prev_n_padded
         self._apply_aabb(padded_batch, force_recompute=size_changed)
@@ -525,7 +499,8 @@ class DomainParallel(BaseDynamics):
             self._invalidate_nl_ref()
             self._prev_n_padded = n_padded
 
-        # --- Diagnostic: state AFTER pre_update + AABB, BEFORE compute ---
+        # --- Diagnostic: state AFTER AABB, BEFORE compute ---
+        step = self.step_count
         if step < 50 and step % 5 == 0:
             _p = padded_batch.positions
             # Check how many neighbors the NL hook will find
