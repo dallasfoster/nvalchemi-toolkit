@@ -239,13 +239,9 @@ class GhostExchanger:
     ) -> torch.Tensor:
         """Find local atoms within ``ghost_width`` of *neighbor_rank*'s domain.
 
-        The test is performed entirely in fractional coordinates so that
-        it remains valid for triclinic cells.
-
-        When the (self.rank, neighbor_rank) pair has a PBC shift, the atom
-        could be a ghost via the direct path OR the PBC-shifted path (or
-        both — e.g., a 2-rank grid where ranks are both direct and
-        PBC-wrap neighbours).  We test both images and take the union.
+        Returns the union of direct-path and PBC-path masks.  For separate
+        masks (needed by :meth:`exchange` to apply shifts correctly), use
+        :meth:`identify_ghosts_split`.
 
         Parameters
         ----------
@@ -260,15 +256,39 @@ class GhostExchanger:
             ``(N,)`` boolean mask — ``True`` for atoms that should be sent
             as ghosts to *neighbor_rank*.
         """
+        direct_mask, pbc_mask = self.identify_ghosts_split(positions, neighbor_rank)
+        return direct_mask | pbc_mask
+
+    def identify_ghosts_split(
+        self, positions: torch.Tensor, neighbor_rank: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return separate direct-path and PBC-path ghost masks.
+
+        This is the core ghost identification method.  The direct mask
+        selects atoms in the halo via the direct (unshifted) image; the
+        PBC mask selects atoms in the halo via the PBC-shifted image.
+        The two sets may overlap (e.g. in a 2-rank grid).
+
+        Parameters
+        ----------
+        positions : torch.Tensor
+            ``(N, 3)`` Cartesian positions of local (owned) atoms.
+        neighbor_rank : int
+            Rank whose domain boundary we test against.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            ``(direct_mask, pbc_mask)`` — each ``(N,)`` boolean.
+        """
         frac_pos = self._positions_to_fractional(positions)  # (N, 3)
         gw_frac = self._ghost_width_fractional()  # (3,)
         frac_lo, frac_hi = self._rank_fractional_bounds(neighbor_rank)
 
-        # Always check the direct (unshifted) image.
-        mask = self._check_halo_region(frac_pos, frac_lo, frac_hi, gw_frac)
+        # Direct (unshifted) image.
+        direct_mask = self._check_halo_region(frac_pos, frac_lo, frac_hi, gw_frac)
 
-        # If a PBC shift exists for this pair, ALSO check the shifted
-        # image and take the union.
+        # PBC-shifted image (if applicable).
         shift_key = (self.rank, neighbor_rank)
         if shift_key in self._pbc_shifts:
             cart_shift = self._pbc_shifts[shift_key].to(
@@ -281,17 +301,20 @@ class GhostExchanger:
             frac_shift = cart_shift @ inv_cell_T  # (3,)
             frac_pos_shifted = frac_pos + frac_shift
 
-            mask_shifted = self._check_halo_region(
+            pbc_mask = self._check_halo_region(
                 frac_pos_shifted, frac_lo, frac_hi, gw_frac
             )
-            mask = mask | mask_shifted
+        else:
+            pbc_mask = torch.zeros(
+                positions.shape[0], dtype=torch.bool, device=positions.device
+            )
 
-        return mask
+        return direct_mask, pbc_mask
 
     def compute_ghost_masks_batched(
         self, positions: torch.Tensor
-    ) -> dict[int, torch.Tensor]:
-        """Compute ghost masks for all neighbors in a single pass.
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        """Compute split ghost masks for all neighbors in a single pass.
 
         Parameters
         ----------
@@ -300,14 +323,12 @@ class GhostExchanger:
 
         Returns
         -------
-        dict[int, torch.Tensor]
-            Mapping from neighbor rank to ``(N,)`` boolean mask.
+        dict[int, tuple[torch.Tensor, torch.Tensor]]
+            Mapping from neighbor rank to ``(direct_mask, pbc_mask)``.
         """
-        masks: dict[int, torch.Tensor] = {}
+        masks: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         for neighbor_rank in self.neighbor_ranks:
-            masks[neighbor_rank] = self.identify_ghosts_for_neighbor(
-                positions, neighbor_rank
-            )
+            masks[neighbor_rank] = self.identify_ghosts_split(positions, neighbor_rank)
         return masks
 
     # ------------------------------------------------------------------
@@ -363,33 +384,68 @@ class GhostExchanger:
             self.neighbor_ranks,
         )
 
-        # Compute ghost masks for all neighbors.
+        # Compute split ghost masks (direct vs PBC) for all neighbors.
         ghost_masks = self.compute_ghost_masks_batched(positions)
 
-        for nr, mask in ghost_masks.items():
+        for nr, (dm, pm) in ghost_masks.items():
+            n_direct = dm.sum().item()
+            n_pbc = pm.sum().item()
+            # Total unique ghosts (direct | pbc).
+            n_total = (dm | pm).sum().item()
             _log.info(
-                "[rank %d] ghost mask for neighbor %d: %d ghosts out of %d atoms",
+                "[rank %d] ghost mask for neighbor %d: %d direct + %d pbc = %d unique (of %d atoms)",
                 self.rank,
                 nr,
-                mask.sum().item(),
-                mask.shape[0],
+                n_direct,
+                n_pbc,
+                n_total,
+                dm.shape[0],
             )
 
         # --- Use batched_isend_irecv to avoid unbatched P2P warnings ---
 
+        # Build per-neighbor send buffers: direct ghosts (unshifted) then
+        # PBC ghosts (shifted).  Atoms in both masks are sent TWICE — once
+        # at each image — so the receiver sees both.
+        send_buffers_all: dict[int, torch.Tensor] = {}
+        for neighbor_rank in self.neighbor_ranks:
+            direct_mask, pbc_mask = ghost_masks[neighbor_rank]
+            parts: list[torch.Tensor] = []
+
+            # Direct ghosts — no shift.
+            if direct_mask.any():
+                parts.append(positions[direct_mask])
+
+            # PBC ghosts — apply shift.
+            if pbc_mask.any():
+                shift_key = (self.rank, neighbor_rank)
+                pbc_pos = positions[pbc_mask]
+                if shift_key in self._pbc_shifts:
+                    shift = self._pbc_shifts[shift_key].to(
+                        device=device, dtype=pbc_pos.dtype
+                    )
+                    pbc_pos = pbc_pos + shift
+                parts.append(pbc_pos)
+
+            if parts:
+                send_buffers_all[neighbor_rank] = torch.cat(parts, dim=0)
+            else:
+                send_buffers_all[neighbor_rank] = torch.zeros(
+                    0, 3, dtype=positions.dtype, device=device
+                )
+
         # Phase 1: exchange counts.
-        # Synchronize GPU before communication to ensure mask.sum() has completed.
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         _log.info("[rank %d] exchange: Phase 1 — exchanging counts", self.rank)
 
-        send_counts: Dict[int, torch.Tensor] = {}
-        recv_counts: Dict[int, torch.Tensor] = {}
+        send_counts: dict[int, torch.Tensor] = {}
+        recv_counts: dict[int, torch.Tensor] = {}
         p2p_ops: list[torch.distributed.P2POp] = []
 
         for neighbor_rank in self.neighbor_ranks:
-            mask = ghost_masks[neighbor_rank]
-            count_send = mask.sum().reshape(1).to(dtype=torch.int64, device=device)
+            n_send = send_buffers_all[neighbor_rank].shape[0]
+            count_send = torch.tensor([n_send], dtype=torch.int64, device=device)
             send_counts[neighbor_rank] = count_send
             count_recv = torch.zeros(1, dtype=torch.int64, device=device)
             recv_counts[neighbor_rank] = count_recv
@@ -416,22 +472,12 @@ class GhostExchanger:
 
         # Phase 2: exchange positions.
         _log.info("[rank %d] exchange: Phase 2 — exchanging positions", self.rank)
-        recv_buffers: Dict[int, torch.Tensor] = {}
+        recv_buffers: dict[int, torch.Tensor] = {}
         p2p_ops = []
 
         for neighbor_rank in self.neighbor_ranks:
-            mask = ghost_masks[neighbor_rank]
-            ghost_pos = positions[mask]  # (n_ghost_send, 3)
-
-            # Apply PBC shift to ghost positions.
-            shift_key = (self.rank, neighbor_rank)
-            if shift_key in self._pbc_shifts:
-                shift = self._pbc_shifts[shift_key].to(
-                    device=device, dtype=ghost_pos.dtype
-                )
-                ghost_pos = ghost_pos + shift
-
-            n_send = ghost_pos.shape[0]
+            send_buf = send_buffers_all[neighbor_rank]
+            n_send = send_buf.shape[0]
             n_recv = recv_counts[neighbor_rank].item()
 
             _log.info(
@@ -442,12 +488,10 @@ class GhostExchanger:
                 n_recv,
             )
 
-            # Always create matching send/recv pairs to avoid deadlock.
             if n_send > 0:
-                send_buf = ghost_pos.contiguous()
                 p2p_ops.append(
                     torch.distributed.P2POp(
-                        torch.distributed.isend, send_buf, neighbor_rank
+                        torch.distributed.isend, send_buf.contiguous(), neighbor_rank
                     )
                 )
             if n_recv > 0:

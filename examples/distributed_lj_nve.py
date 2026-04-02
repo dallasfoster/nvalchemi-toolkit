@@ -224,9 +224,14 @@ class EnergyAllReduceHook:
 
 
 def create_argon_system(
-    n_atoms_per_side: int = 10, lattice_constant: float = 3.4
+    n_atoms_per_side: int = 10, lattice_constant: float = 3.82
 ) -> AtomicData:
-    """Create a simple cubic Argon system with thermal velocities at 300 K."""
+    """Create a simple cubic Argon system with thermal velocities at 50 K.
+
+    The lattice constant defaults to the LJ equilibrium distance
+    ``r_min = 2^(1/6) * sigma ≈ 3.82 Å`` to avoid initial repulsive forces.
+    Temperature matches the single-GPU NVE example for validated stability.
+    """
     positions = [
         [ix * lattice_constant, iy * lattice_constant, iz * lattice_constant]
         for ix in range(n_atoms_per_side)
@@ -239,9 +244,9 @@ def create_argon_system(
     atomic_numbers = torch.full((n_atoms,), 18, dtype=torch.int64)
     atomic_masses = torch.full((n_atoms,), 39.948, dtype=torch.float32)
 
-    # Maxwell-Boltzmann velocities at 300 K
-    kB = 8.617e-5  # eV/K
-    T = 300.0
+    # Maxwell-Boltzmann velocities at 50 K (matches basic/04_nve example)
+    kB = 8.617333262e-5  # eV/K
+    T = 50.0
     sigma_v = (kB * T / 39.948) ** 0.5
     velocities = torch.randn(n_atoms, 3) * sigma_v
     velocities -= velocities.mean(dim=0)  # zero COM velocity
@@ -433,7 +438,7 @@ def main() -> None:
     dist.barrier()
 
     # ── 10. Run NVE ──────────────────────────────────────────
-    n_steps = 500
+    n_steps = 20
     log(rank, ">>> Running {} NVE steps...", n_steps)
     log(rank, "=" * 80)
 

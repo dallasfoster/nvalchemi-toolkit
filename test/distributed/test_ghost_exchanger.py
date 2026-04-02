@@ -535,9 +535,13 @@ class TestComputeGhostMasksBatched:
 
         assert isinstance(masks, dict)
         assert set(masks.keys()) == set(exchanger.neighbor_ranks)
-        for rank, mask in masks.items():
-            assert mask.shape == (2,), f"Mask shape mismatch for rank {rank}"
-            assert mask.dtype == torch.bool
+        for rank, (direct_mask, pbc_mask) in masks.items():
+            assert direct_mask.shape == (2,), (
+                f"Direct mask shape mismatch for rank {rank}"
+            )
+            assert pbc_mask.shape == (2,), f"PBC mask shape mismatch for rank {rank}"
+            assert direct_mask.dtype == torch.bool
+            assert pbc_mask.dtype == torch.bool
 
     def test_correct_masks_for_corner_atom(self):
         """An atom near a corner should be a ghost for multiple neighbors."""
@@ -550,8 +554,8 @@ class TestComputeGhostMasksBatched:
         positions = torch.tensor([[9.5, 9.5, 9.5]], dtype=torch.float64)
         masks = exchanger.compute_ghost_masks_batched(positions)
 
-        # Count how many neighbors see this as a ghost
-        ghost_count = sum(1 for m in masks.values() if m[0].item())
+        # Count how many neighbors see this as a ghost (direct | pbc)
+        ghost_count = sum(1 for dm, pm in masks.values() if (dm[0] | pm[0]).item())
         # Should be ghost for multiple neighbors (face, edge, corner neighbors)
         assert ghost_count >= 3, (
             f"Corner atom should be ghost for at least 3 neighbors, got {ghost_count}"
@@ -566,8 +570,8 @@ class TestComputeGhostMasksBatched:
         positions = torch.tensor([[10.0, 10.0, 10.0]], dtype=torch.float64)
         masks = exchanger.compute_ghost_masks_batched(positions)
 
-        for rank, mask in masks.items():
-            assert not mask[0].item(), (
+        for rank, (dm, pm) in masks.items():
+            assert not (dm[0] | pm[0]).item(), (
                 f"Center atom incorrectly ghosted for rank {rank}"
             )
 
@@ -583,7 +587,7 @@ class TestComputeGhostMasksBatched:
         masks = exchanger.compute_ghost_masks_batched(positions)
 
         assert len(masks) == len(exchanger.neighbor_ranks)
-        ghost_neighbors = [r for r, m in masks.items() if m[0].item()]
+        ghost_neighbors = [r for r, (dm, pm) in masks.items() if (dm[0] | pm[0]).item()]
         assert len(ghost_neighbors) >= 2, (
             f"Expected ghost for at least 2 neighbors, got {ghost_neighbors}"
         )
