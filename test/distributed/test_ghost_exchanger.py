@@ -827,31 +827,31 @@ class TestStrip:
         assert result is mock_batch
 
     def test_strip_with_ghost_atoms_present(self):
-        """When n_owned < total, strip should call index_select to keep graph 0."""
+        """When n_owned < total, strip should truncate node tensors back to n_owned."""
         cell = _make_orthorhombic_cell(20.0, 20.0, 20.0)
         part = _make_partitioner(cell, cutoff=2.0, world_size=2, grid_dims=(2, 1, 1))
         exchanger = _make_ghost_exchanger(part, cutoff=2.0, rank=0)
 
-        # Build a real 2-graph batch: 3 owned atoms (graph 0) + 2 ghost atoms (graph 1)
+        # Build a single-graph batch with 5 atoms (3 owned + 2 ghost merged)
         from nvalchemi.data.atomic_data import AtomicData
         from nvalchemi.data.batch import Batch
 
-        owned = AtomicData(
-            positions=torch.randn(3, 3),
-            atomic_numbers=torch.ones(3, dtype=torch.int64),
+        owned_pos = torch.randn(3, 3)
+        ghost_pos = torch.randn(2, 3)
+
+        data = AtomicData(
+            positions=torch.cat([owned_pos, ghost_pos], dim=0),
+            atomic_numbers=torch.ones(5, dtype=torch.int64),
         )
-        ghost = AtomicData(
-            positions=torch.randn(2, 3),
-            atomic_numbers=torch.ones(2, dtype=torch.int64),
-        )
-        padded = Batch.from_data_list([owned, ghost])
+        padded = Batch.from_data_list([data])
         assert padded.num_nodes == 5
-        assert padded.num_graphs == 2
+        assert padded.num_graphs == 1
 
         result = exchanger.strip(padded, n_owned=3)
-        # Should keep only graph 0 (the 3 owned atoms)
+        # Should keep only the first 3 owned atoms
         assert result.num_nodes == 3
         assert result.num_graphs == 1
+        assert torch.allclose(result.positions, owned_pos)
 
     def test_strip_single_atom_owned(self):
         """Edge case: single owned atom, no ghosts."""
@@ -915,57 +915,52 @@ class TestExchangeBuildsPaddedBatch:
         assert ghost_data.atomic_numbers[1].item() == 18
         assert abs(ghost_data.atomic_masses[0].item() - 39.948) < 1e-3
 
-    def test_padded_batch_via_clone_and_append(self):
-        """Clone local batch, append ghost batch, verify counts."""
+    def test_padded_batch_via_single_graph(self):
+        """Build padded batch as a single graph with owned + ghost atoms."""
         from nvalchemi.data.atomic_data import AtomicData
         from nvalchemi.data.batch import Batch
 
-        # Local batch: 3 atoms
-        local_data = AtomicData(
-            positions=torch.randn(3, 3),
-            atomic_numbers=torch.tensor([6, 6, 6], dtype=torch.int64),
-        )
-        local_batch = Batch.from_data_list([local_data])
+        owned_pos = torch.randn(3, 3)
+        ghost_pos = torch.randn(2, 3)
+        all_pos = torch.cat([owned_pos, ghost_pos], dim=0)
 
-        # Ghost batch: 2 atoms
-        ghost_data = AtomicData(
-            positions=torch.randn(2, 3),
-            atomic_numbers=torch.tensor([6, 6], dtype=torch.int64),
+        data = AtomicData(
+            positions=all_pos,
+            atomic_numbers=torch.tensor([6, 6, 6, 6, 6], dtype=torch.int64),
         )
-        ghost_batch = Batch.from_data_list([ghost_data])
-
-        # Clone and append
-        padded = local_batch.clone()
-        padded.append(ghost_batch)
+        padded = Batch.from_data_list([data])
 
         assert padded.num_nodes == 5
-        assert padded.num_graphs == 2
+        assert padded.num_graphs == 1
         assert padded.positions.shape == (5, 3)
 
     def test_strip_preserves_owned_atom_data(self):
-        """After strip via index_select([0]), owned atom positions should match
-        the original values exactly (not just count)."""
+        """After strip, owned atom positions should match the original values."""
         from nvalchemi.data.atomic_data import AtomicData
         from nvalchemi.data.batch import Batch
 
-        # Create owned batch with known positions
+        # Create owned batch with known positions + ghost appended in graph 0
         owned_positions = torch.tensor(
             [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]
         )
-        owned_data = AtomicData(
-            positions=owned_positions.clone(),
-            atomic_numbers=torch.tensor([18, 18, 18], dtype=torch.int64),
+        all_positions = torch.cat(
+            [owned_positions, torch.tensor([[99.0, 99.0, 99.0], [88.0, 88.0, 88.0]])],
+            dim=0,
         )
-        ghost_data = AtomicData(
-            positions=torch.tensor([[99.0, 99.0, 99.0], [88.0, 88.0, 88.0]]),
-            atomic_numbers=torch.tensor([18, 18], dtype=torch.int64),
+        data = AtomicData(
+            positions=all_positions.clone(),
+            atomic_numbers=torch.tensor([18, 18, 18, 18, 18], dtype=torch.int64),
         )
-        padded = Batch.from_data_list([owned_data, ghost_data])
+        padded = Batch.from_data_list([data])
         assert padded.num_nodes == 5
-        assert padded.num_graphs == 2
+        assert padded.num_graphs == 1
 
-        # Strip: keep only graph 0
-        stripped = padded.index_select(torch.tensor([0]))
+        # Strip: truncate to first 3 owned atoms
+        cell = _make_orthorhombic_cell(20.0, 20.0, 20.0)
+        part = _make_partitioner(cell, cutoff=2.0, world_size=2, grid_dims=(2, 1, 1))
+        exchanger = _make_ghost_exchanger(part, cutoff=2.0, rank=0)
+        stripped = exchanger.strip(padded, n_owned=3)
+
         assert stripped.num_nodes == 3
         assert stripped.num_graphs == 1
         torch.testing.assert_close(stripped.positions, owned_positions)
@@ -1007,31 +1002,20 @@ class TestStripWithRealBatch:
         part = _make_partitioner(cell, cutoff=2.0, world_size=2, grid_dims=(2, 1, 1))
         exchanger = _make_ghost_exchanger(part, cutoff=2.0, rank=0)
 
-        # Owned batch with forces and energies
+        # Build single-graph padded batch: 3 owned + 2 ghost atoms
         owned_forces = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
         owned_energies = torch.tensor([[42.0]])
-        owned_data = AtomicData(
-            positions=torch.randn(3, 3),
-            atomic_numbers=torch.tensor([18, 18, 18], dtype=torch.int64),
-        )
-        owned_batch = Batch.from_data_list([owned_data])
-        owned_batch.forces = owned_forces.clone()
-        owned_batch.energies = owned_energies.clone()
 
-        # Ghost batch
-        ghost_data = AtomicData(
-            positions=torch.randn(2, 3),
-            atomic_numbers=torch.tensor([18, 18], dtype=torch.int64),
+        all_positions = torch.cat([torch.randn(3, 3), torch.randn(2, 3)], dim=0)
+        data = AtomicData(
+            positions=all_positions,
+            atomic_numbers=torch.tensor([18, 18, 18, 18, 18], dtype=torch.int64),
         )
-        ghost_batch = Batch.from_data_list([ghost_data])
-        ghost_batch.forces = torch.zeros(2, 3)
-        ghost_batch.energies = torch.tensor([[0.0]])
-
-        # Build padded batch
-        padded = owned_batch.clone()
-        padded.append(ghost_batch)
+        padded = Batch.from_data_list([data])
+        padded.forces = torch.cat([owned_forces.clone(), torch.zeros(2, 3)], dim=0)
+        padded.energies = owned_energies.clone()
         assert padded.num_nodes == 5
-        assert padded.num_graphs == 2
+        assert padded.num_graphs == 1
 
         # Strip
         result = exchanger.strip(padded, n_owned=3)
@@ -1041,3 +1025,178 @@ class TestStripWithRealBatch:
         torch.testing.assert_close(result.forces, owned_forces)
         assert result.energies is not None
         torch.testing.assert_close(result.energies.float(), owned_energies)
+
+
+# ---------------------------------------------------------------------------
+# Tests — identify_ghosts_split no-PBC branch (line 308)
+# ---------------------------------------------------------------------------
+
+
+class TestIdentifyGhostsSplitNoPBC:
+    """Test identify_ghosts_split when the rank pair has NO PBC shift."""
+
+    def test_no_pbc_shift_returns_zeros_pbc_mask(self):
+        """In a 4x1x1 grid, rank 0 and rank 1 are direct neighbors without
+        PBC wrapping. The pbc_mask should be all zeros."""
+        cell = _make_orthorhombic_cell(40.0, 10.0, 10.0)
+        part = _make_partitioner(cell, cutoff=2.0, world_size=4, grid_dims=(4, 1, 1))
+        # rank_grid = (4, 1, 1)
+        # rank 0 owns x in [0, 10), rank 1 owns x in [10, 20)
+        # These are direct interior neighbors — no PBC wrapping.
+
+        exchanger = _make_ghost_exchanger(part, cutoff=2.0, rank=0)
+
+        # Confirm that (0, 1) has no PBC shift.
+        assert (0, 1) not in exchanger._pbc_shifts
+
+        # Place atoms near the boundary with rank 1.
+        positions = torch.tensor(
+            [[9.0, 5.0, 5.0], [5.0, 5.0, 5.0], [9.5, 5.0, 5.0]],
+            dtype=torch.float64,
+        )
+
+        direct_mask, pbc_mask = exchanger.identify_ghosts_split(
+            positions, neighbor_rank=1
+        )
+
+        # pbc_mask should be all zeros since no PBC shift exists.
+        assert not pbc_mask.any().item()
+        assert pbc_mask.shape == (3,)
+        assert pbc_mask.dtype == torch.bool
+
+        # direct_mask should identify atoms near the x=10 boundary.
+        assert direct_mask[0].item() is True  # x=9.0, within ghost_width=2.0 of x=10
+        assert direct_mask[1].item() is False  # x=5.0, far from boundary
+        assert direct_mask[2].item() is True  # x=9.5, within ghost_width=2.0 of x=10
+
+
+# ---------------------------------------------------------------------------
+# Tests — strip() with various field configurations
+# ---------------------------------------------------------------------------
+
+
+class TestStripFieldConfigurations:
+    """Test strip() with different combinations of optional fields."""
+
+    def _make_exchanger(self) -> GhostExchanger:
+        cell = _make_orthorhombic_cell(20.0, 20.0, 20.0)
+        part = _make_partitioner(cell, cutoff=2.0, world_size=2, grid_dims=(2, 1, 1))
+        return _make_ghost_exchanger(part, cutoff=2.0, rank=0)
+
+    def test_strip_with_all_optional_fields(self):
+        """Strip a batch that has atomic_masses, velocities, forces, cell, pbc,
+        and energies. Verify all node-level tensors are truncated and
+        system-level fields are preserved."""
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch
+
+        exchanger = self._make_exchanger()
+
+        owned_pos = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
+        ghost_pos = torch.tensor([[10.0, 11.0, 12.0], [13.0, 14.0, 15.0]])
+        all_pos = torch.cat([owned_pos, ghost_pos], dim=0)
+
+        data = AtomicData(
+            positions=all_pos,
+            atomic_numbers=torch.tensor([6, 7, 8, 6, 6], dtype=torch.int64),
+            atomic_masses=torch.tensor([12.0, 14.0, 16.0, 12.0, 12.0]),
+            cell=torch.diag(torch.tensor([20.0, 20.0, 20.0])).unsqueeze(0),
+            pbc=torch.tensor([[True, True, True]]),
+        )
+        data.add_node_property(
+            "velocities",
+            torch.tensor(
+                [
+                    [0.1, 0.2, 0.3],
+                    [0.4, 0.5, 0.6],
+                    [0.7, 0.8, 0.9],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]
+            ),
+        )
+        data.add_node_property(
+            "forces",
+            torch.tensor(
+                [
+                    [1.1, 1.2, 1.3],
+                    [1.4, 1.5, 1.6],
+                    [1.7, 1.8, 1.9],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                ]
+            ),
+        )
+        padded = Batch.from_data_list([data])
+        padded.energies = torch.tensor([[42.0]])
+
+        result = exchanger.strip(padded, n_owned=3)
+
+        # Node-level tensors should have 3 atoms.
+        assert result.num_nodes == 3
+        assert result.positions.shape == (3, 3)
+        torch.testing.assert_close(result.positions, owned_pos)
+        assert result.atomic_numbers.shape == (3,)
+        torch.testing.assert_close(
+            result.atomic_numbers,
+            torch.tensor([6, 7, 8], dtype=torch.int64),
+        )
+        assert result.atomic_masses.shape == (3,)
+        torch.testing.assert_close(
+            result.atomic_masses,
+            torch.tensor([12.0, 14.0, 16.0]),
+        )
+        assert result.velocities.shape == (3, 3)
+        torch.testing.assert_close(
+            result.velocities,
+            torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]]),
+        )
+        assert result.forces.shape == (3, 3)
+        torch.testing.assert_close(
+            result.forces,
+            torch.tensor([[1.1, 1.2, 1.3], [1.4, 1.5, 1.6], [1.7, 1.8, 1.9]]),
+        )
+
+        # System-level fields preserved.
+        assert result.cell is not None
+        assert result.pbc is not None
+        assert result.energies is not None
+        torch.testing.assert_close(result.energies.float(), torch.tensor([[42.0]]))
+
+    def test_strip_with_minimal_fields(self):
+        """Strip a batch with only positions and atomic_numbers (no velocities,
+        forces, or masses). Should work without errors."""
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch
+
+        exchanger = self._make_exchanger()
+
+        all_pos = torch.randn(5, 3)
+        data = AtomicData(
+            positions=all_pos,
+            atomic_numbers=torch.tensor([6, 6, 6, 6, 6], dtype=torch.int64),
+        )
+        padded = Batch.from_data_list([data])
+
+        result = exchanger.strip(padded, n_owned=3)
+        assert result.num_nodes == 3
+        assert result.num_graphs == 1
+        torch.testing.assert_close(result.positions, all_pos[:3])
+        assert result.atomic_numbers.shape == (3,)
+
+    def test_exchange_single_process_returns_correct_n_owned(self):
+        """Verify exchange() in single-process mode returns the correct n_owned value."""
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch
+
+        exchanger = self._make_exchanger()
+
+        data = AtomicData(
+            positions=torch.randn(7, 3),
+            atomic_numbers=torch.tensor([6] * 7, dtype=torch.int64),
+        )
+        batch = Batch.from_data_list([data])
+
+        result_batch, n_owned = exchanger.exchange(batch)
+        assert result_batch is batch
+        assert n_owned == 7

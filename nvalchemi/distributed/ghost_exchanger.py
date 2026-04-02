@@ -376,12 +376,16 @@ class GhostExchanger:
         n_owned = positions.shape[0]
         device = positions.device
 
+        pos_min = positions.min(dim=0).values.tolist()
+        pos_max = positions.max(dim=0).values.tolist()
         _log.info(
-            "[rank %d] exchange: n_owned=%d, %d neighbors: %s",
+            "[rank %d] exchange: n_owned=%d, %d neighbors: %s  pos_range=[%.1f,%.1f,%.1f]→[%.1f,%.1f,%.1f]",
             self.rank,
             n_owned,
             len(self.neighbor_ranks),
             self.neighbor_ranks,
+            *pos_min,
+            *pos_max,
         )
 
         # Compute split ghost masks (direct vs PBC) for all neighbors.
@@ -428,7 +432,16 @@ class GhostExchanger:
                 parts.append(pbc_pos)
 
             if parts:
-                send_buffers_all[neighbor_rank] = torch.cat(parts, dim=0)
+                buf = torch.cat(parts, dim=0)
+                send_buffers_all[neighbor_rank] = buf
+                _log.info(
+                    "[rank %d]   send buf for %d: %d atoms  Z_range=[%.2f, %.2f]",
+                    self.rank,
+                    neighbor_rank,
+                    buf.shape[0],
+                    buf[:, 2].min().item(),
+                    buf[:, 2].max().item(),
+                )
             else:
                 send_buffers_all[neighbor_rank] = torch.zeros(
                     0, 3, dtype=positions.dtype, device=device
@@ -522,62 +535,104 @@ class GhostExchanger:
             all_ghost_pos = torch.zeros(0, 3, dtype=positions.dtype, device=device)
 
         n_ghosts = all_ghost_pos.shape[0]
-        _log.info(
-            "[rank %d] exchange: done — %d owned + %d ghosts = %d total",
-            self.rank,
-            n_owned,
-            n_ghosts,
-            n_owned + n_ghosts,
-        )
+        if n_ghosts > 0:
+            ghost_min = all_ghost_pos.min(dim=0).values.tolist()
+            ghost_max = all_ghost_pos.max(dim=0).values.tolist()
+            _log.info(
+                "[rank %d] exchange: done — %d owned + %d ghosts = %d total  "
+                "ghost_Z_range=[%.2f, %.2f]",
+                self.rank,
+                n_owned,
+                n_ghosts,
+                n_owned + n_ghosts,
+                ghost_min[2],
+                ghost_max[2],
+            )
+        else:
+            _log.info(
+                "[rank %d] exchange: done — %d owned + %d ghosts = %d total",
+                self.rank,
+                n_owned,
+                n_ghosts,
+                n_owned + n_ghosts,
+            )
 
         self._n_owned = n_owned
 
         if n_ghosts == 0:
             return local_batch, n_owned
 
-        # Build a padded Batch by creating ghost AtomicData and appending
-        # to the local batch.  Ghost atoms get dummy atomic_numbers and
-        # masses copied from the first owned atom (all same element in
-        # typical LJ/MLIP simulations; a full implementation would exchange
-        # these fields too).
+        # Build a padded Batch as a SINGLE graph containing owned + ghost
+        # atoms.  This is critical: if ghosts were a separate graph
+        # (num_graphs=2), the neighbor list builder would treat them as an
+        # independent system and never build cross-graph edges.
         from nvalchemi.data.atomic_data import AtomicData
         from nvalchemi.data.batch import Batch as BatchCls
 
-        ghost_data = AtomicData(
-            positions=all_ghost_pos,
-            atomic_numbers=local_batch.atomic_numbers[:1].expand(n_ghosts).clone(),
-            atomic_masses=(
-                local_batch.atomic_masses[:1].expand(n_ghosts).clone()
-                if hasattr(local_batch, "atomic_masses")
-                and local_batch.atomic_masses is not None
-                else torch.ones(n_ghosts, device=device)
-            ),
-            cell=local_batch.cell.clone(),
-            pbc=local_batch.pbc.clone()
-            if hasattr(local_batch, "pbc") and local_batch.pbc is not None
-            else None,
+        all_positions = torch.cat([positions, all_ghost_pos], dim=0)
+        all_atomic_numbers = torch.cat(
+            [
+                local_batch.atomic_numbers,
+                local_batch.atomic_numbers[:1].expand(n_ghosts).clone(),
+            ],
+            dim=0,
         )
 
-        # If the local batch has velocities, add zero velocities for ghosts
-        # (ghosts are read-only — their velocities aren't used).
+        padded_data = AtomicData(
+            positions=all_positions,
+            atomic_numbers=all_atomic_numbers,
+        )
+
+        # Atomic masses.
+        if (
+            hasattr(local_batch, "atomic_masses")
+            and local_batch.atomic_masses is not None
+        ):
+            padded_data.atomic_masses = torch.cat(
+                [
+                    local_batch.atomic_masses,
+                    local_batch.atomic_masses[:1].expand(n_ghosts).clone(),
+                ],
+                dim=0,
+            )
+
+        # Velocities (zero for ghosts).
         if hasattr(local_batch, "velocities") and local_batch.velocities is not None:
-            ghost_data.add_node_property(
+            padded_data.add_node_property(
                 "velocities",
-                torch.zeros(n_ghosts, 3, dtype=positions.dtype, device=device),
+                torch.cat(
+                    [
+                        local_batch.velocities,
+                        torch.zeros(n_ghosts, 3, dtype=positions.dtype, device=device),
+                    ],
+                    dim=0,
+                ),
             )
 
-        # If the local batch has forces, add zero forces for ghosts.
+        # Forces (zero for ghosts).
         if hasattr(local_batch, "forces") and local_batch.forces is not None:
-            ghost_data.add_node_property(
-                "forces", torch.zeros(n_ghosts, 3, dtype=positions.dtype, device=device)
+            padded_data.add_node_property(
+                "forces",
+                torch.cat(
+                    [
+                        local_batch.forces,
+                        torch.zeros(n_ghosts, 3, dtype=positions.dtype, device=device),
+                    ],
+                    dim=0,
+                ),
             )
 
-        ghost_batch = BatchCls.from_data_list([ghost_data], device=device)
+        # Preserve cell and pbc.
+        if hasattr(local_batch, "cell") and local_batch.cell is not None:
+            padded_data.cell = local_batch.cell.clone()
+        if hasattr(local_batch, "pbc") and local_batch.pbc is not None:
+            padded_data.pbc = local_batch.pbc.clone()
 
-        # Build padded batch: clone owned, then append ghosts.
-        # Clone so we don't modify the caller's local_batch.
-        padded_batch = local_batch.clone()
-        padded_batch.append(ghost_batch)
+        padded_batch = BatchCls.from_data_list([padded_data], device=device)
+
+        # Copy system-level energies if present.
+        if hasattr(local_batch, "energies") and local_batch.energies is not None:
+            padded_batch.energies = local_batch.energies.clone()
 
         _log.info(
             "[rank %d] padded batch: num_nodes=%d num_graphs=%d",
@@ -595,10 +650,13 @@ class GhostExchanger:
     def strip(self, padded_batch: Batch, n_owned: int) -> Batch:
         """Remove ghost atoms, returning only the owned portion.
 
+        Since ghost atoms are merged into graph 0, stripping rebuilds a
+        clean single-graph Batch with only the first ``n_owned`` atoms.
+
         Parameters
         ----------
         padded_batch : Batch
-            Batch containing owned + ghost atoms.
+            Batch containing owned + ghost atoms (all in graph 0).
         n_owned : int
             Number of owned atoms (ghosts start at this index).
 
@@ -607,21 +665,55 @@ class GhostExchanger:
         Batch
             Batch with only owned atoms.
         """
-        if padded_batch.positions.shape[0] == n_owned:
+        n_total = padded_batch.positions.shape[0]
+        if n_total == n_owned:
             return padded_batch
 
-        # The padded batch has 2 graphs: [owned (graph 0) | ghosts (graph 1)].
-        # Select only graph 0 to strip the ghost atoms.
         import logging as _logging
 
         _log2 = _logging.getLogger(__name__)
         _log2.info(
-            "[rank %d] strip: %d total atoms → keeping graph 0 (%d owned)",
+            "[rank %d] strip: %d total atoms → keeping first %d owned",
             self.rank,
-            padded_batch.num_nodes,
+            n_total,
             n_owned,
         )
-        stripped = padded_batch.index_select(
-            torch.tensor([0], device=padded_batch.positions.device)
+
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch as BatchCls
+
+        device = padded_batch.positions.device
+
+        # Build a fresh AtomicData from the owned slice of each field.
+        data = AtomicData(
+            positions=padded_batch.positions[:n_owned].clone(),
+            atomic_numbers=padded_batch.atomic_numbers[:n_owned].clone(),
         )
+
+        if (
+            hasattr(padded_batch, "atomic_masses")
+            and padded_batch.atomic_masses is not None
+        ):
+            data.atomic_masses = padded_batch.atomic_masses[:n_owned].clone()
+
+        if hasattr(padded_batch, "velocities") and padded_batch.velocities is not None:
+            data.add_node_property(
+                "velocities", padded_batch.velocities[:n_owned].clone()
+            )
+
+        if hasattr(padded_batch, "forces") and padded_batch.forces is not None:
+            data.add_node_property("forces", padded_batch.forces[:n_owned].clone())
+
+        # Preserve cell and pbc from the padded batch.
+        if hasattr(padded_batch, "cell") and padded_batch.cell is not None:
+            data.cell = padded_batch.cell.clone()
+        if hasattr(padded_batch, "pbc") and padded_batch.pbc is not None:
+            data.pbc = padded_batch.pbc.clone()
+
+        stripped = BatchCls.from_data_list([data], device=device)
+
+        # Copy system-level energies if present.
+        if hasattr(padded_batch, "energies") and padded_batch.energies is not None:
+            stripped.energies = padded_batch.energies.clone()
+
         return stripped

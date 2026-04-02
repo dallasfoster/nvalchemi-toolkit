@@ -394,6 +394,16 @@ class DomainParallel(BaseDynamics):
         pos_max = positions.max(dim=0).values  # (3,)
         box_lengths = pos_max - pos_min
 
+        logger.info(
+            "[rank %d] prepare: %d atoms, AABB [%.2f,%.2f,%.2f]→[%.2f,%.2f,%.2f] box=[%.2f,%.2f,%.2f] num_graphs=%d",
+            self._domain_rank,
+            positions.shape[0],
+            *pos_min.tolist(),
+            *pos_max.tolist(),
+            *box_lengths.tolist(),
+            padded_batch.num_graphs,
+        )
+
         # Add small padding to avoid zero-width boxes
         eps = 1e-6
         box_lengths = box_lengths.clamp(min=eps)

@@ -562,6 +562,49 @@ class TestNeedsMigration:
         assert migrator.needs_migration(batch) is False
 
 
+class TestAtomMigratorInit:
+    """Test AtomMigrator.__init__ with a mock mesh."""
+
+    def test_init_stores_attributes(self):
+        """__init__ should store partitioner, config, rank, and world_size."""
+        from unittest.mock import MagicMock
+
+        cell = _make_orthorhombic_cell(20.0, 20.0, 20.0)
+        part = _make_partitioner(cell, cutoff=5.0, world_size=4, grid_dims=(2, 2, 1))
+        config = DomainConfig(cutoff=5.0)
+
+        mock_mesh = MagicMock()
+        mock_mesh.get_local_rank.return_value = 2
+        mock_mesh.size.return_value = 4
+
+        migrator = AtomMigrator(partitioner=part, config=config, mesh=mock_mesh)
+
+        assert migrator.partitioner is part
+        assert migrator.config is config
+        assert migrator.mesh is mock_mesh
+        assert migrator.rank == 2
+        assert migrator.world_size == 4
+        mock_mesh.get_local_rank.assert_called_once()
+        mock_mesh.size.assert_called_once()
+
+    def test_init_rank_zero(self):
+        """When mesh reports rank 0, the migrator should store rank 0."""
+        from unittest.mock import MagicMock
+
+        cell = _make_orthorhombic_cell(20.0, 20.0, 20.0)
+        part = _make_partitioner(cell, cutoff=5.0, world_size=2, grid_dims=(2, 1, 1))
+        config = DomainConfig(cutoff=5.0)
+
+        mock_mesh = MagicMock()
+        mock_mesh.get_local_rank.return_value = 0
+        mock_mesh.size.return_value = 2
+
+        migrator = AtomMigrator(partitioner=part, config=config, mesh=mock_mesh)
+
+        assert migrator.rank == 0
+        assert migrator.world_size == 2
+
+
 class TestMigrateNoDistributed:
     """Test AtomMigrator.migrate when dist is NOT initialized."""
 

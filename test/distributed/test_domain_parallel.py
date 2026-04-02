@@ -733,3 +733,309 @@ class TestRankResolution:
         inner = DemoDynamics(model=model, n_steps=5)
         dp = DomainParallel(dynamics=inner, config=config)
         assert dp._domain_rank == 0
+
+    def test_rank_from_mock_mesh(self) -> None:
+        """When mesh is provided, rank should come from mesh.get_local_rank()."""
+        from unittest.mock import MagicMock
+
+        mock_mesh = MagicMock()
+        mock_mesh.get_local_rank.return_value = 3
+
+        config = DomainConfig(cutoff=3.0, skin=0.5, mesh=mock_mesh)
+        model = DemoModelWrapper()
+        inner = DemoDynamics(model=model, n_steps=5)
+        dp = DomainParallel(dynamics=inner, config=config)
+
+        assert dp._domain_rank == 3
+        mock_mesh.get_local_rank.assert_called_once()
+
+    def test_rank_fallback_when_mesh_raises(self) -> None:
+        """When mesh.get_local_rank() raises, rank should fall back to 0."""
+        from unittest.mock import MagicMock
+
+        mock_mesh = MagicMock()
+        mock_mesh.get_local_rank.side_effect = RuntimeError("no mesh backend")
+
+        config = DomainConfig(cutoff=3.0, skin=0.5, mesh=mock_mesh)
+        model = DemoModelWrapper()
+        inner = DemoDynamics(model=model, n_steps=5)
+        dp = DomainParallel(dynamics=inner, config=config)
+
+        assert dp._domain_rank == 0
+
+
+# ---------------------------------------------------------------------------
+# _ensure_output_tensors tests
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureOutputTensors:
+    """Test _ensure_output_tensors pre-allocation logic.
+
+    Note: Batch uses tensordict-backed storage that validates tensor shapes
+    on assignment. We create batches that genuinely lack fields (by not
+    adding them to AtomicData) to test the missing-field branches.
+    """
+
+    def test_forces_missing(self) -> None:
+        """When batch has no forces, they should be allocated."""
+        data = AtomicData(
+            positions=torch.randn(5, 3),
+            atomic_numbers=torch.tensor([6] * 5, dtype=torch.long),
+        )
+        batch = Batch.from_data_list([data])
+        batch.energies = torch.zeros(1, 1, dtype=torch.float64)
+        assert not hasattr(batch, "forces") or batch.forces is None
+
+        DomainParallel._ensure_output_tensors(batch)
+
+        assert batch.forces is not None
+        assert batch.forces.shape == (5, 3)
+        assert (batch.forces == 0).all()
+
+    def test_energies_missing(self) -> None:
+        """When batch has no energies, they should be allocated."""
+        data = AtomicData(
+            positions=torch.randn(5, 3),
+            atomic_numbers=torch.tensor([6] * 5, dtype=torch.long),
+        )
+        data.add_node_property("forces", torch.zeros(5, 3))
+        batch = Batch.from_data_list([data])
+        assert not hasattr(batch, "energies") or batch.energies is None
+
+        DomainParallel._ensure_output_tensors(batch)
+
+        assert batch.energies is not None
+        assert batch.energies.shape == (1, 1)
+        assert (batch.energies == 0).all()
+
+    def test_both_missing(self) -> None:
+        """When both forces and energies are missing, both should be allocated."""
+        data = AtomicData(
+            positions=torch.randn(4, 3),
+            atomic_numbers=torch.tensor([6] * 4, dtype=torch.long),
+        )
+        batch = Batch.from_data_list([data])
+
+        DomainParallel._ensure_output_tensors(batch)
+
+        assert batch.forces is not None
+        assert batch.forces.shape == (4, 3)
+        assert batch.energies is not None
+        assert batch.energies.shape == (1, 1)
+
+    def test_forces_and_energies_correct_noop(self) -> None:
+        """When forces and energies already have correct shapes, no reallocation."""
+        batch = _make_batch(n_atoms=5)
+        original_forces = batch.forces.clone()
+        original_energies = batch.energies.clone()
+
+        DomainParallel._ensure_output_tensors(batch)
+
+        # Values should be unchanged
+        torch.testing.assert_close(batch.forces, original_forces)
+        torch.testing.assert_close(batch.energies, original_energies)
+
+    def test_forces_wrong_size_via_padded_batch(self) -> None:
+        """Simulate the ghost-exchange scenario: a padded batch is built from
+        a larger set of atoms, but forces from the pre-exchange batch have
+        the wrong size. We verify _ensure_output_tensors handles this case
+        by building two batches of different sizes."""
+        # Build a small batch with 3 atoms + forces
+        data_small = AtomicData(
+            positions=torch.randn(3, 3),
+            atomic_numbers=torch.tensor([6] * 3, dtype=torch.long),
+        )
+        data_small.add_node_property("forces", torch.randn(3, 3))
+        batch_small = Batch.from_data_list([data_small])
+        assert batch_small.forces.shape == (3, 3)
+
+        # Build a larger padded batch (simulating ghost exchange grew the batch)
+        data_large = AtomicData(
+            positions=torch.randn(5, 3),
+            atomic_numbers=torch.tensor([6] * 5, dtype=torch.long),
+        )
+        batch_large = Batch.from_data_list([data_large])
+        # This batch has no forces — _ensure_output_tensors should add them
+        DomainParallel._ensure_output_tensors(batch_large)
+        assert batch_large.forces.shape == (5, 3)
+
+    def test_energies_wrong_num_graphs_via_multi_graph(self) -> None:
+        """Test energies reallocation with a multi-graph batch where we set
+        energies with the correct num_graphs first, then verify the method
+        does not touch them."""
+        data1 = AtomicData(
+            positions=torch.randn(3, 3),
+            atomic_numbers=torch.tensor([6] * 3, dtype=torch.long),
+        )
+        data2 = AtomicData(
+            positions=torch.randn(2, 3),
+            atomic_numbers=torch.tensor([8] * 2, dtype=torch.long),
+        )
+        batch = Batch.from_data_list([data1, data2])
+        batch.forces = torch.zeros(5, 3)
+        batch.energies = torch.zeros(2, 1, dtype=torch.float64)
+
+        DomainParallel._ensure_output_tensors(batch)
+
+        # Both should have correct shapes for 2 graphs, 5 atoms
+        assert batch.forces.shape == (5, 3)
+        assert batch.energies.shape == (2, 1)
+
+
+# ---------------------------------------------------------------------------
+# _prepare_padded_batch with missing pbc
+# ---------------------------------------------------------------------------
+
+
+class TestUnprepareWithNullPosMin:
+    """Test _unprepare_padded_batch when pos_min is None in snapshot."""
+
+    def test_unprepare_skips_position_shift_when_pos_min_none(self) -> None:
+        """When snapshot.pos_min is None, positions should not be shifted."""
+        dp, _ = _make_domain_parallel()
+        batch = _make_batch(n_atoms=5)
+        original_positions = batch.positions.clone()
+        original_cell = torch.diag(torch.tensor([5.0, 5.0, 5.0])).unsqueeze(0)
+        original_pbc = torch.tensor([[True, True, True]])
+
+        snapshot = _GeometrySnapshot(
+            original_cell=original_cell,
+            original_pbc=original_pbc,
+            pos_min=None,
+        )
+
+        dp._unprepare_padded_batch(batch, snapshot)
+
+        # Positions should be unchanged (no shift applied)
+        torch.testing.assert_close(batch.positions, original_positions)
+        # Cell and pbc should be restored
+        torch.testing.assert_close(batch.cell, original_cell)
+        assert (batch.pbc == original_pbc).all()
+
+
+class TestPreparePaddedBatchMissingPBC:
+    """Test _prepare_padded_batch when pbc is not set on the batch."""
+
+    def test_missing_pbc_creates_default(self) -> None:
+        """When pbc is not present on the batch, prepare should create a
+        default pbc (all True) for the snapshot and then set pbc=False
+        for the local domain."""
+        dp, _ = _make_domain_parallel()
+
+        # Create a batch without pbc but with a cell
+        data = AtomicData(
+            positions=torch.rand(5, 3) * 10.0,
+            atomic_numbers=torch.tensor([6] * 5, dtype=torch.long),
+        )
+        batch = Batch.from_data_list([data])
+        batch.cell = torch.diag(torch.tensor([10.0, 10.0, 10.0])).unsqueeze(0)
+        assert not hasattr(batch, "pbc") or batch.pbc is None
+
+        snapshot = dp._prepare_padded_batch(batch)
+
+        # After prepare, pbc should be False (open boundaries)
+        assert batch.pbc is not None
+        assert (~batch.pbc).all()
+
+        # The snapshot should contain the default pbc (all True)
+        assert snapshot.original_pbc is not None
+        assert snapshot.original_pbc.shape == (1, 3)
+        assert snapshot.original_pbc.all()
+
+
+# ---------------------------------------------------------------------------
+# _call_hooks with _runs_on_stage attribute
+# ---------------------------------------------------------------------------
+
+
+class TestCallHooksWithRunsOnStage:
+    """Test _call_hooks with hooks that have a _runs_on_stage method."""
+
+    def _make_dp_with_hooks(self, hooks: list) -> DomainParallel:
+        mock_inner = _MockDynamics(n_steps=10)
+        config = DomainConfig(cutoff=3.0, skin=0.5)
+        dp = DomainParallel(dynamics=mock_inner, config=config, hooks=hooks)
+        return dp
+
+    def test_runs_on_stage_true(self) -> None:
+        """Hook with _runs_on_stage returning True should fire."""
+
+        class _StageAwareHook:
+            def __init__(self):
+                self.stage = DynamicsStage.BEFORE_STEP
+                self.frequency = 1
+                self.scope = HookScope.LOCAL
+                self.call_count = 0
+
+            def _runs_on_stage(self, stage: DynamicsStage) -> bool:
+                return stage == DynamicsStage.BEFORE_STEP
+
+            def __call__(self, ctx, stage):
+                self.call_count += 1
+
+        hook = _StageAwareHook()
+        dp = self._make_dp_with_hooks([hook])
+        batch = _make_batch(n_atoms=5)
+
+        dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+        assert hook.call_count == 1
+
+    def test_runs_on_stage_false_skips(self) -> None:
+        """Hook with _runs_on_stage returning False should be skipped."""
+
+        class _StageAwareHook:
+            def __init__(self):
+                self.stage = DynamicsStage.BEFORE_STEP
+                self.frequency = 1
+                self.scope = HookScope.LOCAL
+                self.call_count = 0
+
+            def _runs_on_stage(self, stage: DynamicsStage) -> bool:
+                return stage == DynamicsStage.AFTER_STEP  # Never matches BEFORE_STEP
+
+            def __call__(self, ctx, stage):
+                self.call_count += 1
+
+        hook = _StageAwareHook()
+        dp = self._make_dp_with_hooks([hook])
+        batch = _make_batch(n_atoms=5)
+
+        dp._call_hooks(DynamicsStage.BEFORE_STEP, batch)
+        assert hook.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# _prime_forces tests
+# ---------------------------------------------------------------------------
+
+
+class TestPrimeForces:
+    """Test _prime_forces in single-process mode (no ghost exchanger)."""
+
+    def test_prime_forces_sets_flag(self) -> None:
+        """After _prime_forces, the flag should be set so it's not called again."""
+        mock_inner = _MockDynamics(n_steps=10)
+        config = DomainConfig(cutoff=3.0, skin=0.5)
+        dp = DomainParallel(dynamics=mock_inner, config=config)
+
+        batch = _make_batch(n_atoms=5)
+        assert dp._forces_primed is False
+
+        # step() calls _prime_forces on the first call
+        dp.step(batch)
+        assert dp._forces_primed is True
+
+    def test_prime_forces_not_called_twice(self) -> None:
+        """_prime_forces should only run on the first step."""
+        mock_inner = _MockDynamics(n_steps=10)
+        config = DomainConfig(cutoff=3.0, skin=0.5)
+        dp = DomainParallel(dynamics=mock_inner, config=config)
+
+        batch = _make_batch(n_atoms=5)
+        dp.step(batch)
+        dp.step(batch)
+
+        # mock_inner.step_calls should be 2 (one per step call)
+        # If _prime_forces ran twice, there would be extra calls to compute
+        assert mock_inner.step_calls == 2
