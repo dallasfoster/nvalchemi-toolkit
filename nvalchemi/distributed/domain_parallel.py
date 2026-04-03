@@ -590,16 +590,23 @@ class DomainParallel(BaseDynamics):
         skin = self._config.skin
         decomposed = self._decomposed_dims_mask(positions.device)
 
+        # Minimum AABB padding: must be large enough that no atom sits at
+        # the very edge of the cell, which would cause the cell-list builder
+        # to wrap it into cell 0 even with pbc=False (producing spurious
+        # shift vectors).  1 Å is safe for typical lattice spacings.
+        _MIN_PADDING = 1.0
+        padding = max(skin, _MIN_PADDING)
+
         if self._cached_pos_min is not None and not force_recompute:
             pos_min = self._cached_pos_min
         else:
-            pos_min = positions.min(dim=0).values - skin - 0.01
+            pos_min = positions.min(dim=0).values - padding
             # Only shift in decomposed dims; non-decomposed keep pos_min=0.
             pos_min = torch.where(decomposed, pos_min, torch.zeros_like(pos_min))
             self._cached_pos_min = pos_min
 
         pos_max = positions.max(dim=0).values
-        aabb_lengths = (pos_max - pos_min + skin + 0.01).clamp(min=1e-6)
+        aabb_lengths = (pos_max - pos_min + padding).clamp(min=1e-6)
 
         # Build cell: AABB for decomposed dims, original cell for periodic dims.
         original_cell = (
