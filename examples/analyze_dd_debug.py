@@ -93,6 +93,7 @@ def print_padded_table(padded_steps: list[dict], rank: int) -> None:
         pos = snap["positions"]
         forces = snap["forces"]
         energies = snap["energies"]
+        # nm = snap.get("neighbor_matrix")
         nn = snap.get("num_neighbors")
 
         pe = energies.sum().item() if energies is not None else 0
@@ -243,6 +244,45 @@ def print_padded_details(padded_steps: list[dict], rank: int) -> None:
                 f"    Closest pair (owned): atoms ({min_pair[0]}, {min_pair[1]}{ghost_tag}) "
                 f"dist={min_dist:.4f} A"
             )
+
+        # Print NL entries for the atoms highlighted above (top-force + bottom-nn)
+        if nm is not None and nn is not None:
+            # Collect the atom indices we already highlighted
+            show_atoms = set()
+            if n_owned > 0:
+                own_fmag = fmag[:n_owned]
+                for ai in own_fmag.topk(min(3, own_fmag.shape[0])).indices:
+                    show_atoms.add(ai.item())
+                own_nn = nn[:n_owned]
+                for ai in own_nn.topk(min(3, own_nn.shape[0]), largest=False).indices:
+                    show_atoms.add(ai.item())
+
+            if show_atoms:
+                print(
+                    f"    Neighbor lists for highlighted atoms (fill_value={n_total}):"
+                )
+                for ai in sorted(show_atoms):
+                    n_nbr = nn[ai].item()
+                    p = pos[ai]
+                    nbrs = nm[ai, :n_nbr].tolist() if n_nbr > 0 else []
+                    # Compute distances to each neighbor
+                    nbr_info = []
+                    for j in nbrs:
+                        if j < n_total:
+                            d = (pos[j] - pos[ai]).norm().item()
+                            tag = "g" if j >= n_owned else "o"
+                            nbr_info.append(f"{j}({tag},{d:.2f})")
+                        else:
+                            nbr_info.append(f"{j}(INVALID)")
+                    nbrs_str = " ".join(nbr_info[:12])
+                    if len(nbr_info) > 12:
+                        nbrs_str += f" ... +{len(nbr_info) - 12} more"
+                    own_tag = "owned" if ai < n_owned else "ghost"
+                    print(
+                        f"      atom {ai:4d} ({own_tag}): nn={n_nbr:3d} "
+                        f"pos=[{p[0]:.2f},{p[1]:.2f},{p[2]:.2f}] "
+                        f"nbrs=[{nbrs_str}]"
+                    )
 
 
 def analyze(paths: list[str]) -> None:
