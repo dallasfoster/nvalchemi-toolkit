@@ -86,6 +86,11 @@ class DomainParallel(BaseDynamics):
         self._cached_pos_min: torch.Tensor | None = None
         self._prev_n_padded: int = 0
 
+        # Optional debug callback: called with (padded_batch, n_owned, step)
+        # after compute but before restore_geometry/strip.  Set from outside
+        # to capture padded-batch state including ghost atoms and NL.
+        self._debug_post_compute_fn: Any = None
+
         # Determine rank from mesh, or fall back to dist / 0.
         if config.mesh is not None:
             try:
@@ -388,6 +393,12 @@ class DomainParallel(BaseDynamics):
         snapshot = self._save_geometry(padded_batch)
         self._ensure_output_tensors(padded_batch)
         padded_batch, converged = self._run_inner_step(padded_batch)
+
+        # Debug hook: capture padded batch state (with NL, in AABB frame)
+        # before geometry is restored and ghosts are stripped.
+        if self._debug_post_compute_fn is not None:
+            self._debug_post_compute_fn(padded_batch, n_owned, self.step_count)
+
         self._restore_geometry(padded_batch, snapshot)
 
         # 6. Strip ghost atoms

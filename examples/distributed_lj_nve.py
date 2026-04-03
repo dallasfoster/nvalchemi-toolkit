@@ -19,12 +19,19 @@ Launch with::
 
     torchrun --nproc_per_node=2 examples/distributed_lj_nve.py
 
-Saves per-step snapshots (positions, forces, velocities, neighbor matrices)
-to ``dd_debug_rank{rank}.pt`` for post-hoc analysis. Load with::
+Saves two kinds of per-step snapshots to ``dd_debug_rank{rank}.pt``:
 
-    data = torch.load("dd_debug_rank0.pt")
-    # data["steps"] is a list of dicts, one per step
-    # data["steps"][i]["positions"], ["forces"], ["velocities"], etc.
+- **owned snapshots**: positions/forces/velocities after strip (owned atoms only)
+- **padded snapshots**: full padded batch (owned + ghosts) in AABB frame,
+  including neighbor_matrix and num_neighbors — captured via a debug callback
+  inside DomainParallel, right after compute and before strip.
+
+Analyze with::
+
+    python examples/analyze_dd_debug.py dd_debug_rank0.pt dd_debug_rank1.pt
+
+The neighbor_matrix fill value is ``num_atoms`` (not -1), so invalid neighbor
+entries equal the total atom count of the padded batch.
 """
 
 from __future__ import annotations
@@ -40,6 +47,10 @@ from nvalchemi.distributed.domain_parallel import DomainParallel
 from nvalchemi.dynamics.hooks.neighbor_list import NeighborListHook
 from nvalchemi.dynamics.integrators.nve import NVE
 from nvalchemi.models.lj import LennardJonesModelWrapper
+
+N_SIDE = 8  # 512 atoms — large enough to show instabilities
+N_STEPS = 80
+
 
 # ──────────────────────────────────────────────────────────────
 # Helpers
@@ -62,40 +73,54 @@ def compute_ke(batch: Batch) -> float:
     return (0.5 * m.unsqueeze(-1) * v**2).sum().item()
 
 
-def snapshot(batch: Batch, step: int, extra: dict | None = None) -> dict:
-    """Capture a CPU copy of the batch state for debugging.  Returns a dict."""
+def _cpu(t):
+    """Detach, move to CPU, clone — or None."""
+    if t is None:
+        return None
+    return t.detach().cpu().clone()
+
+
+def snapshot_owned(batch: Batch, step: int, extra: dict | None = None) -> dict:
+    """Capture the owned-atom batch state (after strip)."""
     d = {
         "step": step,
+        "kind": "owned",
         "n_atoms": batch.num_nodes,
-        "positions": batch.positions.detach().cpu().clone(),
-        "forces": batch.forces.detach().cpu().clone()
-        if hasattr(batch, "forces") and batch.forces is not None
-        else None,
-        "velocities": batch.velocities.detach().cpu().clone()
-        if hasattr(batch, "velocities") and batch.velocities is not None
-        else None,
-        "energies": batch.energies.detach().cpu().clone()
-        if hasattr(batch, "energies") and batch.energies is not None
-        else None,
-        "cell": batch.cell.detach().cpu().clone()
-        if hasattr(batch, "cell") and batch.cell is not None
-        else None,
-        "pbc": batch.pbc.detach().cpu().clone()
-        if hasattr(batch, "pbc") and batch.pbc is not None
-        else None,
-        "neighbor_matrix": batch.neighbor_matrix.detach().cpu().clone()
-        if hasattr(batch, "neighbor_matrix") and batch.neighbor_matrix is not None
-        else None,
-        "num_neighbors": batch.num_neighbors.detach().cpu().clone()
-        if hasattr(batch, "num_neighbors") and batch.num_neighbors is not None
-        else None,
+        "positions": _cpu(batch.positions),
+        "forces": _cpu(getattr(batch, "forces", None)),
+        "velocities": _cpu(getattr(batch, "velocities", None)),
+        "energies": _cpu(getattr(batch, "energies", None)),
+        "cell": _cpu(getattr(batch, "cell", None)),
+        "pbc": _cpu(getattr(batch, "pbc", None)),
     }
     if extra:
         d.update(extra)
     return d
 
 
-def create_argon_system(n_atoms_per_side: int = 5, lattice_constant: float = 3.82):
+def snapshot_padded(batch: Batch, n_owned: int, step: int) -> dict:
+    """Capture the padded batch state (owned + ghosts, in AABB frame, with NL).
+
+    The neighbor_matrix fill value is ``batch.num_nodes`` (= total padded count).
+    Valid neighbor entries are in ``[0, num_atoms)``.
+    """
+    return {
+        "step": step,
+        "kind": "padded",
+        "n_atoms": batch.num_nodes,
+        "n_owned": n_owned,
+        "n_ghosts": batch.num_nodes - n_owned,
+        "positions": _cpu(batch.positions),
+        "forces": _cpu(getattr(batch, "forces", None)),
+        "energies": _cpu(getattr(batch, "energies", None)),
+        "cell": _cpu(getattr(batch, "cell", None)),
+        "pbc": _cpu(getattr(batch, "pbc", None)),
+        "neighbor_matrix": _cpu(getattr(batch, "neighbor_matrix", None)),
+        "num_neighbors": _cpu(getattr(batch, "num_neighbors", None)),
+    }
+
+
+def create_argon_system(n_atoms_per_side: int = 8, lattice_constant: float = 3.82):
     """Create a simple-cubic Argon system with Maxwell-Boltzmann velocities at 50 K."""
     coords = torch.arange(n_atoms_per_side, dtype=torch.float32) * lattice_constant
     gx, gy, gz = torch.meshgrid(coords, coords, coords, indexing="ij")
@@ -178,7 +203,6 @@ def main() -> None:
     dd = DomainParallel(nve, config=config)
 
     # ── 6. Create system on rank 0 ──
-    N_SIDE = 5  # 125 atoms — small for debugging
     if rank == 0:
         data = create_argon_system(n_atoms_per_side=N_SIDE)
         batch = Batch.from_data_list([data], device=device)
@@ -192,12 +216,19 @@ def main() -> None:
     local_batch = dd.partition(batch)
     log(rank, "Partition: {} owned atoms", local_batch.num_nodes)
 
-    # ── 8. Run with per-step snapshots ──
-    N_STEPS = 80
-    debug_log: list[dict] = []
+    # ── 8. Wire up debug callback to capture padded batch snapshots ──
+    debug_owned: list[dict] = []
+    debug_padded: list[dict] = []
+
+    def _on_post_compute(padded_batch, n_owned, step):
+        debug_padded.append(snapshot_padded(padded_batch, n_owned, step))
+
+    dd._debug_post_compute_fn = _on_post_compute
 
     # Snapshot after partition (before any steps)
-    debug_log.append(snapshot(local_batch, step=-1, extra={"label": "after_partition"}))
+    debug_owned.append(
+        snapshot_owned(local_batch, step=-1, extra={"label": "after_partition"})
+    )
 
     # Prime forces
     local_batch = dd._prime_forces(local_batch)
@@ -216,7 +247,9 @@ def main() -> None:
         else 0,
         local_batch.num_nodes,
     )
-    debug_log.append(snapshot(local_batch, step=0, extra={"label": "after_prime"}))
+    debug_owned.append(
+        snapshot_owned(local_batch, step=0, extra={"label": "after_prime"})
+    )
 
     for step in range(1, N_STEPS + 1):
         try:
@@ -226,14 +259,11 @@ def main() -> None:
             import traceback
 
             traceback.print_exc()
-            debug_log.append(
-                snapshot(
+            debug_owned.append(
+                snapshot_owned(
                     local_batch,
                     step=step,
-                    extra={
-                        "label": "exception",
-                        "error": str(e),
-                    },
+                    extra={"label": "exception", "error": str(e)},
                 )
             )
             break
@@ -264,16 +294,9 @@ def main() -> None:
             pos_max[2],
         )
 
-        # Save snapshot every step (small system, affordable)
-        debug_log.append(
-            snapshot(
-                local_batch,
-                step=step,
-                extra={
-                    "pe": pe,
-                    "ke": ke,
-                    "fmax": fmax,
-                },
+        debug_owned.append(
+            snapshot_owned(
+                local_batch, step=step, extra={"pe": pe, "ke": ke, "fmax": fmax}
             )
         )
 
@@ -284,8 +307,23 @@ def main() -> None:
 
     # ── 9. Save debug data ──
     out_path = f"dd_debug_rank{rank}.pt"
-    torch.save({"rank": rank, "world_size": world_size, "steps": debug_log}, out_path)
-    log(rank, "Saved {} snapshots to {}", len(debug_log), out_path)
+    torch.save(
+        {
+            "rank": rank,
+            "world_size": world_size,
+            "n_side": N_SIDE,
+            "owned": debug_owned,
+            "padded": debug_padded,
+        },
+        out_path,
+    )
+    log(
+        rank,
+        "Saved {} owned + {} padded snapshots to {}",
+        len(debug_owned),
+        len(debug_padded),
+        out_path,
+    )
 
     dist.barrier()
     DistributedManager.cleanup()
