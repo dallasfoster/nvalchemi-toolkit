@@ -575,43 +575,58 @@ class DomainParallel(BaseDynamics):
         return padded_batch, converged
 
     def _apply_aabb(self, batch: Batch, force_recompute: bool = False) -> None:
-        """Compute the AABB cell from current positions and shift to origin.
+        """Set the cell for the padded batch and shift positions to local origin.
 
-        Called between ``pre_update`` and ``compute`` so the cell-list
-        neighbor builder always sees positions within ``[0, box_length)``.
+        For **decomposed** dimensions (where the rank grid has > 1 rank),
+        the cell diagonal is computed from the AABB of current positions
+        plus skin padding.  For **non-decomposed** (periodic) dimensions,
+        the original global cell diagonal is preserved so the NL builder
+        can apply minimum-image convention.
 
-        When ``force_recompute`` is False and a cached ``pos_min`` exists,
-        the cached origin is reused to keep the local coordinate frame
-        stable across steps.  This allows the NeighborListHook's skin
-        check to compute correct displacements, avoiding forced rebuilds.
-        The AABB cell is padded by ``skin`` to accommodate atom movement
-        between rebuilds.
+        Position shifting (``positions -= pos_min``) is applied only in
+        the decomposed dimensions.  Periodic dimensions keep their
+        original coordinates so the NL builder wraps them correctly.
         """
         positions = batch.positions
         skin = self._config.skin
+        decomposed = self._decomposed_dims_mask(positions.device)
 
         if self._cached_pos_min is not None and not force_recompute:
-            # Reuse cached origin — keeps the coordinate frame stable
-            # so the NL skin check works correctly.
             pos_min = self._cached_pos_min
         else:
-            # Fresh AABB computation: pad by skin so atoms can move
-            # within the cell between NL rebuilds.
             pos_min = positions.min(dim=0).values - skin - 0.01
+            # Only cache and shift in decomposed dims.
+            # Non-decomposed dims keep pos_min=0 (no shift).
+            pos_min = torch.where(decomposed, pos_min, torch.zeros_like(pos_min))
             self._cached_pos_min = pos_min
 
         pos_max = positions.max(dim=0).values
         box_lengths = (pos_max - pos_min + skin + 0.01).clamp(min=1e-6)
 
-        local_cell = torch.diag(box_lengths).unsqueeze(0)
+        # Build the cell: AABB for decomposed dims, original cell for periodic dims.
+        original_cell = (
+            self._geometry_snapshot.original_cell
+            if self._geometry_snapshot is not None
+            else batch.cell.clone()
+        )
+        # Start from AABB diagonal.
+        local_cell = (
+            torch.diag(box_lengths)
+            .unsqueeze(0)
+            .to(dtype=batch.cell.dtype, device=batch.cell.device)
+        )
+        # For periodic (non-decomposed) dims, use the original cell diagonal.
+        for d in range(3):
+            if not decomposed[d]:
+                local_cell[0, d, d] = original_cell[0, d, d]
+
         if batch.cell.shape[0] > 1:
             local_cell = local_cell.expand(batch.cell.shape[0], -1, -1)
-        batch.cell = local_cell.to(dtype=batch.cell.dtype, device=batch.cell.device)
+        batch.cell = local_cell
 
-        # Shift positions to local origin.
+        # Shift positions only in decomposed dims.
         batch.positions = positions - pos_min
 
-        # Update snapshot so _restore_geometry can undo the shift.
         if self._geometry_snapshot is not None:
             self._geometry_snapshot.pos_min = pos_min
 
@@ -658,8 +673,30 @@ class DomainParallel(BaseDynamics):
         frac[:, pbc_mask] = frac[:, pbc_mask] % 1.0
         batch.positions = frac @ cell_3x3
 
+    def _decomposed_dims_mask(self, device: torch.device) -> torch.Tensor:
+        """Return a ``(3,)`` bool mask: True for dimensions that are decomposed.
+
+        A dimension is decomposed when the rank grid has > 1 rank along it.
+        Decomposed dims use open boundaries (ghost atoms handle neighbors);
+        non-decomposed dims keep PBC so the NL builder wraps correctly.
+        """
+        if self._partitioner is None:
+            return torch.ones(3, dtype=torch.bool, device=device)
+        grid = self._partitioner.rank_grid  # (Px, Py, Pz)
+        return torch.tensor(
+            [grid[0] > 1, grid[1] > 1, grid[2] > 1],
+            dtype=torch.bool,
+            device=device,
+        )
+
     def _save_geometry(self, padded_batch: Batch) -> _GeometrySnapshot:
-        """Save original cell and PBC, then set ``pbc=False``."""
+        """Save original cell and PBC, then disable PBC for decomposed dims only.
+
+        Non-decomposed dimensions keep ``pbc=True`` so the NL builder
+        applies minimum-image convention for periodic neighbors in those
+        directions.  Without this, atoms near the X/Y cell edges lose
+        half their neighbors, causing systematic force errors.
+        """
         positions = padded_batch.positions
         original_cell = padded_batch.cell.clone()
         original_pbc = (
@@ -668,11 +705,12 @@ class DomainParallel(BaseDynamics):
             else torch.ones(1, 3, dtype=torch.bool, device=positions.device)
         )
 
-        # Set pbc=False for open boundaries within the subdomain.
+        # Only disable PBC for decomposed dimensions.
+        decomposed = self._decomposed_dims_mask(positions.device)
         n_graphs = max(1, padded_batch.cell.shape[0])
-        padded_batch.pbc = torch.zeros(
-            n_graphs, 3, dtype=torch.bool, device=positions.device
-        )
+        new_pbc = original_pbc.clone().expand(n_graphs, -1).clone()
+        new_pbc[:, decomposed] = False
+        padded_batch.pbc = new_pbc
 
         snapshot = _GeometrySnapshot(
             original_cell=original_cell,
