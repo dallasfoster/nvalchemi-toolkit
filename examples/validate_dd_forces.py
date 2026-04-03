@@ -136,9 +136,32 @@ def main() -> None:
     local_batch = dd.partition(batch)
     log(rank, "Partition: {} owned atoms", local_batch.num_nodes)
 
-    # ── Prime forces (ghost exchange + compute) ──
+    # ── Wire debug callback to capture padded NL info ──
+    def _capture_padded_nl(padded_batch, n_owned, step):
+        dd._last_padded_nn = (
+            padded_batch.num_neighbors.detach().cpu().clone()
+            if hasattr(padded_batch, "num_neighbors")
+            and padded_batch.num_neighbors is not None
+            else None
+        )
+        dd._last_padded_ns = (
+            padded_batch.neighbor_shifts.detach().cpu().clone()
+            if hasattr(padded_batch, "neighbor_shifts")
+            and padded_batch.neighbor_shifts is not None
+            else None
+        )
+        dd._last_padded_n_owned = n_owned
+
+    dd._debug_post_compute_fn = _capture_padded_nl
+    dd._last_padded_nn = None
+    dd._last_padded_ns = None
+    dd._last_padded_n_owned = 0
+
+    # ── Prime forces (ghost exchange + compute) + one DD step ──
     local_batch = dd._prime_forces(local_batch)
     dd._forces_primed = True
+    # Run one step so the debug callback fires inside step() → _run_inner_step.
+    local_batch, _ = dd.step(local_batch)
     log(
         rank,
         "Forces primed: fmax={:.6f} fmean={:.6f}",
@@ -231,7 +254,42 @@ def main() -> None:
                 p[2].item(),
             )
 
-        # ── Neighbor count comparison ──
+        # ── Check DD NL properties (from the last padded batch) ──
+        # We need the padded batch NL, not the gathered batch NL.
+        # Capture it via the debug callback.
+        log(rank, "")
+        log(rank, "  --- DD Padded Batch NL Check (from debug callback) ---")
+        if hasattr(dd, "_last_padded_nn") and dd._last_padded_nn is not None:
+            pad_nn = dd._last_padded_nn
+            pad_ns = dd._last_padded_ns
+            pad_n_owned = dd._last_padded_n_owned
+            log(
+                rank,
+                "  DD padded NL: n_total={} n_owned={} avg_nn={:.1f} min_nn_own={}",
+                pad_nn.shape[0],
+                pad_n_owned,
+                pad_nn.float().mean().item(),
+                pad_nn[:pad_n_owned].min().item() if pad_n_owned > 0 else -1,
+            )
+            # Check if any shifts are nonzero
+            if pad_ns is not None:
+                nonzero_shifts = (pad_ns != 0).any(dim=-1).sum().item()
+                log(
+                    rank,
+                    "  DD padded NL: nonzero shift entries={} (of {} total)",
+                    nonzero_shifts,
+                    pad_nn.sum().item(),
+                )
+                # Check per-dimension
+                for d, name in enumerate(["X", "Y", "Z"]):
+                    nz = (pad_ns[:, :, d] != 0).sum().item()
+                    log(rank, "    {}-shifts nonzero: {}", name, nz)
+            else:
+                log(rank, "  DD padded NL: neighbor_shifts is None!")
+        else:
+            log(rank, "  (No padded NL captured — debug callback not wired)")
+
+        # ── Ref NL neighbor count ──
         ref_nn = ref_batch.num_neighbors
         log(rank, "")
         log(
