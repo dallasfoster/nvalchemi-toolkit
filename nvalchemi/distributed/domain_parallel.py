@@ -86,6 +86,9 @@ class DomainParallel(BaseDynamics):
         self._cached_pos_min: torch.Tensor | None = None
         self._prev_n_padded: int = 0
 
+        # Number of periodic image atoms added by _add_periodic_images.
+        self._n_periodic_images: int = 0
+
         # Optional debug callback: called with (padded_batch, n_owned, step)
         # after compute but before restore_geometry/strip.  Set from outside
         # to capture padded-batch state including ghost atoms and NL.
@@ -389,7 +392,15 @@ class DomainParallel(BaseDynamics):
             self._domain_rank,
             self.step_count,
         )
-        # 4-5. AABB + compute + post_update on padded batch
+        # 4. Add periodic images for non-decomposed PBC dims (X/Y).
+        #    The nvalchemiops NL builder doesn't support mixed PBC, so we
+        #    explicitly add copies of atoms near the X/Y cell edges.
+        n_before_images = padded_batch.num_nodes
+        padded_batch = self._add_periodic_images(padded_batch)
+        n_after_images = padded_batch.num_nodes
+        self._n_periodic_images = n_after_images - n_before_images
+
+        # 5. AABB + compute + post_update on padded batch
         snapshot = self._save_geometry(padded_batch)
         self._ensure_output_tensors(padded_batch)
         padded_batch, converged = self._run_inner_step(padded_batch)
@@ -401,7 +412,13 @@ class DomainParallel(BaseDynamics):
 
         self._restore_geometry(padded_batch, snapshot)
 
-        # 6. Strip ghost atoms
+        # 6a. Strip periodic images (added in step 4).
+        #     They were appended after the owned+ghost atoms, so we just
+        #     truncate the padded batch back to its pre-image size.
+        if self._n_periodic_images > 0:
+            padded_batch = self._strip_periodic_images(padded_batch, n_before_images)
+
+        # 6b. Strip ghost atoms
         if self._ghost_exchanger is not None:
             batch = self._ghost_exchanger.strip(padded_batch, n_owned)
         else:
@@ -575,60 +592,172 @@ class DomainParallel(BaseDynamics):
         return padded_batch, converged
 
     def _apply_aabb(self, batch: Batch, force_recompute: bool = False) -> None:
-        """Set the cell for the padded batch and shift positions to local origin.
+        """Compute the AABB cell from current positions and shift to origin.
 
-        For **decomposed** dimensions (where the rank grid has > 1 rank),
-        the cell diagonal is computed from the AABB of current positions
-        plus skin padding.  For **non-decomposed** (periodic) dimensions,
-        the original global cell diagonal is preserved so the NL builder
-        can apply minimum-image convention.
+        Called between ``pre_update`` and ``compute`` so the cell-list
+        neighbor builder always sees positions within ``[0, box_length)``.
 
-        Position shifting (``positions -= pos_min``) is applied only in
-        the decomposed dimensions.  Periodic dimensions keep their
-        original coordinates so the NL builder wraps them correctly.
+        When ``force_recompute`` is False and a cached ``pos_min`` exists,
+        the cached origin is reused to keep the local coordinate frame
+        stable across steps.  This allows the NeighborListHook's skin
+        check to compute correct displacements, avoiding forced rebuilds.
+        The AABB cell is padded by ``skin`` to accommodate atom movement
+        between rebuilds.
         """
         positions = batch.positions
         skin = self._config.skin
-        decomposed = self._decomposed_dims_mask(positions.device)
 
         if self._cached_pos_min is not None and not force_recompute:
             pos_min = self._cached_pos_min
         else:
             pos_min = positions.min(dim=0).values - skin - 0.01
-            # Only cache and shift in decomposed dims.
-            # Non-decomposed dims keep pos_min=0 (no shift).
-            pos_min = torch.where(decomposed, pos_min, torch.zeros_like(pos_min))
             self._cached_pos_min = pos_min
 
         pos_max = positions.max(dim=0).values
         box_lengths = (pos_max - pos_min + skin + 0.01).clamp(min=1e-6)
 
-        # Build the cell: AABB for decomposed dims, original cell for periodic dims.
+        local_cell = torch.diag(box_lengths).unsqueeze(0)
+        if batch.cell.shape[0] > 1:
+            local_cell = local_cell.expand(batch.cell.shape[0], -1, -1)
+        batch.cell = local_cell.to(dtype=batch.cell.dtype, device=batch.cell.device)
+
+        # Shift positions to local origin.
+        batch.positions = positions - pos_min
+
+        # Update snapshot so _restore_geometry can undo the shift.
+        if self._geometry_snapshot is not None:
+            self._geometry_snapshot.pos_min = pos_min
+
+    def _add_periodic_images(self, batch: Batch) -> Batch:
+        """Add copies of atoms near cell edges for non-decomposed periodic dims.
+
+        The nvalchemiops NL builder does not correctly handle mixed PBC
+        (e.g. ``[True, True, False]``).  Instead, we run with
+        ``pbc=False`` everywhere and explicitly add periodic image copies
+        of atoms within ``cutoff + skin`` of each periodic cell face.
+
+        Images are appended AFTER all owned + ghost atoms.  The returned
+        batch has more atoms; call :meth:`_strip_periodic_images` after
+        force computation to remove them.
+
+        Only non-decomposed periodic dimensions get images (decomposed
+        dims are handled by ghost exchange).
+        """
+        original_pbc = (
+            self._geometry_snapshot.original_pbc
+            if self._geometry_snapshot is not None
+            else getattr(batch, "pbc", None)
+        )
+        if original_pbc is None or not original_pbc.any():
+            return batch
+
         original_cell = (
             self._geometry_snapshot.original_cell
             if self._geometry_snapshot is not None
-            else batch.cell.clone()
+            else batch.cell
         )
-        # Start from AABB diagonal.
-        local_cell = (
-            torch.diag(box_lengths)
-            .unsqueeze(0)
-            .to(dtype=batch.cell.dtype, device=batch.cell.device)
-        )
-        # For periodic (non-decomposed) dims, use the original cell diagonal.
+        decomposed = self._decomposed_dims_mask(batch.positions.device)
+        pbc_flags = original_pbc.squeeze(0)  # (3,) bool
+        box_diag = torch.diag(original_cell.squeeze(0))  # (3,)
+
+        ghost_width = self._config.cutoff + self._config.skin
+        positions = batch.positions  # global coords (before AABB shift)
+
+        image_parts: list[torch.Tensor] = []
+
         for d in range(3):
-            if not decomposed[d]:
-                local_cell[0, d, d] = original_cell[0, d, d]
+            # Only add images for periodic, NON-decomposed dimensions.
+            if not pbc_flags[d] or decomposed[d]:
+                continue
+            L = box_diag[d].item()
+            pos_d = positions[:, d]
 
-        if batch.cell.shape[0] > 1:
-            local_cell = local_cell.expand(batch.cell.shape[0], -1, -1)
-        batch.cell = local_cell
+            # Atoms near the LOW face: pos_d < ghost_width → copy at pos_d + L
+            lo_mask = pos_d < ghost_width
+            if lo_mask.any():
+                shifted = positions[lo_mask].clone()
+                shifted[:, d] += L
+                image_parts.append(shifted)
 
-        # Shift positions only in decomposed dims.
-        batch.positions = positions - pos_min
+            # Atoms near the HIGH face: pos_d > L - ghost_width → copy at pos_d - L
+            hi_mask = pos_d > (L - ghost_width)
+            if hi_mask.any():
+                shifted = positions[hi_mask].clone()
+                shifted[:, d] -= L
+                image_parts.append(shifted)
 
-        if self._geometry_snapshot is not None:
-            self._geometry_snapshot.pos_min = pos_min
+        if not image_parts:
+            return batch
+
+        all_images = torch.cat(image_parts, dim=0)
+        n_images = all_images.shape[0]
+        device = batch.positions.device
+        dtype = batch.positions.dtype
+
+        # Extend per-atom tensors: positions, atomic_numbers, atomic_masses.
+        # Image atoms get zero velocities and zero forces (they exist only
+        # for the NL — their forces are discarded after strip).
+        batch.positions = torch.cat([batch.positions, all_images], dim=0)
+
+        batch.atomic_numbers = torch.cat(
+            [batch.atomic_numbers, batch.atomic_numbers[:1].expand(n_images).clone()],
+            dim=0,
+        )
+        if hasattr(batch, "atomic_masses") and batch.atomic_masses is not None:
+            batch.atomic_masses = torch.cat(
+                [batch.atomic_masses, batch.atomic_masses[:1].expand(n_images).clone()],
+                dim=0,
+            )
+        if hasattr(batch, "velocities") and batch.velocities is not None:
+            batch.velocities = torch.cat(
+                [
+                    batch.velocities,
+                    torch.zeros(n_images, 3, dtype=dtype, device=device),
+                ],
+                dim=0,
+            )
+        if hasattr(batch, "forces") and batch.forces is not None:
+            batch.forces = torch.cat(
+                [batch.forces, torch.zeros(n_images, 3, dtype=dtype, device=device)],
+                dim=0,
+            )
+
+        # Update batch metadata for the new atom count.
+        # We directly extend the single-graph batch_idx (all zeros).
+        batch.batch = torch.zeros(
+            batch.positions.shape[0], dtype=torch.long, device=device
+        )
+
+        return batch
+
+    @staticmethod
+    def _strip_periodic_images(batch: Batch, n_real: int) -> Batch:
+        """Remove periodic image atoms appended by :meth:`_add_periodic_images`.
+
+        Truncates per-atom tensors back to the first *n_real* atoms.
+        Forces on image atoms are discarded (they were only needed to
+        provide correct NL neighbors for the real atoms).
+        """
+        if batch.num_nodes <= n_real:
+            return batch
+
+        batch.positions = batch.positions[:n_real]
+        batch.atomic_numbers = batch.atomic_numbers[:n_real]
+        if hasattr(batch, "atomic_masses") and batch.atomic_masses is not None:
+            batch.atomic_masses = batch.atomic_masses[:n_real]
+        if hasattr(batch, "velocities") and batch.velocities is not None:
+            batch.velocities = batch.velocities[:n_real]
+        if hasattr(batch, "forces") and batch.forces is not None:
+            batch.forces = batch.forces[:n_real]
+        if hasattr(batch, "energies") and batch.energies is not None:
+            # Energies are per-system (not per-atom), keep as-is.
+            pass
+
+        batch.batch = torch.zeros(
+            n_real, dtype=torch.long, device=batch.positions.device
+        )
+
+        return batch
 
     def _invalidate_nl_ref(self) -> None:
         """Reset the NeighborListHook's reference positions.
@@ -690,13 +819,7 @@ class DomainParallel(BaseDynamics):
         )
 
     def _save_geometry(self, padded_batch: Batch) -> _GeometrySnapshot:
-        """Save original cell and PBC, then disable PBC for decomposed dims only.
-
-        Non-decomposed dimensions keep ``pbc=True`` so the NL builder
-        applies minimum-image convention for periodic neighbors in those
-        directions.  Without this, atoms near the X/Y cell edges lose
-        half their neighbors, causing systematic force errors.
-        """
+        """Save original cell and PBC, then set ``pbc=False``."""
         positions = padded_batch.positions
         original_cell = padded_batch.cell.clone()
         original_pbc = (
@@ -705,12 +828,13 @@ class DomainParallel(BaseDynamics):
             else torch.ones(1, 3, dtype=torch.bool, device=positions.device)
         )
 
-        # Only disable PBC for decomposed dimensions.
-        decomposed = self._decomposed_dims_mask(positions.device)
+        # Set pbc=False — all periodic boundaries are handled explicitly:
+        # decomposed dims via ghost atoms from neighbor ranks, non-decomposed
+        # dims via periodic image copies from _add_periodic_images().
         n_graphs = max(1, padded_batch.cell.shape[0])
-        new_pbc = original_pbc.clone().expand(n_graphs, -1).clone()
-        new_pbc[:, decomposed] = False
-        padded_batch.pbc = new_pbc
+        padded_batch.pbc = torch.zeros(
+            n_graphs, 3, dtype=torch.bool, device=positions.device
+        )
 
         snapshot = _GeometrySnapshot(
             original_cell=original_cell,
@@ -1000,6 +1124,10 @@ class DomainParallel(BaseDynamics):
             n_owned = batch.positions.shape[0]
         self._n_owned = n_owned
 
+        # Add periodic images for non-decomposed PBC dims.
+        n_before_images = padded_batch.num_nodes
+        padded_batch = self._add_periodic_images(padded_batch)
+
         snapshot = self._save_geometry(padded_batch)
         self._ensure_output_tensors(padded_batch)
 
@@ -1017,7 +1145,9 @@ class DomainParallel(BaseDynamics):
 
         self._restore_geometry(padded_batch, snapshot)
 
-        # Strip ghosts — forces on owned atoms are what we keep
+        # Strip periodic images, then strip ghosts.
+        if padded_batch.num_nodes > n_before_images:
+            padded_batch = self._strip_periodic_images(padded_batch, n_before_images)
         if self._ghost_exchanger is not None:
             batch = self._ghost_exchanger.strip(padded_batch, n_owned)
         else:
