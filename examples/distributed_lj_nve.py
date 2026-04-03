@@ -190,13 +190,17 @@ def main() -> None:
     neighbor_config = model.model_card.neighbor_config
 
     # ── 4. Dynamics ──
-    nl_hook = NeighborListHook(config=neighbor_config, skin=4.25)
+    # skin=0 forces NL rebuild every step. Required because the LJ Warp
+    # kernel computes forces for ALL NL pairs (does not apply its own
+    # cutoff), so extra skin-region pairs create asymmetric forces at
+    # the domain boundary.
+    nl_hook = NeighborListHook(config=neighbor_config, skin=0.0)
     nve = NVE(model=model, dt=1.0, hooks=[nl_hook])
 
     # ── 5. Domain config ──
     config = DomainConfig(
         cutoff=neighbor_config.cutoff,
-        skin=4.25,
+        skin=0.0,
         mesh=mesh,
         mesh_dim="domain",
     )

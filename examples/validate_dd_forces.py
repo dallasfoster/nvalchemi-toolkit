@@ -99,10 +99,10 @@ def main() -> None:
     model = LennardJonesModelWrapper(epsilon=0.0104, sigma=3.40, cutoff=8.5).to(device)
     neighbor_config = model.model_card.neighbor_config
 
-    nl_hook = NeighborListHook(config=neighbor_config, skin=4.25)
+    nl_hook = NeighborListHook(config=neighbor_config, skin=0.0)
     nve = NVE(model=model, dt=1.0, hooks=[nl_hook])
     config = DomainConfig(
-        cutoff=neighbor_config.cutoff, skin=4.25, mesh=mesh, mesh_dim="domain"
+        cutoff=neighbor_config.cutoff, skin=0.0, mesh=mesh, mesh_dim="domain"
     )
     dd = DomainParallel(nve, config=config)
 
