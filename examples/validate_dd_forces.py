@@ -113,6 +113,9 @@ def main() -> None:
         from nvalchemi.dynamics.hooks import WrapPeriodicHook
 
         data = create_argon_system(n_side=8)
+        n = data.positions.shape[0]
+        data.add_node_property("forces", torch.zeros(n, 3))
+        data.energies = torch.zeros(1, 1)
         batch = Batch.from_data_list([data], device=device)
 
         ref_nve = NVE_ref(model=model, dt=1.0, n_steps=10)
