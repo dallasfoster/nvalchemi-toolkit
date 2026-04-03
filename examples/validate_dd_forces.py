@@ -106,11 +106,26 @@ def main() -> None:
     )
     dd = DomainParallel(nve, config=config)
 
-    # ── Create + partition ──
+    # ── Create system and run a few single-GPU steps to perturb positions ──
+    # (A perfect lattice has F=0 everywhere, making force comparison useless.)
     if rank == 0:
+        from nvalchemi.dynamics import NVE as NVE_ref
+        from nvalchemi.dynamics.hooks import WrapPeriodicHook
+
         data = create_argon_system(n_side=8)
         batch = Batch.from_data_list([data], device=device)
-        log(rank, "Created {} atoms", batch.num_nodes)
+
+        ref_nve = NVE_ref(model=model, dt=1.0, n_steps=10)
+        ref_nve.register_hook(NeighborListHook(config=neighbor_config, skin=0.5))
+        ref_nve.register_hook(WrapPeriodicHook())
+        batch = ref_nve.run(batch)
+
+        log(
+            rank,
+            "Created {} atoms, ran 10 single-GPU NVE steps to perturb. fmax={:.6f}",
+            batch.num_nodes,
+            batch.forces.norm(dim=-1).max().item(),
+        )
     else:
         batch = None
 
