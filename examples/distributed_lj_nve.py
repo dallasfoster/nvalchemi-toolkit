@@ -300,9 +300,14 @@ def main() -> None:
             )
         )
 
-        # Bail out early if energy is clearly exploding
-        if abs(pe) > 1e4:
-            log(rank, "Energy exploded (PE={:.1f}), stopping.", pe)
+        # Synchronized bail-out: all ranks must agree to stop, otherwise
+        # the next dd.step() will hang on a collective.
+        should_stop = torch.tensor(
+            [1 if abs(pe) > 1e4 else 0], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(should_stop, op=dist.ReduceOp.MAX)
+        if should_stop.item() > 0:
+            log(rank, "Stopping (PE={:.1f}, any-rank explosion).", pe)
             break
 
     # ── 9. Save debug data ──
