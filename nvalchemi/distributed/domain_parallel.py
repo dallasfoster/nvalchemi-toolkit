@@ -636,13 +636,16 @@ class DomainParallel(BaseDynamics):
         ``pbc=False`` everywhere and explicitly add periodic image copies
         of atoms within ``cutoff + skin`` of each periodic cell face.
 
-        Images are appended AFTER all owned + ghost atoms.  The returned
-        batch has more atoms; call :meth:`_strip_periodic_images` after
-        force computation to remove them.
+        Returns a **new** ``Batch`` (the ``SegmentedLevelStorage`` used
+        by ``Batch`` validates that all tensors in a group share the same
+        length, so we cannot extend in-place).
 
         Only non-decomposed periodic dimensions get images (decomposed
         dims are handled by ghost exchange).
         """
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch as BatchCls
+
         original_pbc = (
             self._geometry_snapshot.original_pbc
             if self._geometry_snapshot is not None
@@ -666,20 +669,17 @@ class DomainParallel(BaseDynamics):
         image_parts: list[torch.Tensor] = []
 
         for d in range(3):
-            # Only add images for periodic, NON-decomposed dimensions.
             if not pbc_flags[d] or decomposed[d]:
                 continue
             L = box_diag[d].item()
             pos_d = positions[:, d]
 
-            # Atoms near the LOW face: pos_d < ghost_width → copy at pos_d + L
             lo_mask = pos_d < ghost_width
             if lo_mask.any():
                 shifted = positions[lo_mask].clone()
                 shifted[:, d] += L
                 image_parts.append(shifted)
 
-            # Atoms near the HIGH face: pos_d > L - ghost_width → copy at pos_d - L
             hi_mask = pos_d > (L - ghost_width)
             if hi_mask.any():
                 shifted = positions[hi_mask].clone()
@@ -691,73 +691,93 @@ class DomainParallel(BaseDynamics):
 
         all_images = torch.cat(image_parts, dim=0)
         n_images = all_images.shape[0]
-        device = batch.positions.device
-        dtype = batch.positions.dtype
+        device = positions.device
+        dtype = positions.dtype
 
-        # Extend per-atom tensors: positions, atomic_numbers, atomic_masses.
-        # Image atoms get zero velocities and zero forces (they exist only
-        # for the NL — their forces are discarded after strip).
-        batch.positions = torch.cat([batch.positions, all_images], dim=0)
-
-        batch.atomic_numbers = torch.cat(
+        # Build a new Batch with real + image atoms (Batch validates
+        # tensor lengths, so we can't mutate in-place).
+        all_pos = torch.cat([positions, all_images], dim=0)
+        all_Z = torch.cat(
             [batch.atomic_numbers, batch.atomic_numbers[:1].expand(n_images).clone()],
             dim=0,
         )
+
+        data = AtomicData(positions=all_pos, atomic_numbers=all_Z)
+
         if hasattr(batch, "atomic_masses") and batch.atomic_masses is not None:
-            batch.atomic_masses = torch.cat(
+            data.atomic_masses = torch.cat(
                 [batch.atomic_masses, batch.atomic_masses[:1].expand(n_images).clone()],
                 dim=0,
             )
         if hasattr(batch, "velocities") and batch.velocities is not None:
-            batch.velocities = torch.cat(
-                [
-                    batch.velocities,
-                    torch.zeros(n_images, 3, dtype=dtype, device=device),
-                ],
-                dim=0,
+            data.add_node_property(
+                "velocities",
+                torch.cat(
+                    [
+                        batch.velocities,
+                        torch.zeros(n_images, 3, dtype=dtype, device=device),
+                    ],
+                    dim=0,
+                ),
             )
         if hasattr(batch, "forces") and batch.forces is not None:
-            batch.forces = torch.cat(
-                [batch.forces, torch.zeros(n_images, 3, dtype=dtype, device=device)],
-                dim=0,
+            data.add_node_property(
+                "forces",
+                torch.cat(
+                    [
+                        batch.forces,
+                        torch.zeros(n_images, 3, dtype=dtype, device=device),
+                    ],
+                    dim=0,
+                ),
             )
+        if hasattr(batch, "cell") and batch.cell is not None:
+            data.cell = batch.cell.clone()
+        if hasattr(batch, "pbc") and batch.pbc is not None:
+            data.pbc = batch.pbc.clone()
 
-        # Update batch metadata for the new atom count.
-        # We directly extend the single-graph batch_idx (all zeros).
-        batch.batch = torch.zeros(
-            batch.positions.shape[0], dtype=torch.long, device=device
-        )
+        new_batch = BatchCls.from_data_list([data], device=device)
+        if hasattr(batch, "energies") and batch.energies is not None:
+            new_batch.energies = batch.energies.clone()
 
-        return batch
+        return new_batch
 
     @staticmethod
-    def _strip_periodic_images(batch: Batch, n_real: int) -> Batch:
-        """Remove periodic image atoms appended by :meth:`_add_periodic_images`.
+    def _strip_periodic_images(padded_batch: Batch, n_real: int) -> Batch:
+        """Remove periodic image atoms, rebuilding a clean ``Batch``.
 
-        Truncates per-atom tensors back to the first *n_real* atoms.
-        Forces on image atoms are discarded (they were only needed to
-        provide correct NL neighbors for the real atoms).
+        Returns a fresh ``Batch`` with only the first *n_real* atoms.
         """
-        if batch.num_nodes <= n_real:
-            return batch
+        from nvalchemi.data.atomic_data import AtomicData
+        from nvalchemi.data.batch import Batch as BatchCls
 
-        batch.positions = batch.positions[:n_real]
-        batch.atomic_numbers = batch.atomic_numbers[:n_real]
-        if hasattr(batch, "atomic_masses") and batch.atomic_masses is not None:
-            batch.atomic_masses = batch.atomic_masses[:n_real]
-        if hasattr(batch, "velocities") and batch.velocities is not None:
-            batch.velocities = batch.velocities[:n_real]
-        if hasattr(batch, "forces") and batch.forces is not None:
-            batch.forces = batch.forces[:n_real]
-        if hasattr(batch, "energies") and batch.energies is not None:
-            # Energies are per-system (not per-atom), keep as-is.
-            pass
+        if padded_batch.num_nodes <= n_real:
+            return padded_batch
 
-        batch.batch = torch.zeros(
-            n_real, dtype=torch.long, device=batch.positions.device
+        device = padded_batch.positions.device
+        data = AtomicData(
+            positions=padded_batch.positions[:n_real],
+            atomic_numbers=padded_batch.atomic_numbers[:n_real],
         )
+        if (
+            hasattr(padded_batch, "atomic_masses")
+            and padded_batch.atomic_masses is not None
+        ):
+            data.atomic_masses = padded_batch.atomic_masses[:n_real]
+        if hasattr(padded_batch, "velocities") and padded_batch.velocities is not None:
+            data.add_node_property("velocities", padded_batch.velocities[:n_real])
+        if hasattr(padded_batch, "forces") and padded_batch.forces is not None:
+            data.add_node_property("forces", padded_batch.forces[:n_real])
+        if hasattr(padded_batch, "cell") and padded_batch.cell is not None:
+            data.cell = padded_batch.cell.clone()
+        if hasattr(padded_batch, "pbc") and padded_batch.pbc is not None:
+            data.pbc = padded_batch.pbc.clone()
 
-        return batch
+        new_batch = BatchCls.from_data_list([data], device=device)
+        if hasattr(padded_batch, "energies") and padded_batch.energies is not None:
+            new_batch.energies = padded_batch.energies.clone()
+
+        return new_batch
 
     def _invalidate_nl_ref(self) -> None:
         """Reset the NeighborListHook's reference positions.
