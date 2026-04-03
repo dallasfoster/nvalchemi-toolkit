@@ -597,13 +597,25 @@ class DomainParallel(BaseDynamics):
         _MIN_PADDING = 1.0
         padding = max(skin, _MIN_PADDING)
 
-        if self._cached_pos_min is not None and not force_recompute:
-            pos_min = self._cached_pos_min
-        else:
-            pos_min = positions.min(dim=0).values - padding
+        # Always check if any atom has drifted below the cached origin.
+        # If so, recompute to prevent negative local coordinates that
+        # cause the cell-list builder to produce spurious Z-shifts.
+        actual_min = positions.min(dim=0).values
+        needs_recompute = force_recompute or self._cached_pos_min is None
+        if not needs_recompute:
+            # Check decomposed dims only — non-decomposed have pos_min=0
+            for d in range(3):
+                if decomposed[d] and actual_min[d] < self._cached_pos_min[d]:
+                    needs_recompute = True
+                    break
+
+        if needs_recompute:
+            pos_min = actual_min - padding
             # Only shift in decomposed dims; non-decomposed keep pos_min=0.
             pos_min = torch.where(decomposed, pos_min, torch.zeros_like(pos_min))
             self._cached_pos_min = pos_min
+        else:
+            pos_min = self._cached_pos_min
 
         pos_max = positions.max(dim=0).values
         aabb_lengths = (pos_max - pos_min + padding).clamp(min=1e-6)
