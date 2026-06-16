@@ -161,6 +161,15 @@ class UMAWrapper(nn.Module, BaseModelMixin):
         self._is_pbc_task = task_name in _PBC_TASKS
         self._cutoff = self._extract_cutoff()
 
+        # Under turbo/compile, the first forward must feed CPU input to dodge a
+        # fairchem lazy-merge device bug; this one-shot flag clears after that
+        # forward (tracked here rather than via fairchem's private init flag).
+        _settings = getattr(predict_unit, "inference_settings", None)
+        self._cpu_route_first_forward = _settings is not None and bool(
+            getattr(_settings, "merge_mole", False)
+            or getattr(_settings, "compile", False)
+        )
+
         # Task-dependent output set. Energy + forces are universal;
         # stress only makes sense for periodic tasks.
         outputs: set[str] = {"energy", "forces"}
@@ -402,7 +411,14 @@ class UMAWrapper(nn.Module, BaseModelMixin):
         nedges = torch.zeros(n_systems, dtype=torch.long, device=device)
 
         fixed = torch.zeros(total_atoms, dtype=torch.long, device=device)
-        tags = torch.zeros(total_atoms, dtype=torch.long, device=device)
+
+        # fairchem tags = nvalchemi atom_categories (sub-surface/surface/
+        # adsorbate for OC20/ODAC); defaults to zeros when unset.
+        cats = getattr(data, "atom_categories", None)
+        if cats is None:
+            tags = torch.zeros(total_atoms, dtype=torch.long, device=device)
+        else:
+            tags = cats.to(torch.long).reshape(total_atoms)
 
         return FCAtomicData(
             pos=pos,
@@ -468,24 +484,16 @@ class UMAWrapper(nn.Module, BaseModelMixin):
         With ``merge_mole=True`` that merge leaves the charge/spin embeddings
         on CPU when the first batch is GPU-resident, crashing the forward.
         fairchem's own ASE calculator dodges this by feeding CPU data on that
-        first call, so we route only the lazy-init forward through CPU input;
-        ``predict`` moves it back to the model device, so inference stays
-        on-device and later forwards use the input's real device.
+        first call, so we route only the first wrapper forward through CPU
+        input; ``predict`` moves it back to the model device, so inference
+        stays on-device and later forwards use the input's real device.
         """
         fc_data = self.adapt_input(data, **kwargs)
 
-        # Route only the first (lazy-init) forward through CPU input under
-        # turbo — see the docstring for why.
-        settings = getattr(self.predict_unit, "inference_settings", None)
-        if (
-            not getattr(self.predict_unit, "lazy_model_intialized", True)
-            and settings is not None
-            and (
-                getattr(settings, "merge_mole", False)
-                or getattr(settings, "compile", False)
-            )
-        ):
+        # First turbo/compile forward only — see the docstring.
+        if self._cpu_route_first_forward:
             fc_data = fc_data.to(torch.device("cpu"))
+            self._cpu_route_first_forward = False
 
         raw = self.predict_unit.predict(fc_data, undo_element_references=True)
         return self.adapt_output(raw, data=data)

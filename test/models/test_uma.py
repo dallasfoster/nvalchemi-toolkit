@@ -315,6 +315,22 @@ class TestAdaptInput:
         assert fc.charge.tolist() == [-1]
         assert fc.spin.tolist() == [2]
 
+    def test_passes_tags(self, mock_pu):
+        """Per-atom atom_categories (fairchem tags, e.g. OC20/ODAC) pass through."""
+        w = UMAWrapper(mock_pu, task_name="oc20")
+        data = AtomicData(
+            positions=torch.zeros(4, 3),
+            atomic_numbers=torch.tensor([1, 1, 1, 1], dtype=torch.long),
+            atom_categories=torch.tensor([0, 1, 2, 1], dtype=torch.long),
+        )
+        fc = w.adapt_input(data)
+        assert fc.tags.tolist() == [0, 1, 2, 1]
+
+    def test_tags_default_zero(self, mock_omol):
+        """Without atom_categories, the adapter fills tags with zeros."""
+        fc = mock_omol.adapt_input(_make_propane())
+        assert fc.tags.tolist() == [0] * 11
+
 
 class TestAdaptOutput:
     def test_molecular_energy_forces(self, mock_omol):
