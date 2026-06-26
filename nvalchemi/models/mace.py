@@ -268,6 +268,51 @@ def _cueq_conv_unfuse_adapters(model: nn.Module) -> tuple:
     return tuple(adapters)
 
 
+def _mace_product_block_static_index_forward(
+    original: Any,
+    self: Any,
+    node_feats: torch.Tensor,
+    sc: "torch.Tensor | None",
+    node_attrs: torch.Tensor,
+) -> torch.Tensor:
+    """Wrap ``EquivariantProductBasisBlock.forward`` to derive the cueq
+    symmetric-contraction element index with a static-shape ``argmax`` instead of
+    the data-dependent ``torch.nonzero(node_attrs)[:, 1]``.
+
+    Mirrors mace's cueq branch exactly except for the index op. ``argmax`` returns
+    one index per row (== ``nonzero[:, 1]`` for genuine one-hot rows), so under
+    DD-compile the inert dead-padding rows (``Z=0`` -> all-zero one-hot) map to
+    element 0 and ``index_attrs`` keeps ``n_padded`` rows — matching ``node_feats``
+    and avoiding the cueq ``uniform_1d`` "batch dim mismatch". The non-cueq path
+    has no ``nonzero``, so it delegates to the original. Declared on the cueq spec
+    (see :func:`_mace_cueq_spec`); installed only inside the distributed scope, so
+    single-process keeps the stock forward.
+    """
+    use_cueq = False
+    use_cueq_mul_ir = False
+    if getattr(self, "use_agnostic_product", False):
+        node_attrs = torch.ones(
+            (node_feats.shape[0], 1), dtype=node_feats.dtype, device=node_feats.device
+        )
+    cfg = getattr(self, "cueq_config", None)
+    if cfg is not None:
+        if cfg.enabled and (cfg.optimize_all or cfg.optimize_symmetric):
+            use_cueq = True
+        if cfg.layout_str == "mul_ir":
+            use_cueq_mul_ir = True
+    if not use_cueq:
+        # Stock path (symmetric_contractions takes node_attrs directly) — no
+        # nonzero, nothing to correct.
+        return original(self, node_feats, sc, node_attrs)
+    if use_cueq_mul_ir:
+        node_feats = torch.transpose(node_feats, 1, 2)
+    index_attrs = node_attrs.argmax(dim=1).int()
+    node_feats = self.symmetric_contractions(node_feats.flatten(1), index_attrs)
+    if self.use_sc and sc is not None:
+        return self.linear(node_feats) + sc
+    return self.linear(node_feats)
+
+
 _MACE_CUEQ_SPEC_CACHE: Any = None
 
 
@@ -335,6 +380,7 @@ def _mace_cueq_spec() -> Any:
     # mishandle sharded tensors (the scripted kernel faults; the in-place op
     # fails under compile). Marshal the whole ``SphericalHarmonics.forward`` so
     # both run on a plain local tensor.
+    #
     from nvalchemi.distributed._core.adapter import MethodAdapter
 
     _marshal = (
@@ -343,6 +389,24 @@ def _mace_cueq_spec() -> Any:
             "SphericalHarmonics",
             "forward",
             mode="marshal",
+        ),
+        # cueq's ``EquivariantProductBasisBlock.forward`` derives the per-node
+        # element index for the symmetric contraction with
+        # ``torch.nonzero(node_attrs)[:, 1]``. Under DD-compile the graph is padded
+        # to fixed-shape caps with inert dead atoms (``Z=0`` -> all-zero one-hot
+        # ``node_attrs`` row), so ``nonzero`` UNDERCOUNTS — ``index_attrs`` gets
+        # fewer rows than ``node_feats`` (``n_padded``) and the cueq ``uniform_1d``
+        # kernel raises "batch dim mismatch" (caught in the fake impl on some
+        # backends, at eager runtime on others). The wrap swaps in
+        # ``node_attrs.argmax(dim=1)`` — one index per row, == ``nonzero[:, 1]``
+        # for real one-hot rows; dead rows map to element 0 and are stripped from
+        # the owned-only output. Static-shape, so it also sidesteps the
+        # data-dependent ``nonzero`` under compile. Non-cueq path is untouched.
+        MethodAdapter(
+            "mace.modules.blocks",
+            "EquivariantProductBasisBlock",
+            "forward",
+            _mace_product_block_static_index_forward,
         ),
     )
     from nvalchemi.distributed.spec import CompilePolicy, ForceStrategy
