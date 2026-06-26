@@ -1,6 +1,9 @@
 ---
 name: nvalchemi-data-storage
-description: How to write, read, and load atomic data using nvalchemi's composable Zarr-backed storage pipeline (Writer, Reader, Dataset, DataLoader).
+description: >-
+  How to write, read, compose, and load atomic data using nvalchemi's
+  composable Zarr-backed storage pipeline (Writer, Reader, Dataset,
+  MultiDataset, DataLoader).
 ---
 
 # nvalchemi Data Storage
@@ -9,15 +12,17 @@ description: How to write, read, and load atomic data using nvalchemi's composab
 
 `nvalchemi` provides a composable pipeline for persisting and loading atomic data:
 
-```
+```text
 Writer                          Reader
 (AtomicData/Batch -> Zarr)      (Zarr -> dict[str, Tensor])
                                     |
                                 Dataset
-                                (dict -> AtomicData, device transfer, prefetch)
+                                (dict -> AtomicData, load_batches, prefetch)
+                                    |
+                    optional MultiDataset composition
                                     |
                                 DataLoader
-                                (AtomicData -> Batch, batching, iteration)
+                                (Batch iteration)
 ```
 
 ```python
@@ -25,7 +30,9 @@ from nvalchemi.data.datapipes import (
     AtomicDataZarrWriter,
     AtomicDataZarrReader,
     Dataset,
+    MultiDataset,
     DataLoader,
+    MultiDatasetBatchSampler,
 )
 ```
 
@@ -33,7 +40,8 @@ from nvalchemi.data.datapipes import (
 
 ## Writing Data
 
-`AtomicDataZarrWriter` serializes `AtomicData`, `list[AtomicData]`, or `Batch` into a Zarr store.
+`AtomicDataZarrWriter` serializes `AtomicData`, `list[AtomicData]`, or
+`Batch` into a Zarr store.
 
 ```python
 from nvalchemi.data import AtomicData, Batch
@@ -46,7 +54,7 @@ writer = AtomicDataZarrWriter("dataset.zarr")
 data = AtomicData(
     positions=torch.randn(10, 3),
     atomic_numbers=torch.ones(10, dtype=torch.long),
-    energies=torch.tensor([[0.5]]),
+    energy=torch.tensor([[0.5]]),
 )
 writer.write(data)
 
@@ -82,7 +90,7 @@ writer.defragment()      # rebuild store without deleted samples
 
 ### Zarr store layout
 
-```
+```text
 dataset.zarr/
 ├── meta/
 │   ├── atoms_ptr       # int64 [N+1] — cumulative node counts
@@ -144,6 +152,10 @@ atomic_data, metadata = ds[0]   # AtomicData on target device
 # Lightweight metadata (no full construction)
 num_atoms, num_edges = ds.get_metadata(0)
 
+# Explicit batch loading. This is the canonical synchronous batch API.
+batches = ds.load_batches([[0, 3, 2], [4, 1, 5]])
+batch0 = batches[0]
+
 len(ds)    # number of samples
 ds.close()
 
@@ -178,8 +190,8 @@ Iterates over a `Dataset` in batches, producing `Batch` objects.
 ```python
 from nvalchemi.data.datapipes import AtomicDataZarrReader, Dataset, DataLoader
 
-reader = AtomicDataZarrReader("dataset.zarr")
-ds = Dataset(reader, device="cuda", num_workers=4)
+reader = AtomicDataZarrReader("dataset.zarr", pin_memory=True)
+ds = Dataset(reader, device="cuda", num_workers=1)
 
 loader = DataLoader(
     ds,
@@ -187,10 +199,13 @@ loader = DataLoader(
     shuffle=True,
     drop_last=False,
     sampler=None,              # optional torch Sampler
-    prefetch_factor=2,         # batches to prefetch ahead
-    num_streams=4,             # CUDA streams for prefetching
+    prefetch_factor=16,        # fuse 16 batches per read_many call
+    num_streams=2,             # CUDA streams for prefetching
     use_streams=True,          # enable stream prefetching
 )
+
+# For throughput tuning (skip_validation, prefetch_factor, chunk/shard
+# sizing), load the nvalchemi-zarr-perf agent skill.
 
 for batch in loader:
     # batch is a Batch with concatenated tensors on target device
@@ -199,6 +214,45 @@ for batch in loader:
 len(loader)                    # number of batches
 loader.set_epoch(epoch)        # for distributed sampler
 ```
+
+Use `prefetch_factor=0` to disable async fused prefetch while still reading each
+emitted batch through `Dataset.load_batches([indices])`. For explicit/manual
+batch reads, use `load_batches(...)`.
+
+### Composing multiple datasets
+
+Use `MultiDataset` to concatenate multiple `Dataset` instances behind one global
+index space while keeping the same `load_batches(...)` fast path:
+
+```python
+from nvalchemi.data.datapipes import (
+    AtomicDataZarrReader,
+    DataLoader,
+    Dataset,
+    MultiDataset,
+    MultiDatasetBatchSampler,
+)
+
+ds_a = Dataset(AtomicDataZarrReader("dataset_a.zarr"), device="cuda")
+ds_b = Dataset(AtomicDataZarrReader("dataset_b.zarr"), device="cuda")
+dataset = MultiDataset(ds_a, ds_b, output_strict=True)
+
+batch_sampler = MultiDatasetBatchSampler.balanced(
+    dataset,
+    batch_size=64,
+    epoch_policy="max_size",  # oversample smaller datasets when replacement=True
+    replacement=True,
+)
+
+loader = DataLoader(dataset, batch_sampler=batch_sampler, prefetch_factor=16)
+```
+
+Sampler notes:
+
+- `samples_per_dataset` accepts integer counts or float ratios.
+- `epoch_policy="min_size"` stops at the smallest contributing dataset.
+- `epoch_policy="max_size"` covers the largest dataset and oversamples smaller
+  datasets when `replacement=True`.
 
 ---
 
@@ -216,6 +270,10 @@ class MyReader(Reader):
 
     def _load_sample(self, index: int) -> dict[str, torch.Tensor]:
         """Load raw tensor dict for a single sample."""
+        ...
+
+    def _load_many_samples(self, indices) -> list[dict[str, torch.Tensor]]:
+        """Optional fast path for coalesced batch reads."""
         ...
 
     def __len__(self) -> int:
@@ -263,7 +321,7 @@ data_list = [
     AtomicData(
         positions=torch.randn(n, 3),
         atomic_numbers=torch.ones(n, dtype=torch.long),
-        energies=torch.tensor([[float(i)]]),
+        energy=torch.tensor([[float(i)]]),
     )
     for i, n in enumerate([5, 8, 3, 12])
 ]
@@ -285,7 +343,7 @@ loader = DataLoader(ds, batch_size=2, shuffle=True, prefetch_factor=2)
 for epoch in range(10):
     loader.set_epoch(epoch)
     for batch in loader:
-        energies = batch["energies"]      # [batch_size, 1]
+        energy = batch["energy"]          # [batch_size, 1]
         positions = batch["positions"]    # [total_nodes, 3]
         # ... model forward pass ...
 ```
