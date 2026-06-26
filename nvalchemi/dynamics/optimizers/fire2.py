@@ -54,7 +54,8 @@ from nvalchemi.dynamics._ops.npt_nph import stress_to_cell_force
 from nvalchemi.dynamics.base import BaseDynamics
 
 if TYPE_CHECKING:
-    from nvalchemi.dynamics.base import ConvergenceHook, Hook
+    from nvalchemi.dynamics.base import ConvergenceHook
+    from nvalchemi.hooks import Hook
     from nvalchemi.models.base import BaseModelMixin
 
 __all__ = ["FIRE2", "FIRE2VariableCell"]
@@ -200,11 +201,14 @@ class FIRE2(BaseDynamics):
         batch : Batch
             Current batch; *positions* and *velocities* updated in-place.
         """
+        # Detach positions to avoid "non-leaf .grad accessed" warning from
+        # wp.from_torch.  FIRE2 does not use autograd; in-place updates
+        # still apply to the batch's underlying storage.
         fire2_step_coord(
-            batch.positions,
+            batch.positions.detach(),
             batch.velocities,
             batch.forces,
-            batch.batch.int(),
+            batch.batch_idx.int(),
             self._state.alpha,
             self._state.dt,
             self._state.nsteps_inc,
@@ -235,7 +239,7 @@ class FIRE2VariableCell(BaseDynamics):
     Parameters
     ----------
     model : BaseModelMixin
-        The neural network potential model.  Must produce ``"stresses"``.
+        The neural network potential model.  Must produce ``"stress"``.
     dt : float or torch.Tensor
         Initial adaptive timestep ``[M]`` or scalar.
     delaystep : int
@@ -266,12 +270,12 @@ class FIRE2VariableCell(BaseDynamics):
     Attributes
     ----------
     __needs_keys__ : set[str]
-        ``{"forces", "stresses"}``.
+        ``{"forces", "stress"}``.
     __provides_keys__ : set[str]
         ``{"positions", "velocities", "cell"}``.
     """
 
-    __needs_keys__: set[str] = {"forces", "stresses"}
+    __needs_keys__: set[str] = {"forces", "stress"}
     __provides_keys__: set[str] = {"positions", "velocities", "cell"}
 
     def __init__(
@@ -337,19 +341,17 @@ class FIRE2VariableCell(BaseDynamics):
             updated in-place.
         """
         volumes = torch.linalg.det(batch.cell).abs()
-        # batch.stress is the raw virial W_phys (energy units, eV).
-        # stress_to_cell_force expects the mechanical stress σ = W_phys / V
-        # (energy/volume units), so divide by volume here.
-        stress_sigma = batch.stress / volumes.view(-1, 1, 1)
+        # batch.stress is Cauchy stress W/V (eV/A^3).
+        stress_sigma = batch.stress
         cell_force = stress_to_cell_force(stress_sigma, batch.cell, volumes)
         fire2_step_coord_cell(
-            batch.positions,
+            batch.positions.detach(),
             batch.velocities,
             batch.forces,
-            batch.cell,
+            batch.cell.detach(),
             self._state.cell_velocities,
             cell_force,
-            batch.batch.int(),
+            batch.batch_idx.int(),
             self._state.alpha,
             self._state.dt,
             self._state.nsteps_inc,

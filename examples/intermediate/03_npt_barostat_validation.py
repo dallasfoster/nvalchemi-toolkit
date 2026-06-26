@@ -53,8 +53,10 @@ import os
 import torch
 
 from nvalchemi.data import AtomicData, Batch
-from nvalchemi.dynamics.hooks import LoggingHook, NeighborListHook, WrapPeriodicHook
+from nvalchemi.dynamics.base import DynamicsStage
+from nvalchemi.dynamics.hooks import LoggingHook
 from nvalchemi.dynamics.integrators.npt import NPT
+from nvalchemi.hooks import NeighborListHook, WrapPeriodicHook
 from nvalchemi.models.lj import LennardJonesModelWrapper
 
 logging.basicConfig(level=logging.INFO)
@@ -68,8 +70,9 @@ model = LennardJonesModelWrapper(
     sigma=3.40,  # Å
     cutoff=8.5,  # Å
 )
+# NPT requires stress computation — opt in (default is energy + forces only).
+model.set_config("active_outputs", {"energy", "forces", "stress"})
 model.eval()
-model.model_config.compute_stresses = True
 
 # %%
 # FCC crystal builder
@@ -117,9 +120,10 @@ def make_fcc_batch(lattice_constant: float, seed_vel: int) -> Batch:
         atomic_numbers=torch.full((n_atoms,), 18, dtype=torch.long),
         atomic_masses=torch.full((n_atoms,), MASS_AR),
         forces=torch.zeros(n_atoms, 3),
-        energies=torch.zeros(1, 1),
+        energy=torch.zeros(1, 1),
         cell=cell,
         pbc=torch.tensor([[True, True, True]]),
+        device="cuda:0",
     )
     data.add_node_property("velocities", velocities)
 
@@ -174,7 +178,7 @@ PRINT_EVERY = 300
 
 shared_npt_kwargs = dict(
     model=model,
-    dt=1.0,  # fs
+    dt=0.1,  # fs
     temperature=TEMPERATURE,
     pressure=PRESSURE,
     barostat_time=200.0,  # fs
@@ -186,26 +190,23 @@ shared_npt_kwargs = dict(
 
 def run_npt(batch: Batch, label: str, log_path: str) -> tuple[Batch, list[float]]:
     """Run NPT and return (final_batch, list_of_volumes_logged_every_PRINT_EVERY steps)."""
-    nl_hook = NeighborListHook(model.model_card.neighbor_config)
-    wrap_hook = WrapPeriodicHook()
+    nl_hook = NeighborListHook(
+        model.model_config.neighbor_config, stage=DynamicsStage.BEFORE_COMPUTE
+    )
+    wrap_hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
     logger = LoggingHook(backend="csv", log_path=log_path, frequency=PRINT_EVERY)
 
     npt = NPT(**shared_npt_kwargs, n_steps=N_STEPS, hooks=[nl_hook, wrap_hook, logger])
-
+    compiled_npt = torch.compile(npt.run)
     volumes = [torch.linalg.det(batch.cell).abs().item()]
 
     with logger:
         for block_start in range(0, N_STEPS, PRINT_EVERY):
             steps = min(PRINT_EVERY, N_STEPS - block_start)
-            batch = npt.run(batch, n_steps=steps)
+            batch = compiled_npt(batch, n_steps=steps)
             v = torch.linalg.det(batch.cell).abs().item()
             volumes.append(v)
-            logging.info(
-                "[%s] step=%4d  V=%.3f Å³",
-                label,
-                npt.step_count,
-                v,
-            )
+            logging.info(f"[{label}] step={npt.step_count}  V=%.3f Å³", v)
 
     return batch, volumes
 

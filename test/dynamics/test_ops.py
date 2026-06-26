@@ -211,6 +211,134 @@ class TestThermostatUtils:
         assert vel.shape == (N, 3)
         assert vel.dtype == dtype
 
+    def test_initialize_velocities_rescale(self, dtype, device):
+        """After COM removal + rescale, temperature should match target exactly."""
+        from nvalchemi.dynamics._ops.thermostat_utils import (
+            compute_kinetic_energy,
+            initialize_velocities,
+        )
+        from nvalchemi.dynamics.hooks._utils import KB_EV
+
+        M, N = 1, 200  # large enough for good statistics
+        vel = torch.zeros(N, 3, dtype=dtype, device=device)
+        mass = torch.full((N,), 28.0, dtype=dtype, device=device)  # silicon
+        temp = torch.full((M,), 300.0, dtype=dtype, device=device)
+        batch = torch.zeros(N, dtype=torch.int32, device=device)
+
+        initialize_velocities(
+            vel, mass, temp, batch, random_seed=42, remove_com=True, rescale=True
+        )
+        ke = compute_kinetic_energy(vel, mass, batch, M)
+        t_actual = float(2.0 * ke[0] / (3.0 * N * KB_EV))
+        assert abs(t_actual - 300.0) < 1.0, f"T={t_actual}, expected ~300"
+
+    def test_initialize_velocities_no_rescale_drifts(self, dtype, device):
+        """Without rescale, COM removal causes temperature to drift below target."""
+        from nvalchemi.dynamics._ops.thermostat_utils import (
+            compute_kinetic_energy,
+            initialize_velocities,
+        )
+        from nvalchemi.dynamics.hooks._utils import KB_EV
+
+        M, N = 1, 200
+        vel = torch.zeros(N, 3, dtype=dtype, device=device)
+        mass = torch.full((N,), 28.0, dtype=dtype, device=device)
+        temp = torch.full((M,), 300.0, dtype=dtype, device=device)
+        batch = torch.zeros(N, dtype=torch.int32, device=device)
+
+        initialize_velocities(
+            vel, mass, temp, batch, random_seed=42, remove_com=True, rescale=False
+        )
+        ke = compute_kinetic_energy(vel, mass, batch, M)
+        t_actual = float(2.0 * ke[0] / (3.0 * N * KB_EV))
+        # Without rescale, T should be slightly below target (lost 3 DOF).
+        assert t_actual < 300.0, f"Expected T < 300 without rescale, got {t_actual}"
+
+    def test_initialize_velocities_remove_rotations(self, dtype, device):
+        """After rotation removal, angular momentum should be near zero."""
+        from nvalchemi.dynamics._ops.thermostat_utils import initialize_velocities
+
+        M, N = 1, 100
+        torch.manual_seed(7)
+        pos = torch.randn(N, 3, dtype=dtype, device=device)
+        vel = torch.zeros(N, 3, dtype=dtype, device=device)
+        mass = torch.full((N,), 28.0, dtype=dtype, device=device)
+        temp = torch.full((M,), 300.0, dtype=dtype, device=device)
+        batch = torch.zeros(N, dtype=torch.int32, device=device)
+
+        initialize_velocities(
+            vel,
+            mass,
+            temp,
+            batch,
+            random_seed=42,
+            remove_com=True,
+            remove_rotations=True,
+            positions=pos,
+        )
+
+        # Angular momentum L = sum(m * r x v) should be ~0.
+        m = mass.unsqueeze(-1)
+        L = (m * torch.linalg.cross(pos, vel)).sum(dim=0)
+        assert L.abs().max() < 1e-3, f"Angular momentum not zero: {L}"
+
+    def test_initialize_velocities_rotation_removal_rescales(self, dtype, device):
+        """Rotation removal + rescale should still match target temperature."""
+        from nvalchemi.dynamics._ops.thermostat_utils import (
+            compute_kinetic_energy,
+            initialize_velocities,
+        )
+        from nvalchemi.dynamics.hooks._utils import KB_EV
+
+        M, N = 1, 200
+        torch.manual_seed(7)
+        pos = torch.randn(N, 3, dtype=dtype, device=device)
+        vel = torch.zeros(N, 3, dtype=dtype, device=device)
+        mass = torch.full((N,), 28.0, dtype=dtype, device=device)
+        temp = torch.full((M,), 300.0, dtype=dtype, device=device)
+        batch = torch.zeros(N, dtype=torch.int32, device=device)
+
+        initialize_velocities(
+            vel,
+            mass,
+            temp,
+            batch,
+            random_seed=42,
+            remove_com=True,
+            remove_rotations=True,
+            rescale=True,
+            positions=pos,
+        )
+        ke = compute_kinetic_energy(vel, mass, batch, M)
+        t_actual = float(2.0 * ke[0] / (3.0 * N * KB_EV))
+        assert abs(t_actual - 300.0) < 1.0, f"T={t_actual}, expected ~300"
+
+    def test_initialize_velocities_multi_system(self, dtype, device):
+        """Rescale works per-system with different target temperatures."""
+        from nvalchemi.dynamics._ops.thermostat_utils import (
+            compute_kinetic_energy,
+            initialize_velocities,
+        )
+        from nvalchemi.dynamics.hooks._utils import KB_EV
+
+        N_per = 100
+        M = 3
+        N = M * N_per
+        vel = torch.zeros(N, 3, dtype=dtype, device=device)
+        mass = torch.full((N,), 28.0, dtype=dtype, device=device)
+        temp = torch.tensor([100.0, 300.0, 500.0], dtype=dtype, device=device)
+        batch = _batch_idx([N_per] * M, device)
+
+        initialize_velocities(
+            vel, mass, temp, batch, random_seed=42, remove_com=True, rescale=True
+        )
+        ke = compute_kinetic_energy(vel, mass, batch, M)
+        for i in range(M):
+            t_actual = float(2.0 * ke[i] / (3.0 * N_per * KB_EV))
+            assert abs(t_actual - float(temp[i])) < 2.0, (
+                f"System {i}: T={t_actual}, expected {float(temp[i])}"
+            )
+
     def test_compute_kinetic_energy_shape(self, dtype, device):
         from nvalchemi.dynamics._ops.thermostat_utils import compute_kinetic_energy
 
@@ -714,9 +842,9 @@ class TestNptNphOps:
         torch.manual_seed(8)
         velocities = torch.randn(N, 3, dtype=dtype, device=device)
         masses = torch.ones(N, dtype=dtype, device=device)
-        # Random symmetric stress tensors.
+        # Random symmetric virial tensors.
         S = torch.randn(M, 3, 3, dtype=dtype, device=device)
-        stress = 0.5 * (S + S.transpose(-1, -2))
+        virial = 0.5 * (S + S.transpose(-1, -2))
         # Identity cells.
         cell = (
             torch.eye(3, dtype=dtype, device=device)
@@ -726,14 +854,14 @@ class TestNptNphOps:
         )
         kinetic_tensors = torch.zeros(M, 9, dtype=dtype, device=device)  # [M,9] array2d
         pressure_tensors = torch.zeros(M, 9, dtype=dtype, device=device)  # [M,9] vec9
-        volumes = torch.zeros(M, dtype=dtype, device=device)
+        volumes = torch.full((M,), 2.0, dtype=dtype, device=device)
         sizes = [N // M] * M
         sizes[-1] += N - sum(sizes)
         batch = _batch_idx(sizes, device)
         return (
             velocities,
             masses,
-            stress,
+            virial,
             cell,
             kinetic_tensors,
             pressure_tensors,
@@ -745,10 +873,10 @@ class TestNptNphOps:
         from nvalchemi.dynamics._ops.npt_nph import compute_pressure_tensor
 
         M, N = 2, 8
-        vel, mass, stress, cell, kin, P_scr, vol, batch = self._make_pressure(
+        vel, mass, virial, cell, kin, P_scr, vol, batch = self._make_pressure(
             M, N, dtype, device
         )
-        P = compute_pressure_tensor(vel, mass, stress, cell, kin, P_scr, vol, batch)
+        P = compute_pressure_tensor(vel, mass, virial, cell, kin, P_scr, vol, batch)
         assert P.shape == (M, 9)
         assert P.dtype == dtype
 
@@ -756,10 +884,10 @@ class TestNptNphOps:
         from nvalchemi.dynamics._ops.npt_nph import compute_pressure_tensor
 
         M, N = 1, 4
-        vel, mass, stress, cell, kin, P_scr, vol, batch = self._make_pressure(
+        vel, mass, virial, cell, kin, P_scr, vol, batch = self._make_pressure(
             M, N, dtype, device
         )
-        P = compute_pressure_tensor(vel, mass, stress, cell, kin, P_scr, vol, batch)
+        P = compute_pressure_tensor(vel, mass, virial, cell, kin, P_scr, vol, batch)
         assert P.shape == (1, 9)
 
     def test_compute_scalar_pressure(self, dtype, device):
@@ -841,6 +969,31 @@ class TestNptNphOps:
         )
         assert positions.shape == pos_orig.shape
 
+    def test_compute_pressure_tensor_virial_sign_convention(self, dtype, device):
+        """Bridge passes virial directly to the ops kernel.
+
+        With zero velocities (no kinetic contribution), the pressure
+        tensor should be P = virial / V.  A positive (compressive) virial
+        should yield positive pressure.
+        """
+        from nvalchemi.dynamics._ops.npt_nph import compute_pressure_tensor
+
+        M, N = 1, 4
+        vel = torch.zeros(N, 3, dtype=dtype, device=device)
+        mass = torch.ones(N, dtype=dtype, device=device)
+        virial = torch.eye(3, dtype=dtype, device=device).unsqueeze(0) * 3.0
+        cell = torch.eye(3, dtype=dtype, device=device).unsqueeze(0) * 10.0
+        kin = torch.zeros(M, 9, dtype=dtype, device=device)
+        P_scr = torch.zeros(M, 9, dtype=dtype, device=device)
+        vol = torch.full((M,), 1.0, dtype=dtype, device=device)
+        batch = torch.zeros(N, dtype=torch.int32, device=device)
+        P = compute_pressure_tensor(vel, mass, virial, cell, kin, P_scr, vol, batch)
+        P_mat = P.reshape(M, 3, 3)
+        P_diag = torch.diagonal(P_mat, dim1=-2, dim2=-1)
+        assert (P_diag > 0).all(), (
+            f"Compressive virial should give positive pressure, got diag {P_diag}"
+        )
+
     def test_stress_to_cell_force_shape(self, dtype, device):
         from nvalchemi.dynamics._ops.npt_nph import stress_to_cell_force
 
@@ -880,7 +1033,7 @@ class TestIntegrators:
             ),
             atomic_masses=torch.ones(n_atoms),
             forces=torch.zeros(n_atoms, 3),
-            energies=torch.zeros(1, 1),
+            energy=torch.zeros(1, 1),
         )
         data.add_node_property("velocities", torch.zeros(n_atoms, 3))
         return data
@@ -888,9 +1041,9 @@ class TestIntegrators:
     def test_nve_step(self):
         from nvalchemi.data import Batch
         from nvalchemi.dynamics.integrators.nve import NVE
-        from nvalchemi.models.demo import DemoModelWrapper
+        from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
-        model = DemoModelWrapper()
+        model = DemoModelWrapper(DemoModel())
         model.eval()
         data = self._make_batch(4, seed=0)
         batch = Batch.from_data_list([data])
@@ -902,9 +1055,9 @@ class TestIntegrators:
     def test_nvt_langevin_step(self):
         from nvalchemi.data import Batch
         from nvalchemi.dynamics.integrators.nvt_langevin import NVTLangevin
-        from nvalchemi.models.demo import DemoModelWrapper
+        from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
-        model = DemoModelWrapper()
+        model = DemoModelWrapper(DemoModel())
         model.eval()
         data = self._make_batch(4, seed=1)
         batch = Batch.from_data_list([data])
@@ -918,9 +1071,9 @@ class TestIntegrators:
     def test_fire_step(self):
         from nvalchemi.data import Batch
         from nvalchemi.dynamics.optimizers.fire import FIRE
-        from nvalchemi.models.demo import DemoModelWrapper
+        from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
-        model = DemoModelWrapper()
+        model = DemoModelWrapper(DemoModel())
         model.eval()
         data = self._make_batch(4, seed=2)
         batch = Batch.from_data_list([data])
@@ -932,9 +1085,9 @@ class TestIntegrators:
     def test_fire_uphill_flag(self):
         from nvalchemi.data import Batch
         from nvalchemi.dynamics.optimizers.fire import FIRE
-        from nvalchemi.models.demo import DemoModelWrapper
+        from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
-        model = DemoModelWrapper()
+        model = DemoModelWrapper(DemoModel())
         model.eval()
         data = self._make_batch(4, seed=3)
         batch = Batch.from_data_list([data])
@@ -947,9 +1100,9 @@ class TestIntegrators:
     def test_fire_uphill_tensor(self):
         from nvalchemi.data import Batch
         from nvalchemi.dynamics.optimizers.fire import FIRE
-        from nvalchemi.models.demo import DemoModelWrapper
+        from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
-        model = DemoModelWrapper()
+        model = DemoModelWrapper(DemoModel())
         model.eval()
         data_list = [self._make_batch(4, seed=i) for i in range(3)]
         batch = Batch.from_data_list(data_list)
@@ -962,9 +1115,9 @@ class TestIntegrators:
     def test_nvt_nhc_step(self):
         from nvalchemi.data import Batch
         from nvalchemi.dynamics.integrators.nvt_nose_hoover import NVTNoseHoover
-        from nvalchemi.models.demo import DemoModelWrapper
+        from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
-        model = DemoModelWrapper()
+        model = DemoModelWrapper(DemoModel())
         model.eval()
         data = self._make_batch(6, seed=4)
         batch = Batch.from_data_list([data])
@@ -976,9 +1129,9 @@ class TestIntegrators:
     def test_multi_system_fire(self):
         from nvalchemi.data import Batch
         from nvalchemi.dynamics.optimizers.fire import FIRE
-        from nvalchemi.models.demo import DemoModelWrapper
+        from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
-        model = DemoModelWrapper()
+        model = DemoModelWrapper(DemoModel())
         model.eval()
         data_list = [self._make_batch(n, seed=i) for n, i in [(4, 0), (5, 1), (3, 2)]]
         batch = Batch.from_data_list(data_list)
@@ -1006,7 +1159,7 @@ class TestFireOptimizerState:
             ),
             atomic_masses=torch.ones(n_atoms),
             forces=torch.zeros(n_atoms, 3),
-            energies=torch.zeros(1, 1),
+            energy=torch.zeros(1, 1),
         )
         data.add_node_property("velocities", torch.zeros(n_atoms, 3))
         return data
@@ -1014,9 +1167,9 @@ class TestFireOptimizerState:
     def test_all_hyperparams_are_tensors_in_state(self):
         from nvalchemi.data import Batch
         from nvalchemi.dynamics.optimizers.fire import FIRE
-        from nvalchemi.models.demo import DemoModelWrapper
+        from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
-        model = DemoModelWrapper()
+        model = DemoModelWrapper(DemoModel())
         model.eval()
         data_list = [self._make_batch(4), self._make_batch(5)]
         batch = Batch.from_data_list(data_list)

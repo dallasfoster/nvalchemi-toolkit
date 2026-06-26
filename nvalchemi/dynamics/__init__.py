@@ -17,13 +17,14 @@
 from __future__ import annotations
 
 from nvalchemi.dynamics import hooks, integrators, optimizers
+from nvalchemi.dynamics._ops.thermostat_utils import initialize_velocities
 from nvalchemi.dynamics.base import (
     BaseDynamics,
     ConvergenceHook,
     DistributedPipeline,
+    DynamicsStage,
     FusedStage,
     Hook,
-    HookStageEnum,
 )
 from nvalchemi.dynamics.demo import DemoDynamics
 from nvalchemi.dynamics.integrators import NPH, NPT, NVE, NVTLangevin, NVTNoseHoover
@@ -42,6 +43,7 @@ __all__ = [
     "DataSink",
     "DemoDynamics",
     "DistributedPipeline",
+    "DynamicsStage",
     "FIRE",
     "FIRE2",
     "FIRE2VariableCell",
@@ -49,7 +51,6 @@ __all__ = [
     "FusedStage",
     "GPUBuffer",
     "Hook",
-    "HookStageEnum",
     "HostMemory",
     "NPH",
     "NPT",
@@ -59,6 +60,7 @@ __all__ = [
     "SizeAwareSampler",
     "ZarrData",
     "hooks",
+    "initialize_velocities",
     "integrators",
     "optimizers",
 ]

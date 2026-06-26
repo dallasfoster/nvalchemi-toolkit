@@ -18,6 +18,12 @@ specializations in ``nvalchemi`` for CSR-type data, but in the near-term
 we will merge implementations.
 ```
 
+```{tip}
+**AI coding assistant?** Load the ``nvalchemi-data-storage``
+{ref}`agent skill <agent_skills>` for concise instructions on writing,
+reading, and loading atomic data through the Zarr-backed storage pipeline.
+```
+
 ## Reader: raw tensor I/O
 
 A {py:class}`~nvalchemi.data.datapipes.backends.base.Reader` is the simplest

@@ -17,7 +17,7 @@ the private helpers in nvalchemi/models/_ops/lj.py.
 
 Strategy
 --------
-* All tests that touch ``__init__``, ``model_card``, ``adapt_input``,
+* All tests that touch ``__init__``, ``model_config``, ``adapt_input``,
   ``adapt_output``, ``input_data``, and ``output_data`` run without
   ``nvalchemiops`` installed, because the forward pass (which calls the
   Warp kernels) is never exercised.
@@ -32,7 +32,6 @@ import torch
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.models.base import (
-    ModelCard,
     ModelConfig,
     NeighborListFormat,
 )
@@ -113,77 +112,67 @@ class TestLennardJonesModelWrapperInit:
         )
         assert model.half_list is True
 
-    def test_stores_max_neighbors_default(self):
-        model = LennardJonesModelWrapper(epsilon=0.5, sigma=2.0, cutoff=6.0)
-        assert model.max_neighbors == 128
-
-    def test_stores_max_neighbors_custom(self):
-        model = LennardJonesModelWrapper(
-            epsilon=0.5, sigma=2.0, cutoff=6.0, max_neighbors=64
-        )
-        assert model.max_neighbors == 64
-
-    def test_atomic_energies_buf_is_none(self):
-        model = _make_model()
-        assert model._atomic_energies_buf is None
-
-    def test_forces_buf_is_none(self):
-        model = _make_model()
-        assert model._forces_buf is None
-
-    def test_virials_buf_is_none(self):
-        model = _make_model()
-        assert model._virials_buf is None
-
     def test_energies_buf_is_none(self):
+        # Per-atom energy / force / virial outputs are returned by the
+        # functional Warp ops (no pre-allocated per-atom buffers); only the
+        # per-system energy accumulator is retained, lazily allocated.
         model = _make_model()
         assert model._energies_buf is None
+
+    def test_no_per_atom_output_buffers(self):
+        # The Bug-1 in-place buffer pattern was removed in favour of
+        # functional ops + an OpAdapter (Phase 6 / Path 1).
+        model = _make_model()
+        assert not hasattr(model, "_atomic_energies_buf")
+        assert not hasattr(model, "_forces_buf")
+        assert not hasattr(model, "_virials_buf")
 
     def test_model_config_is_model_config_instance(self):
         model = _make_model()
         assert isinstance(model.model_config, ModelConfig)
 
-    def test_model_config_compute_forces_default_true(self):
+    def test_model_config_active_outputs_forces_default_true(self):
         model = _make_model()
-        assert model.model_config.compute_forces is True
+        assert "forces" in model.model_config.active_outputs
 
-    def test_model_config_compute_stresses_default_false(self):
+    def test_model_config_active_outputs_stresses_default_true(self):
         model = _make_model()
-        assert model.model_config.compute_stresses is False
+        # active_outputs defaults to outputs = {"energy", "forces"}
+        assert "stress" not in model.model_config.active_outputs
 
 
 # ---------------------------------------------------------------------------
-# TestModelCard
+# TestModelConfig
 # ---------------------------------------------------------------------------
 
 
-class TestModelCard:
-    """Tests for model_card property and embedding_shapes."""
+class TestModelConfig:
+    """Tests for model_config and embedding_shapes."""
 
-    def test_model_card_returns_model_card(self):
+    def test_model_config_returns_model_config(self):
         model = _make_model()
-        assert isinstance(model.model_card, ModelCard)
+        assert isinstance(model.model_config, ModelConfig)
 
-    def test_forces_via_autograd_false(self):
+    def test_forces_not_via_autograd(self):
         model = _make_model()
-        assert model.model_card.forces_via_autograd is False
+        assert "forces" not in model.model_config.autograd_outputs
 
     def test_neighbor_config_is_matrix_format(self):
         model = _make_model()
-        assert model.model_card.neighbor_config is not None
-        assert model.model_card.neighbor_config.format == NeighborListFormat.MATRIX
+        assert model.model_config.neighbor_config is not None
+        assert model.model_config.neighbor_config.format == NeighborListFormat.MATRIX
 
     def test_neighbor_config_cutoff_matches_constructor(self):
         model = LennardJonesModelWrapper(epsilon=0.1, sigma=3.0, cutoff=9.0)
-        assert model.model_card.neighbor_config.cutoff == 9.0
+        assert model.model_config.neighbor_config.cutoff == 9.0
 
     def test_supports_stresses_true(self):
         model = _make_model()
-        assert model.model_card.supports_stresses is True
+        assert "stress" in model.model_config.outputs
 
     def test_supports_pbc_true(self):
         model = _make_model()
-        assert model.model_card.supports_pbc is True
+        assert model.model_config.supports_pbc is True
 
     def test_embedding_shapes_empty_dict(self):
         model = _make_model()
@@ -196,53 +185,46 @@ class TestModelCard:
 
 
 class TestEnsureComputeBuffers:
-    """Tests for _ensure_compute_buffers()."""
+    """Tests for _ensure_compute_buffers() — only the per-system energy
+    accumulator remains (per-atom outputs come from the functional ops)."""
 
-    def test_allocates_buffers_on_first_call(self):
+    def test_allocates_accumulator_on_first_call(self):
         model = _make_model()
-        assert model._atomic_energies_buf is None
+        assert model._energies_buf is None
         model._ensure_compute_buffers(
-            N=4, B=1, dtype=torch.float32, device=torch.device("cpu")
+            B=1, dtype=torch.float32, device=torch.device("cpu")
         )
-        assert isinstance(model._atomic_energies_buf, torch.Tensor)
-        assert isinstance(model._forces_buf, torch.Tensor)
-        assert isinstance(model._virials_buf, torch.Tensor)
         assert isinstance(model._energies_buf, torch.Tensor)
 
-    def test_buffer_shapes_after_first_call(self):
+    def test_accumulator_shape_after_first_call(self):
         model = _make_model()
         model._ensure_compute_buffers(
-            N=6, B=2, dtype=torch.float32, device=torch.device("cpu")
+            B=2, dtype=torch.float32, device=torch.device("cpu")
         )
-        assert model._atomic_energies_buf.shape == (6,)
-        assert model._forces_buf.shape == (6, 3)
-        assert model._virials_buf.shape == (2, 9)
         assert model._energies_buf.shape == (2,)
 
-    def test_no_realloc_when_shapes_unchanged(self):
+    def test_no_realloc_when_shape_unchanged(self):
         model = _make_model()
         model._ensure_compute_buffers(
-            N=4, B=1, dtype=torch.float32, device=torch.device("cpu")
+            B=1, dtype=torch.float32, device=torch.device("cpu")
         )
-        original_ae = model._atomic_energies_buf
-        original_f = model._forces_buf
+        original = model._energies_buf
         model._ensure_compute_buffers(
-            N=4, B=1, dtype=torch.float32, device=torch.device("cpu")
+            B=1, dtype=torch.float32, device=torch.device("cpu")
         )
-        assert model._atomic_energies_buf is original_ae
-        assert model._forces_buf is original_f
+        assert model._energies_buf is original
 
-    def test_reallocates_when_N_changes(self):
+    def test_reallocates_when_B_changes(self):
         model = _make_model()
         model._ensure_compute_buffers(
-            N=4, B=1, dtype=torch.float32, device=torch.device("cpu")
+            B=1, dtype=torch.float32, device=torch.device("cpu")
         )
-        original_ae = model._atomic_energies_buf
+        original = model._energies_buf
         model._ensure_compute_buffers(
-            N=8, B=1, dtype=torch.float32, device=torch.device("cpu")
+            B=2, dtype=torch.float32, device=torch.device("cpu")
         )
-        assert model._atomic_energies_buf is not original_ae
-        assert model._atomic_energies_buf.shape == (8,)
+        assert model._energies_buf is not original
+        assert model._energies_buf.shape == (2,)
 
 
 # ---------------------------------------------------------------------------
@@ -343,11 +325,11 @@ class TestAdaptInput:
         result = model.adapt_input(batch)
         assert result["cells"] is None
 
-    def test_neighbor_shifts_none_when_no_neighbor_shifts(self):
+    def test_neighbor_matrix_shifts_none_when_no_neighbor_matrix_shifts(self):
         model = _make_model()
         batch = _make_lj_batch()
         result = model.adapt_input(batch)
-        assert result["neighbor_shifts"] is None
+        assert result["neighbor_matrix_shifts"] is None
 
     def test_cells_returned_when_present(self):
         model = _make_model()
@@ -357,13 +339,13 @@ class TestAdaptInput:
         result = model.adapt_input(batch)
         assert result["cells"] is not None
 
-    def test_neighbor_shifts_returned_when_present(self):
+    def test_neighbor_matrix_shifts_returned_when_present(self):
         model = _make_model()
         batch = _make_lj_batch(n_atoms=4, max_neighbors=8)
         shifts = torch.zeros(4, 8, 3, dtype=torch.int32)
-        object.__setattr__(batch, "neighbor_shifts", shifts)
+        object.__setattr__(batch, "neighbor_matrix_shifts", shifts)
         result = model.adapt_input(batch)
-        assert result["neighbor_shifts"] is not None
+        assert result["neighbor_matrix_shifts"] is not None
 
 
 # ---------------------------------------------------------------------------
@@ -378,63 +360,88 @@ class TestAdaptOutput:
         self, include_virials: bool = False, include_stresses: bool = False
     ):
         output = {
-            "energies": torch.tensor([[1.0]]),
+            "energy": torch.tensor([[1.0]]),
             "forces": torch.randn(4, 3),
         }
         if include_virials:
-            output["virials"] = torch.randn(1, 3, 3)
+            output["virial"] = torch.randn(1, 3, 3)
         if include_stresses:
-            output["stresses"] = torch.randn(1, 3, 3)
+            output["stress"] = torch.randn(1, 3, 3)
         return output
 
-    def test_energies_always_in_output(self):
+    def test_energies_always_in_output(
+        self,
+    ):
         model = _make_model()
         batch = _make_lj_batch()
-        result = model.adapt_output(self._model_output(), batch)
-        assert "energies" in result
+        result = model.adapt_output(self._model_output(include_stresses=True), batch)
+        assert "energy" in result
 
     def test_forces_in_output_when_compute_forces_true(self):
         model = _make_model()
-        model.model_config.compute_forces = True
+        model.model_config.active_outputs = {"energy", "forces"}
         batch = _make_lj_batch()
         result = model.adapt_output(self._model_output(), batch)
         assert "forces" in result
 
     def test_forces_not_in_output_when_compute_forces_false(self):
         model = _make_model()
-        model.model_config.compute_forces = False
+        model.model_config.active_outputs = {"energy"}
         batch = _make_lj_batch()
         result = model.adapt_output(self._model_output(), batch)
         assert "forces" not in result
 
     def test_stresses_not_in_output_when_compute_stresses_false(self):
         model = _make_model()
-        model.model_config.compute_stresses = False
+        model.model_config.active_outputs = {"energy", "forces"}
         batch = _make_lj_batch()
         result = model.adapt_output(self._model_output(include_virials=True), batch)
-        assert "stresses" not in result
+        assert "stress" not in result
 
-    def test_stresses_negated_virials_when_compute_stresses_true_and_virials_key(self):
+    def test_stresses_equal_virial_over_volume(self):
         model = _make_model()
-        model.model_config.compute_stresses = True
+        model.model_config.active_outputs = {"energy", "forces", "stress"}
         batch = _make_lj_batch()
+        # Add cell so volume can be computed.
+        batch.cell = torch.eye(3).unsqueeze(0)
+        batch.pbc = torch.ones(1, 3, dtype=torch.bool)
         virials = torch.randn(1, 3, 3)
         mo = self._model_output()
-        mo["virials"] = virials
+        mo["virial"] = virials
         result = model.adapt_output(mo, batch)
-        assert "stresses" in result
-        assert torch.allclose(result["stresses"], -virials)
+        assert "stress" in result
+        volume = torch.det(batch.cell).abs().view(-1, 1, 1)
+        assert torch.allclose(result["stress"], virials / volume)
 
     def test_stresses_is_stresses_when_no_virials_key(self):
         model = _make_model()
-        model.model_config.compute_stresses = True
+        model.model_config.active_outputs = {"energy", "forces", "stress"}
         batch = _make_lj_batch()
         stresses = torch.randn(1, 3, 3)
         mo = self._model_output()
-        mo["stresses"] = stresses
+        mo["stress"] = stresses
         result = model.adapt_output(mo, batch)
-        assert "stresses" in result
-        assert torch.allclose(result["stresses"], stresses)
+        assert "stress" in result
+        assert torch.allclose(result["stress"], stresses)
+
+    def test_adapt_output_stress_raises_without_cell(self):
+        model = _make_model()
+        model.model_config.active_outputs = {"energy", "forces", "stress"}
+        batch = _make_lj_batch()  # no cell
+        mo = self._model_output()
+        mo["virial"] = torch.randn(1, 3, 3)
+        with pytest.raises(ValueError, match="stress output requires cell"):
+            model.adapt_output(mo, batch)
+
+    def test_adapt_output_stress_raises_when_missing(self):
+        """RuntimeError when stress is active but model_output has neither virial nor stress."""
+        model = _make_model()
+        model.model_config.active_outputs = {"energy", "forces", "stress"}
+        batch = _make_lj_batch()
+        batch.cell = torch.eye(3).unsqueeze(0)
+        mo = self._model_output()
+        with pytest.raises(RuntimeError, match="missing from model output"):
+            model.adapt_output(mo, batch)
 
 
 # ---------------------------------------------------------------------------
@@ -447,22 +454,22 @@ class TestOutputData:
 
     def test_energies_always_in_output_data(self):
         model = _make_model()
-        assert "energies" in model.output_data()
+        assert "energy" in model.output_data()
 
     def test_forces_in_output_data_when_compute_forces_true(self):
         model = _make_model()
-        model.model_config.compute_forces = True
+        model.model_config.active_outputs = {"energy", "forces"}
         assert "forces" in model.output_data()
 
     def test_stresses_in_output_data_when_compute_stresses_true(self):
         model = _make_model()
-        model.model_config.compute_stresses = True
-        assert "stresses" in model.output_data()
+        model.model_config.active_outputs = {"energy", "forces", "stress"}
+        assert "stress" in model.output_data()
 
     def test_stresses_not_in_output_data_when_compute_stresses_false(self):
         model = _make_model()
-        model.model_config.compute_stresses = False
-        assert "stresses" not in model.output_data()
+        model.model_config.active_outputs = {"energy", "forces"}
+        assert "stress" not in model.output_data()
 
 
 # ---------------------------------------------------------------------------

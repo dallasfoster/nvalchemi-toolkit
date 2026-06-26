@@ -83,7 +83,7 @@ def _make_simple_coo(dtype, device):
     Edges: (0,1) d=1, (1,0) d=1, (1,2) d=2, (2,1) d=2, (0,2) d=3, (2,0) d=3
     ptr: [0, 2, 4, 6, 6]  (atom 3 has no neighbors)
 
-    Returns edge_index in (E, 2) convention: column 0 = source, column 1 = target.
+    Returns neighbor_list in (E, 2) convention: column 0 = source, column 1 = target.
     """
     positions = torch.tensor(
         [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
@@ -91,13 +91,13 @@ def _make_simple_coo(dtype, device):
         device=device,
     )
     # (E, 2): each row is [source, target]
-    edge_index = torch.tensor(
+    neighbor_list = torch.tensor(
         [[0, 1], [0, 2], [1, 0], [1, 2], [2, 0], [2, 1]],
         dtype=torch.int32,
         device=device,
     )
     ptr = torch.tensor([0, 2, 4, 6, 6], dtype=torch.int32, device=device)
-    return positions, edge_index, ptr
+    return positions, neighbor_list, ptr
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +180,7 @@ class TestFilterNeighborMatrix:
                 )
 
     def test_pbc_single_cell_expands_effective_distance(self, dtype, device):
-        """With a PBC cell and non-zero shifts, distances should include the shift."""
+        """With a PBC cell and non-zero neighbor_matrix_shifts, distances should include the shift."""
         # Place two atoms far apart in direct space but a shift of (1,0,0) brings
         # them close.  Cell = 5*I, so shift (1,0,0) -> Cartesian (+5, 0, 0).
         # atom 0 at (0,0,0), atom 1 at (4.5, 0, 0).
@@ -193,7 +193,7 @@ class TestFilterNeighborMatrix:
         cell = 5.0 * torch.eye(3, dtype=dtype, device=device)
         nm = torch.tensor([[1, 2], [0, 2]], dtype=torch.int32, device=device)
         nn_ = torch.tensor([1, 1], dtype=torch.int32, device=device)
-        shifts = torch.tensor(
+        neighbor_matrix_shifts = torch.tensor(
             [[[-1, 0, 0], [0, 0, 0]], [[1, 0, 0], [0, 0, 0]]],
             dtype=torch.int32,
             device=device,
@@ -207,7 +207,7 @@ class TestFilterNeighborMatrix:
             num_neighbors=nn_,
             fill_value=fill_value,
             cell=cell,
-            neighbor_shifts=shifts,
+            neighbor_matrix_shifts=neighbor_matrix_shifts,
         )
 
         # Both atoms should retain their neighbor through the PBC image.
@@ -244,11 +244,15 @@ class TestFilterNeighborMatrix:
             device=device,
         )
         nn_ = torch.tensor([1, 1, 1, 1], dtype=torch.int32, device=device)
-        shifts = torch.zeros(4, 2, 3, dtype=torch.int32, device=device)
+        neighbor_matrix_shifts = torch.zeros(4, 2, 3, dtype=torch.int32, device=device)
         # Atom 0 (sys 0) seeing atom 1 through shift (-1,0,0).
-        shifts[0, 0] = torch.tensor([-1, 0, 0], dtype=torch.int32, device=device)
+        neighbor_matrix_shifts[0, 0] = torch.tensor(
+            [-1, 0, 0], dtype=torch.int32, device=device
+        )
         # Atom 1 (sys 0) seeing atom 0 through shift (+1,0,0).
-        shifts[1, 0] = torch.tensor([1, 0, 0], dtype=torch.int32, device=device)
+        neighbor_matrix_shifts[1, 0] = torch.tensor(
+            [1, 0, 0], dtype=torch.int32, device=device
+        )
 
         nm_out, nn_out, _ = filter_neighbor_matrix(
             positions=positions,
@@ -257,7 +261,7 @@ class TestFilterNeighborMatrix:
             num_neighbors=nn_,
             fill_value=fill_value,
             cell=cell,
-            neighbor_shifts=shifts,
+            neighbor_matrix_shifts=neighbor_matrix_shifts,
             batch_idx=batch_idx,
         )
 
@@ -269,14 +273,16 @@ class TestFilterNeighborMatrix:
         assert int(nn_out[3]) == 1
 
     def test_neighbor_shifts_output_matches_defragmented_matrix(self, dtype, device):
-        """Returned shifts must correspond to the same reordering as nm_out."""
+        """Returned neighbor_matrix_shifts must correspond to the same reordering as nm_out."""
         positions, nm, nn_, fill_value = _make_simple_4atom(dtype, device)
         N, K = nm.shape
-        # Assign distinct shifts so we can track which got kept.
-        shifts = torch.zeros(N, K, 3, dtype=torch.int32, device=device)
+        # Assign distinct neighbor_matrix_shifts so we can track which got kept.
+        neighbor_matrix_shifts = torch.zeros(N, K, 3, dtype=torch.int32, device=device)
         for i in range(N):
             for k in range(K):
-                shifts[i, k] = torch.tensor([i * 10 + k, 0, 0], dtype=torch.int32)
+                neighbor_matrix_shifts[i, k] = torch.tensor(
+                    [i * 10 + k, 0, 0], dtype=torch.int32
+                )
 
         nm_out, nn_out, shifts_out = filter_neighbor_matrix(
             positions=positions,
@@ -284,14 +290,14 @@ class TestFilterNeighborMatrix:
             neighbor_matrix=nm,
             num_neighbors=nn_,
             fill_value=fill_value,
-            neighbor_shifts=shifts,
+            neighbor_matrix_shifts=neighbor_matrix_shifts,
         )
 
         assert shifts_out is not None
         assert shifts_out.shape == (N, K, 3)
 
         # For each atom, check that the shift at slot k aligns with the neighbor
-        # at nm_out[i, k] (cross-check against the original nm/shifts).
+        # at nm_out[i, k] (cross-check against the original nm/neighbor_matrix_shifts).
         orig_nm_flat = {
             (i, int(nm[i, k])): k
             for i in range(N)
@@ -303,12 +309,14 @@ class TestFilterNeighborMatrix:
                 j = int(nm_out[i, k])
                 orig_k = orig_nm_flat.get((i, j))
                 assert orig_k is not None
-                assert torch.equal(shifts_out[i, k], shifts[i, orig_k]), (
+                assert torch.equal(
+                    shifts_out[i, k], neighbor_matrix_shifts[i, orig_k]
+                ), (
                     f"shift mismatch at atom {i} slot {k}: got {shifts_out[i, k]}, "
-                    f"expected {shifts[i, orig_k]}"
+                    f"expected {neighbor_matrix_shifts[i, orig_k]}"
                 )
 
-        # Slots beyond nn_out should have zero-filled shifts.
+        # Slots beyond nn_out should have zero-filled neighbor_matrix_shifts.
         for i in range(N):
             count = int(nn_out[i])
             assert torch.all(shifts_out[i, count:] == 0)
@@ -382,7 +390,9 @@ class TestFilterNeighborMatrix:
     def test_output_shapes(self, dtype, device):
         """Output shapes must match input shapes."""
         positions, nm, nn_, fill_value = _make_simple_4atom(dtype, device)
-        shifts = torch.zeros(*nm.shape, 3, dtype=torch.int32, device=device)
+        neighbor_matrix_shifts = torch.zeros(
+            *nm.shape, 3, dtype=torch.int32, device=device
+        )
 
         nm_out, nn_out, shifts_out = filter_neighbor_matrix(
             positions=positions,
@@ -390,16 +400,16 @@ class TestFilterNeighborMatrix:
             neighbor_matrix=nm,
             num_neighbors=nn_,
             fill_value=fill_value,
-            neighbor_shifts=shifts,
+            neighbor_matrix_shifts=neighbor_matrix_shifts,
         )
 
         assert nm_out.shape == nm.shape
         assert nn_out.shape == nn_.shape
         assert shifts_out is not None
-        assert shifts_out.shape == shifts.shape
+        assert shifts_out.shape == neighbor_matrix_shifts.shape
 
     def test_no_shifts_input_returns_none_shifts(self, dtype, device):
-        """When neighbor_shifts is None, the output shifts must also be None."""
+        """When neighbor_matrix_shifts is None, the output must also be None."""
         positions, nm, nn_, fill_value = _make_simple_4atom(dtype, device)
 
         _, _, shifts_out = filter_neighbor_matrix(
@@ -408,7 +418,7 @@ class TestFilterNeighborMatrix:
             neighbor_matrix=nm,
             num_neighbors=nn_,
             fill_value=fill_value,
-            neighbor_shifts=None,
+            neighbor_matrix_shifts=None,
         )
 
         assert shifts_out is None
@@ -422,13 +432,13 @@ class TestFilterNeighborMatrix:
 class TestFilterNeighborList:
     def test_basic_filtering_removes_distant_edges(self, dtype, device):
         """Edges beyond cutoff must be removed from the COO list."""
-        positions, edge_index, ptr = _make_simple_coo(dtype, device)
+        positions, neighbor_list, ptr = _make_simple_coo(dtype, device)
 
         # cutoff=1.5: only d=1 edges survive ((0,1) and (1,0)).
         nl_out, ptr_out, _ = filter_neighbor_list(
             positions=positions,
             cutoff=1.5,
-            neighbor_list=edge_index,
+            neighbor_list=neighbor_list,
             neighbor_ptr=ptr,
         )
 
@@ -443,7 +453,7 @@ class TestFilterNeighborList:
 
     def test_neighbor_ptr_rebuilt_correctly(self, dtype, device):
         """CSR pointer after filtering must reflect the new per-atom edge counts."""
-        positions, edge_index, ptr = _make_simple_coo(dtype, device)
+        positions, neighbor_list, ptr = _make_simple_coo(dtype, device)
 
         # cutoff=2.5: d=1 and d=2 edges survive.
         # Surviving: (0,1)d=1, (1,0)d=1, (1,2)d=2, (2,1)d=2  -> 4 edges
@@ -451,7 +461,7 @@ class TestFilterNeighborList:
         nl_out, ptr_out, _ = filter_neighbor_list(
             positions=positions,
             cutoff=2.5,
-            neighbor_list=edge_index,
+            neighbor_list=neighbor_list,
             neighbor_ptr=ptr,
         )
 
@@ -467,8 +477,8 @@ class TestFilterNeighborList:
         for i in range(4):
             assert int(ptr_out[i + 1]) - int(ptr_out[i]) == counts_from_nl[i]
 
-    def test_pbc_unit_shifts_applied(self, dtype, device):
-        """Edges kept only because of PBC shift must survive when shifts are provided."""
+    def test_pbc_neighbor_list_shifts_applied(self, dtype, device):
+        """Edges kept only because of PBC shift must survive when neighbor_list_shifts are provided."""
         # Same setup as the single-cell PBC matrix test.
         positions = torch.tensor(
             [[0.0, 0.0, 0.0], [4.5, 0.0, 0.0]], dtype=dtype, device=device
@@ -476,19 +486,19 @@ class TestFilterNeighborList:
         cell = 5.0 * torch.eye(3, dtype=dtype, device=device)
         # Both edges: (0->1) with shift (-1,0,0) and (1->0) with shift (+1,0,0).
         # (E, 2) convention: each row is [source, target]
-        edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
+        neighbor_list = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
         ptr = torch.tensor([0, 1, 2], dtype=torch.int32, device=device)
-        unit_shifts = torch.tensor(
+        neighbor_list_shifts = torch.tensor(
             [[-1, 0, 0], [1, 0, 0]], dtype=torch.int32, device=device
         )
 
         nl_out, ptr_out, us_out = filter_neighbor_list(
             positions=positions,
             cutoff=2.0,
-            neighbor_list=edge_index,
+            neighbor_list=neighbor_list,
             neighbor_ptr=ptr,
             cell=cell,
-            unit_shifts=unit_shifts,
+            neighbor_list_shifts=neighbor_list_shifts,
         )
 
         # Both edges survive because PBC image distances are 0.5.
@@ -517,11 +527,11 @@ class TestFilterNeighborList:
         )
         batch_idx = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device=device)
         # Edges for both systems. (E, 2) convention: each row is [source, target]
-        edge_index = torch.tensor(
+        neighbor_list = torch.tensor(
             [[0, 1], [1, 0], [2, 3], [3, 2]], dtype=torch.int32, device=device
         )
         ptr = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device=device)
-        unit_shifts = torch.tensor(
+        neighbor_list_shifts = torch.tensor(
             [[-1, 0, 0], [1, 0, 0], [0, 0, 0], [0, 0, 0]],
             dtype=torch.int32,
             device=device,
@@ -530,39 +540,39 @@ class TestFilterNeighborList:
         nl_out, ptr_out, us_out = filter_neighbor_list(
             positions=positions,
             cutoff=2.0,
-            neighbor_list=edge_index,
+            neighbor_list=neighbor_list,
             neighbor_ptr=ptr,
             cell=cell,
-            unit_shifts=unit_shifts,
+            neighbor_list_shifts=neighbor_list_shifts,
             batch_idx=batch_idx,
         )
 
         # All 4 edges should survive (sys0 via PBC d=0.5, sys1 direct d=1.0).
         assert nl_out.shape[0] == 4
 
-    def test_none_unit_shifts_returns_none(self, dtype, device):
-        """When unit_shifts input is None, output must also be None."""
-        positions, edge_index, ptr = _make_simple_coo(dtype, device)
+    def test_none_neighbor_list_shifts_returns_none(self, dtype, device):
+        """When neighbor_list_shifts input is None, output must also be None."""
+        positions, neighbor_list, ptr = _make_simple_coo(dtype, device)
 
         _, _, us_out = filter_neighbor_list(
             positions=positions,
             cutoff=5.0,
-            neighbor_list=edge_index,
+            neighbor_list=neighbor_list,
             neighbor_ptr=ptr,
-            unit_shifts=None,
+            neighbor_list_shifts=None,
         )
 
         assert us_out is None
 
     def test_output_shapes(self, dtype, device):
         """Output ptr must always have shape (N+1,)."""
-        positions, edge_index, ptr = _make_simple_coo(dtype, device)
+        positions, neighbor_list, ptr = _make_simple_coo(dtype, device)
         N = positions.shape[0]
 
         _, ptr_out, _ = filter_neighbor_list(
             positions=positions,
             cutoff=2.0,
-            neighbor_list=edge_index,
+            neighbor_list=neighbor_list,
             neighbor_ptr=ptr,
         )
 
@@ -570,13 +580,13 @@ class TestFilterNeighborList:
 
     def test_all_edges_removed(self, dtype, device):
         """With cutoff below all pair distances, output edge list must be empty."""
-        positions, edge_index, ptr = _make_simple_coo(dtype, device)
+        positions, neighbor_list, ptr = _make_simple_coo(dtype, device)
         N = positions.shape[0]
 
         nl_out, ptr_out, _ = filter_neighbor_list(
             positions=positions,
             cutoff=0.001,
-            neighbor_list=edge_index,
+            neighbor_list=neighbor_list,
             neighbor_ptr=ptr,
         )
 
@@ -586,16 +596,16 @@ class TestFilterNeighborList:
 
     def test_all_edges_survive(self, dtype, device):
         """With large cutoff, all edges must survive and ptr must match input."""
-        positions, edge_index, ptr = _make_simple_coo(dtype, device)
+        positions, neighbor_list, ptr = _make_simple_coo(dtype, device)
 
         nl_out, ptr_out, _ = filter_neighbor_list(
             positions=positions,
             cutoff=100.0,
-            neighbor_list=edge_index,
+            neighbor_list=neighbor_list,
             neighbor_ptr=ptr,
         )
 
-        assert nl_out.shape[0] == edge_index.shape[0]
+        assert nl_out.shape[0] == neighbor_list.shape[0]
         assert torch.equal(ptr_out, ptr)
 
 
@@ -606,7 +616,7 @@ class TestFilterNeighborList:
 
 class TestNeighborMatrixToList:
     def test_edge_index_source_and_target(self, dtype, device):
-        """edge_index[:, 0] must be source (i) indices, edge_index[:, 1] target (j)."""
+        """neighbor_list[:, 0] must be source (i) indices, neighbor_list[:, 1] target (j)."""
         positions, nm, nn_, fill_value = _make_simple_4atom(dtype, device)
 
         nl, ptr, _ = neighbor_matrix_to_list(
@@ -673,14 +683,14 @@ class TestNeighborMatrixToList:
         assert nl.shape[0] == int(nn_.sum())
 
     def test_without_shifts_returns_none(self, dtype, device):
-        """When neighbor_shifts is None, unit_shifts output must be None."""
+        """When neighbor_matrix_shifts is None, neighbor_list_shifts output must be None."""
         positions, nm, nn_, fill_value = _make_simple_4atom(dtype, device)
 
         _, _, us_out = neighbor_matrix_to_list(
             neighbor_matrix=nm,
             num_neighbors=nn_,
             fill_value=fill_value,
-            neighbor_shifts=None,
+            neighbor_matrix_shifts=None,
         )
 
         assert us_out is None
@@ -689,17 +699,19 @@ class TestNeighborMatrixToList:
         """Shift vectors for valid pairs must be extracted correctly."""
         positions, nm, nn_, fill_value = _make_simple_4atom(dtype, device)
         N, K = nm.shape
-        # Unique shifts so we can verify correct extraction.
-        shifts = torch.zeros(N, K, 3, dtype=torch.int32, device=device)
+        # Unique neighbor_matrix_shifts so we can verify correct extraction.
+        neighbor_matrix_shifts = torch.zeros(N, K, 3, dtype=torch.int32, device=device)
         for i in range(N):
             for k in range(K):
-                shifts[i, k] = torch.tensor([i * 10 + k, i, k], dtype=torch.int32)
+                neighbor_matrix_shifts[i, k] = torch.tensor(
+                    [i * 10 + k, i, k], dtype=torch.int32
+                )
 
         nl, ptr, us_out = neighbor_matrix_to_list(
             neighbor_matrix=nm,
             num_neighbors=nn_,
             fill_value=fill_value,
-            neighbor_shifts=shifts,
+            neighbor_matrix_shifts=neighbor_matrix_shifts,
         )
 
         M = nl.shape[0]
@@ -719,8 +731,8 @@ class TestNeighborMatrixToList:
             i = int(nl[e, 0])
             j = int(nl[e, 1])
             k = lookup[(i, j)]
-            assert torch.equal(us_out[e], shifts[i, k]), (
-                f"edge ({i},{j}): shift {us_out[e]} != expected {shifts[i, k]}"
+            assert torch.equal(us_out[e], neighbor_matrix_shifts[i, k]), (
+                f"edge ({i},{j}): shift {us_out[e]} != expected {neighbor_matrix_shifts[i, k]}"
             )
 
     def test_variable_num_neighbors_per_atom(self, dtype, device):
@@ -774,7 +786,7 @@ def _make_matrix_data(dtype, device, cutoff=None):
         num_neighbors=nn_,
         batch=torch.zeros(4, dtype=torch.int32, device=device),
         num_nodes=4,
-        edge_index=None,
+        neighbor_list=None,
     )
     if cutoff is not None:
         data._neighbor_list_cutoff = cutoff
@@ -783,11 +795,11 @@ def _make_matrix_data(dtype, device, cutoff=None):
 
 def _make_coo_data(dtype, device, cutoff=None):
     """Build a SimpleNamespace mimicking a Batch with COO neighbor data."""
-    positions, edge_index, ptr = _make_simple_coo(dtype, device)
+    positions, neighbor_list, ptr = _make_simple_coo(dtype, device)
     data = types.SimpleNamespace(
         positions=positions,
         neighbor_matrix=None,
-        edge_index=edge_index,  # (E, 2) — nvalchemi convention
+        neighbor_list=neighbor_list,  # (E, 2) — nvalchemi convention
         edge_ptr=ptr,
         batch=torch.zeros(4, dtype=torch.int32, device=device),
         num_nodes=4,
@@ -864,9 +876,9 @@ class TestPrepareNeighborsForModel:
             fill_value=fill_value,
         )
 
-        assert "edge_index" in result
+        assert "neighbor_list" in result
         assert "edge_ptr" in result
-        nl = result["edge_index"]
+        nl = result["neighbor_list"]
         ptr = result["edge_ptr"]
         assert nl.shape[1] == 2
         assert int(ptr[0]) == 0
@@ -884,7 +896,7 @@ class TestPrepareNeighborsForModel:
             fill_value=fill_value,
         )
 
-        nl = result["edge_index"]
+        nl = result["neighbor_list"]
         # Only d=1 pair survives: edges (0,1) and (1,0).
         assert nl.shape[0] == 2
         edges_set = {(int(nl[e, 0]), int(nl[e, 1])) for e in range(nl.shape[0])}
@@ -903,9 +915,9 @@ class TestPrepareNeighborsForModel:
             fill_value=999,
         )
 
-        assert "edge_index" in result
+        assert "neighbor_list" in result
         assert "edge_ptr" in result
-        assert torch.equal(result["edge_index"], data.edge_index)
+        assert torch.equal(result["neighbor_list"], data.neighbor_list)
         assert torch.equal(result["edge_ptr"], data.edge_ptr)
 
     def test_coo_to_coo_with_filtering(self, dtype, device):
@@ -919,7 +931,7 @@ class TestPrepareNeighborsForModel:
             fill_value=999,
         )
 
-        nl = result["edge_index"]
+        nl = result["neighbor_list"]
         # Only d=1 pair survives.
         assert nl.shape[0] == 2
 
@@ -934,17 +946,17 @@ class TestPrepareNeighborsForModel:
             fill_value=999,
         )
 
-        assert torch.equal(result["edge_index"], data.edge_index)
+        assert torch.equal(result["neighbor_list"], data.neighbor_list)
         assert torch.equal(result["edge_ptr"], data.edge_ptr)
 
     # ---- Error cases ----
 
     def test_raises_runtime_error_when_no_neighbor_data(self, dtype, device):
-        """RuntimeError must be raised when neither neighbor_matrix nor edge_index present."""
+        """RuntimeError must be raised when neither neighbor_matrix nor neighbor_list present."""
         data = types.SimpleNamespace(
             positions=torch.zeros(4, 3, dtype=dtype, device=device),
             neighbor_matrix=None,
-            edge_index=None,
+            neighbor_list=None,
             batch=torch.zeros(4, dtype=torch.int32, device=device),
             num_nodes=4,
         )
@@ -971,13 +983,15 @@ class TestPrepareNeighborsForModel:
                 fill_value=999,
             )
 
-    # ---- neighbor_shifts propagation ----
+    # ---- neighbor_matrix_shifts propagation ----
 
-    def test_neighbor_shifts_in_matrix_output(self, dtype, device):
-        """neighbor_shifts key present in output when data has neighbor_shifts."""
+    def test_neighbor_matrix_shifts_in_matrix_output(self, dtype, device):
+        """neighbor_matrix_shifts key present in output when data has neighbor_matrix_shifts."""
         data, fill_value = _make_matrix_data(dtype, device, cutoff=None)
         N, K = data.neighbor_matrix.shape
-        data.neighbor_shifts = torch.zeros(N, K, 3, dtype=torch.int32, device=device)
+        data.neighbor_matrix_shifts = torch.zeros(
+            N, K, 3, dtype=torch.int32, device=device
+        )
 
         result = prepare_neighbors_for_model(
             data=data,
@@ -986,13 +1000,15 @@ class TestPrepareNeighborsForModel:
             fill_value=fill_value,
         )
 
-        assert "neighbor_shifts" in result
+        assert "neighbor_matrix_shifts" in result
 
-    def test_unit_shifts_in_coo_output_from_matrix(self, dtype, device):
-        """unit_shifts key present in COO output when matrix had neighbor_shifts."""
+    def test_neighbor_list_shifts_in_coo_output_from_matrix(self, dtype, device):
+        """neighbor_list_shifts key present in COO output when matrix had neighbor_matrix_shifts."""
         data, fill_value = _make_matrix_data(dtype, device, cutoff=None)
         N, K = data.neighbor_matrix.shape
-        data.neighbor_shifts = torch.zeros(N, K, 3, dtype=torch.int32, device=device)
+        data.neighbor_matrix_shifts = torch.zeros(
+            N, K, 3, dtype=torch.int32, device=device
+        )
 
         result = prepare_neighbors_for_model(
             data=data,
@@ -1001,14 +1017,14 @@ class TestPrepareNeighborsForModel:
             fill_value=fill_value,
         )
 
-        assert "unit_shifts" in result
-        assert result["unit_shifts"].shape[1] == 3
+        assert "neighbor_list_shifts" in result
+        assert result["neighbor_list_shifts"].shape[1] == 3
 
-    def test_unit_shifts_in_coo_output_from_coo(self, dtype, device):
-        """unit_shifts key present in COO output when COO input had unit_shifts."""
+    def test_neighbor_list_shifts_in_coo_output_from_coo(self, dtype, device):
+        """neighbor_list_shifts key present in COO output when COO input had neighbor_list_shifts."""
         data = _make_coo_data(dtype, device, cutoff=None)
-        M = data.edge_index.shape[0]
-        data.unit_shifts = torch.zeros(M, 3, dtype=torch.int32, device=device)
+        M = data.neighbor_list.shape[0]
+        data.neighbor_list_shifts = torch.zeros(M, 3, dtype=torch.int32, device=device)
 
         result = prepare_neighbors_for_model(
             data=data,
@@ -1017,10 +1033,10 @@ class TestPrepareNeighborsForModel:
             fill_value=999,
         )
 
-        assert "unit_shifts" in result
+        assert "neighbor_list_shifts" in result
 
     def test_no_shifts_key_absent_in_output(self, dtype, device):
-        """When no shifts present in data, output dict must not contain shift keys."""
+        """When no neighbor_list_shifts present in data, output dict must not contain shift keys."""
         data, fill_value = _make_matrix_data(dtype, device, cutoff=None)
 
         result_matrix = prepare_neighbors_for_model(
@@ -1029,7 +1045,7 @@ class TestPrepareNeighborsForModel:
             target_format=NeighborListFormat.MATRIX,
             fill_value=fill_value,
         )
-        assert "neighbor_shifts" not in result_matrix
+        assert "neighbor_matrix_shifts" not in result_matrix
 
         result_coo = prepare_neighbors_for_model(
             data=data,
@@ -1037,4 +1053,4 @@ class TestPrepareNeighborsForModel:
             target_format=NeighborListFormat.COO,
             fill_value=fill_value,
         )
-        assert "unit_shifts" not in result_coo
+        assert "neighbor_list_shifts" not in result_coo

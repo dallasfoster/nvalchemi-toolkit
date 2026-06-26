@@ -44,7 +44,7 @@ def _make_atomic_data(
         atomic_numbers=torch.randint(1, 10, (n_atoms,), dtype=torch.long, generator=g),
         atomic_masses=torch.ones(n_atoms),
         forces=torch.zeros(n_atoms, 3),
-        energies=torch.zeros(1, 1),
+        energy=torch.zeros(1, 1),
     )
     if with_cell:
         kwargs["cell"] = torch.eye(3).unsqueeze(0)
@@ -77,21 +77,20 @@ def _make_stress_model():
     """
     from collections import OrderedDict
 
-    from nvalchemi.models.base import ModelCard
-    from nvalchemi.models.demo import DemoModelWrapper
+    from nvalchemi.models.base import ModelConfig
+    from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
     class _Wrapper(DemoModelWrapper):
-        @property
-        def model_card(self):
-            base = super().model_card
-            return ModelCard(
-                forces_via_autograd=base.forces_via_autograd,
-                supports_energies=base.supports_energies,
-                supports_forces=base.supports_forces,
-                supports_stresses=True,
-                supports_hessians=base.supports_hessians,
-                supports_dipoles=base.supports_dipoles,
-                supports_non_batch=base.supports_non_batch,
+        def __init__(self):
+            super().__init__(DemoModel())
+            base = self.model_config
+            self.model_config = ModelConfig(
+                outputs=frozenset(set(base.outputs) | {"stress"}),
+                autograd_outputs=base.autograd_outputs,
+                autograd_inputs=base.autograd_inputs,
+                required_inputs=base.required_inputs,
+                optional_inputs=base.optional_inputs,
+                supports_pbc=base.supports_pbc,
                 neighbor_config=base.neighbor_config,
                 needs_pbc=base.needs_pbc,
             )
@@ -100,7 +99,7 @@ def _make_stress_model():
             M = data.num_graphs if hasattr(data, "num_graphs") else 1
             return OrderedDict(
                 [
-                    ("energies", model_output["energies"]),
+                    ("energy", model_output["energy"]),
                     ("forces", model_output["forces"]),
                     (
                         "stress",
@@ -119,11 +118,11 @@ def _make_stress_model():
 
 
 def _make_model(needs_stress: bool = False):
-    from nvalchemi.models.demo import DemoModelWrapper
+    from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
     if needs_stress:
         return _make_stress_model()
-    return DemoModelWrapper()
+    return DemoModelWrapper(DemoModel())
 
 
 # ---------------------------------------------------------------------------
@@ -605,13 +604,30 @@ class _MockSampler:
         # Eagerly reflect exhausted state so base.py can snapshot it before requesting
         self.exhausted = len(self._queue) == 0
 
-    def request_replacement(self, n_atoms: int, n_edges: int):
+    @property
+    def max_atoms(self) -> int | None:
+        return None
+
+    @property
+    def max_edges(self) -> int | None:
+        return None
+
+    @property
+    def max_batch_size(self) -> int | None:
+        return None
+
+    def request_replacements_budget(
+        self,
+        atom_budget: int | None = None,
+        edge_budget: int | None = None,
+        max_count: int | None = None,
+    ) -> list:
         if not self._queue:
             self.exhausted = True
-            return None
+            return []
         result = self._queue.pop(0)
         self.exhausted = len(self._queue) == 0
-        return result
+        return [result]
 
 
 class TestStateSyncInflight:

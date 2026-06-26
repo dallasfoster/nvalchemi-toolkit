@@ -42,10 +42,12 @@ from nvalchemi.dynamics._ops.velocity_verlet import (
     vv_position_update,
     vv_velocity_finalize,
 )
+from nvalchemi.dynamics._units import fs_to_internal_time
 from nvalchemi.dynamics.base import BaseDynamics
 
 if TYPE_CHECKING:
-    from nvalchemi.dynamics.base import ConvergenceHook, Hook
+    from nvalchemi.dynamics.base import ConvergenceHook
+    from nvalchemi.hooks import Hook
     from nvalchemi.models.base import BaseModelMixin
 
 __all__ = ["NVE"]
@@ -62,7 +64,7 @@ class NVE(BaseDynamics):
     model : BaseModelMixin
         The neural network potential model.
     dt : float or torch.Tensor
-        Integration timestep.  A scalar is broadcast to all systems;
+        Integration timestep in femtoseconds. A scalar is broadcast to all systems;
         a tensor of shape ``[M]`` sets per-system timesteps (useful for
         heterogeneous batches or adaptive stepping via hooks).
     n_steps : int, optional
@@ -107,7 +109,7 @@ class NVE(BaseDynamics):
             convergence_hook=convergence_hook,
             **kwargs,
         )
-        self._dt_init = dt
+        self._dt_init = fs_to_internal_time(dt)
 
     def _init_state(self, batch: Batch) -> None:
         """Allocate per-system timestep tensor.
@@ -156,7 +158,7 @@ class NVE(BaseDynamics):
             batch.forces,
             batch.atomic_masses,
             self._state.dt,
-            batch.batch.int(),
+            batch.batch_idx.int(),
         )
 
     def post_update(self, batch: Batch) -> None:
@@ -172,5 +174,5 @@ class NVE(BaseDynamics):
             batch.forces,
             batch.atomic_masses,
             self._state.dt,
-            batch.batch.int(),
+            batch.batch_idx.int(),
         )

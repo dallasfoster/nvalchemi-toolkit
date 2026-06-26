@@ -10,15 +10,22 @@ optional edges (e.g. bonds or radius-cutoff neighbors) connect them. The
 structure), and {py:class}`nvalchemi.data.Batch` batches many such graphs into one
 structure for efficient GPU-friendly training and inference.
 
+```{tip}
+**AI coding assistant?** Load the ``nvalchemi-data-structures``
+{ref}`agent skill <agent_skills>` for concise instructions on creating,
+manipulating, and batching ``AtomicData`` objects.
+```
+
 ## AtomicData: a single graph
 
 {py:class}`nvalchemi.data.AtomicData` is a Pydantic model that stores:
 
 - **Required**: `positions` (shape `[n_nodes, 3]`) and `atomic_numbers` (shape `[n_nodes]`).
 - **Optional node-level**: e.g. `atomic_masses`, `forces`, `velocities`, `node_attrs`.
-- **Optional edge-level**: `edge_index` (shape `[n_edges, 2]`) and edge attributes such
-as `shifts` for periodicity.
-- **Optional system-level**: `energies`, `cell`, `pbc`, `stresses`, `virials`, etc.
+- **Optional edge-level**: `neighbor_list` (shape `[n_edges, 2]`) and edge attributes such
+as `shifts` (Cartesian displacements) and
+`neighbor_list_shifts` (integer lattice indices) for periodicity.
+- **Optional system-level**: `energy`, `cell`, `pbc`, `stress`, `virial`, etc.
 
 All tensor fields use PyTorch tensors, so you can move them to GPU with `.to(device)` or
 use the mixin method {py:meth}`nvalchemi.data.data.DataMixin.to` for device/dtype changes.
@@ -37,7 +44,7 @@ data = AtomicData(positions=positions, atomic_numbers=atomic_numbers)
 data = AtomicData(
     positions=positions,
     atomic_numbers=atomic_numbers,
-    energies=torch.tensor([[0.0]]),
+    energy=torch.tensor([[0.0]]),
 )
 ```
 
@@ -66,12 +73,12 @@ data_list = [
     AtomicData(
         positions=torch.randn(2, 3),
         atomic_numbers=torch.ones(2, dtype=torch.long),
-        energies=torch.zeros(1, 1),
+        energy=torch.zeros(1, 1),
     ),
     AtomicData(
         positions=torch.randn(3, 3),
         atomic_numbers=torch.ones(3, dtype=torch.long),
-        energies=torch.zeros(1, 1),
+        energy=torch.zeros(1, 1),
     ),
 ]
 batch = Batch.from_data_list(data_list)
@@ -95,7 +102,7 @@ conventions. The type of index determines what you get back:
 
 When selecting multiple graphs (slice, tensor, or list), the underlying
 {py:meth}`~nvalchemi.data.batch.Batch.index_select` method operates directly on the
-concatenated storage --- it slices segments and adjusts `edge_index` offsets without
+concatenated storage --- it slices segments and adjusts `neighbor_list` offsets without
 reconstructing individual `AtomicData` objects, so it is efficient even for large
 batches.
 
@@ -119,13 +126,13 @@ gets the correct slice.
 ```python
 batch.add_key("node_feat", [torch.randn(2, 4), torch.randn(3, 4)], level="node")
 batch.add_key(
-    "energies",
+    "energy",
     [torch.tensor([[0.1]]), torch.tensor([[0.2]])],
     level="system",
     overwrite=True,
 )
 list_of_data = batch.to_data_list()
-# list_of_data[i] now has "node_feat" and "energies" with the right shapes.
+# list_of_data[i] now has "node_feat" and "energy" with the right shapes.
 ```
 
 ## Device and serialization
@@ -148,9 +155,9 @@ Every tensor attribute belongs to one of three **levels**:
 
 | Level | Storage class | Shape convention | Examples |
 |-----------|----------------------------|--------------------------------------|---------------------------------------------|
-| **system** | {py:class}`~nvalchemi.data.level_storage.UniformLevelStorage` | First dim = number of graphs | `cell`, `pbc`, `energies`, `stresses` |
+| **system** | {py:class}`~nvalchemi.data.level_storage.UniformLevelStorage` | First dim = number of graphs | `cell`, `pbc`, `energy`, `stress` |
 | **atoms** | {py:class}`~nvalchemi.data.level_storage.SegmentedLevelStorage` | Concatenated across graphs | `positions`, `atomic_numbers`, `forces` |
-| **edges** | {py:class}`~nvalchemi.data.level_storage.SegmentedLevelStorage` | Concatenated across graphs | `edge_index`, `shifts`, `edge_embeddings` |
+| **edges** | {py:class}`~nvalchemi.data.level_storage.SegmentedLevelStorage` | Concatenated across graphs | `neighbor_list`, `shifts`, `neighbor_list_shifts`, `edge_embeddings` |
 
 **Uniform storage** is straightforward: every graph contributes exactly one row, so
 the i-th graph's data is always at index `i`. System-level properties like the
@@ -161,7 +168,7 @@ are concatenated into a single tensor of shape `(total_nodes, 3)`. To know where
 graph's atoms start and end, the storage tracks `segment_lengths` and a pointer array
 `batch_ptr`. The i-th graph's nodes live at `positions[batch_ptr[i]:batch_ptr[i+1]]`.
 Edge data works the same way, with node-index offsets automatically applied to
-`edge_index` so that each graph's edges still point to the correct atoms in the
+`neighbor_list` so that each graph's edges still point to the correct atoms in the
 flattened array.
 
 The mapping from attribute name to level is determined by a
@@ -169,6 +176,44 @@ The mapping from attribute name to level is determined by a
 {py:meth}`~nvalchemi.data.batch.Batch.add_key`, you explicitly specify the level
 (`"node"`, `"edge"`, or `"system"`) so the batch knows how to slice it back out when
 you call {py:meth}`~nvalchemi.data.batch.Batch.get_data`.
+
+## Neighbor list formats
+
+The framework supports two neighbor list representations, configured via
+{py:class}`~nvalchemi.models.base.NeighborConfig` and populated by
+{py:class}`~nvalchemi.hooks.NeighborListHook` at the ``BEFORE_COMPUTE``
+stage.
+
+| | **MATRIX format** | **COO format** |
+|---|---|---|
+| **Edge indices** | `neighbor_matrix` `[N, K]` int32 | `neighbor_list` `[E, 2]` int32 |
+| **Per-atom counts** | `num_neighbors` `[N]` int32 | *(derived via `edge_ptr`)* |
+| **CSR pointer** | *(not used)* | `edge_ptr` `[N+1]` int32 |
+| **PBC shifts** | `neighbor_matrix_shifts` `[N, K, 3]` int32 | `neighbor_list_shifts` `[E, 3]` int32 |
+| **Padding value** | `N` (total atoms in batch) | *(no padding — sparse)* |
+| **Configured via** | `NeighborConfig(format="matrix")` | `NeighborConfig(format="coo")` |
+| **Used by** | Analytical-force models (LJ, Ewald, PME) | GNN-based models (MACE, etc.) |
+
+Here `N` is the total number of atoms in the batch, `K` is the maximum
+number of neighbors per atom (``max_neighbors``), and `E` is the total
+number of edges.
+
+**MATRIX format** is a dense representation where each atom has a
+fixed-width row of `K` neighbor indices.  Unused slots are filled with the
+sentinel value `N` (total atoms in the batch).  Valid neighbors for atom `i`
+are in `neighbor_matrix[i, :num_neighbors[i]]`.  This format avoids
+dynamic allocation and is used by analytical-force models that iterate over
+pair interactions.
+
+**COO format** is a sparse representation where each edge is an `(i, j)`
+pair in `neighbor_list`.  This format is used by GNN-based models that
+operate on edge features.  The per-atom CSR pointer `edge_ptr` is derived
+on demand via the {py:attr}`~nvalchemi.data.Batch.edge_ptr` property.
+
+Both formats are populated automatically by
+{py:class}`~nvalchemi.hooks.NeighborListHook`.  The format is controlled
+by the `format` field in the model's
+{py:class}`~nvalchemi.models.base.NeighborConfig`.
 
 ## Pre-allocated batches and the buffer API
 
@@ -191,7 +236,7 @@ template = AtomicData(
     positions=torch.zeros(1, 3),
     atomic_numbers=torch.zeros(1, dtype=torch.long),
     forces=torch.zeros(1, 3),
-    energies=torch.zeros(1, 1),
+    energy=torch.zeros(1, 1),
     cell=torch.zeros(1, 3, 3),
     pbc=torch.zeros(1, 3, dtype=torch.bool),
 )
@@ -271,18 +316,18 @@ The conversion maps ASE fields to ALCHEMI fields:
 | `atoms.positions` | `positions` | Always populated |
 | `atoms.get_pbc()` | `pbc` | Reshaped to `(1, 3)` |
 | `atoms.get_cell()` | `cell` | Reshaped to `(1, 3, 3)` |
-| `atoms.info[energy_key]` | `energies` | `None` if absent; `(1, 1)` |
+| `atoms.info[energy_key]` | `energy` | `None` if absent; `(1, 1)` |
 | `atoms.arrays[forces_key]` | `forces` | `None` if absent |
-| `atoms.info[stress_key]` | `stresses` | `None` if absent; Voigt → `(1, 3, 3)` |
-| `atoms.info[virials_key]` | `virials` | `None` if absent; Voigt → `(1, 3, 3)` |
-| `atoms.info[dipole_key]` | `dipoles` | `None` if absent; `(1, 3)` |
-| `atoms.arrays[charges_key]` | `node_charges` | `None` if absent; `(N, 1)` |
-| `atoms.info["charge"]` | `graph_charges` | `None` if absent; from per-atom sum |
+| `atoms.info[stress_key]` | `stress` | `None` if absent; Voigt → `(1, 3, 3)` |
+| `atoms.info[virials_key]` | `virial` | `None` if absent; Voigt → `(1, 3, 3)` |
+| `atoms.info[dipole_key]` | `dipole` | `None` if absent; `(1, 3)` |
+| `atoms.arrays[charges_key]` | `charges` | `None` if absent; `(N,)` |
+| `atoms.info["charge"]` | `charge` | `None` if absent; from per-atom sum |
 | `atoms.get_masses()` | `atomic_masses` | Always populated |
 | `atoms.info` (remaining) | `info` | Arrays, lists, ints, floats kept; bools/strings dropped |
 
-Optional label fields (`energies`, `forces`, `stresses`, `virials`, `dipoles`,
-`node_charges`, `graph_charges`) are populated **only** when present in the ASE
+Optional label fields (`energy`, `forces`, `stress`, `virial`, `dipole`,
+`charges`, `charge`) are populated **only** when present in the ASE
 object; otherwise they remain `None`. The input `atoms` object is **not** mutated.
 
 Keyword arguments (`energy_key`, `forces_key`, etc.) let you adapt to different

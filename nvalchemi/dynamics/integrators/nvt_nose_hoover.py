@@ -50,11 +50,13 @@ from nvalchemi.dynamics._ops.nose_hoover import (
     nhc_position_update,
     nhc_velocity_half_step,
 )
+from nvalchemi.dynamics._units import fs_to_internal_time
 from nvalchemi.dynamics.base import BaseDynamics
 from nvalchemi.dynamics.hooks._utils import KB_EV
 
 if TYPE_CHECKING:
-    from nvalchemi.dynamics.base import ConvergenceHook, Hook
+    from nvalchemi.dynamics.base import ConvergenceHook
+    from nvalchemi.hooks import Hook
     from nvalchemi.models.base import BaseModelMixin
 
 __all__ = ["NVTNoseHoover"]
@@ -71,13 +73,13 @@ class NVTNoseHoover(BaseDynamics):
     model : BaseModelMixin
         The neural network potential model.
     dt : float or torch.Tensor
-        Integration timestep ``[M]`` or scalar.
+        Integration timestep in femtoseconds ``[M]`` or scalar.
     temperature : float or torch.Tensor
         Target temperature in Kelvin ``[M]`` or scalar.
     thermostat_time : float or torch.Tensor
-        Thermostat coupling time τ_T in the same time units as *dt*
-        ``[M]`` or scalar.  Controls how tightly the thermostat couples
-        to the system; typical values are 10–100 × dt.
+        Thermostat coupling time τ_T in femtoseconds ``[M]`` or scalar.
+        Controls how tightly the thermostat couples to the system;
+        typical values are 10–100 × dt.
     chain_length : int, optional
         Number of links in the Nosé-Hoover chain.  Default 3.
     yoshida_order : int, optional
@@ -123,9 +125,9 @@ class NVTNoseHoover(BaseDynamics):
             convergence_hook=convergence_hook,
             **kwargs,
         )
-        self._dt_init = dt
+        self._dt_init = fs_to_internal_time(dt)
         self._temperature_init = temperature
-        self._thermostat_time_init = thermostat_time
+        self._thermostat_time_init = fs_to_internal_time(thermostat_time)
         self.chain_length = chain_length
         self.yoshida_order = yoshida_order
 
@@ -139,10 +141,10 @@ class NVTNoseHoover(BaseDynamics):
         tau = _to_per_system(self._thermostat_time_init, M, dev, dtype)
         # Compute chain masses using the actual per-atom masses and batch index.
         Q = nhc_compute_masses(
-            kT, tau, batch.atomic_masses, batch.batch.int(), self.chain_length
+            kT, tau, batch.atomic_masses, batch.batch_idx.int(), self.chain_length
         )
         # Compute per-system ndof as a float tensor (required by nhc_chain_update).
-        counts = torch.bincount(batch.batch.long(), minlength=M)
+        counts = torch.bincount(batch.batch_idx, minlength=M)
         nhc_ndof = (counts * 3).to(dtype=dtype, device=dev)
         self._state = _make_state_batch(
             {
@@ -224,20 +226,20 @@ class NVTNoseHoover(BaseDynamics):
             self._state.nhc_total_scale,
             self._state.nhc_step_scale,
             self._state.nhc_dt_chain,
-            batch.batch.int(),
+            batch.batch_idx.int(),
         )
         nhc_velocity_half_step(
             batch.velocities,
             batch.forces,
             batch.atomic_masses,
             self._state.dt,
-            batch.batch.int(),
+            batch.batch_idx.int(),
         )
         nhc_position_update(
             batch.positions,
             batch.velocities,
             self._state.dt,
-            batch.batch.int(),
+            batch.batch_idx.int(),
         )
 
     def post_update(self, batch: Batch) -> None:
@@ -253,7 +255,7 @@ class NVTNoseHoover(BaseDynamics):
             batch.forces,
             batch.atomic_masses,
             self._state.dt,
-            batch.batch.int(),
+            batch.batch_idx.int(),
         )
         nhc_chain_update(
             batch.velocities,
@@ -268,5 +270,5 @@ class NVTNoseHoover(BaseDynamics):
             self._state.nhc_total_scale,
             self._state.nhc_step_scale,
             self._state.nhc_dt_chain,
-            batch.batch.int(),
+            batch.batch_idx.int(),
         )

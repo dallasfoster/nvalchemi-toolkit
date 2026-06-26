@@ -1,0 +1,1143 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""UMA (fairchem-core) model wrapper.
+
+Wraps a fairchem ``MLIPPredictUnit`` as a
+:class:`~nvalchemi.models.base.BaseModelMixin`-compatible model.
+
+UMA is multi-task — a single backbone checkpoint (``uma-s-1p1``,
+``uma-s-1p2``, ``uma-m-1p1``) ships with heads for OMol25 (molecules),
+OMat24 (crystals), OC20 (catalysis), ODAC23 (direct air capture), and
+OMC (molecular crystals). Task selection happens at checkpoint load
+time via ``task_name=`` and is baked into the wrapper — matching the
+"one wrapper, one model" pattern used by :class:`~nvalchemi.models.mace.MACEWrapper`.
+
+Usage
+-----
+::
+
+    from nvalchemi.models.uma import UMAWrapper
+
+    # OMol molecular potential
+    mol_wrapper = UMAWrapper.from_checkpoint(
+        "uma-s-1p1", task_name="omol", device="cuda"
+    )
+
+    # OMat bulk-crystal potential (same checkpoint, different head)
+    mat_wrapper = UMAWrapper.from_checkpoint(
+        "uma-s-1p1", task_name="omat", device="cuda"
+    )
+
+Notes
+-----
+* Energy is the primitive differentiable output; forces and (for
+  periodic tasks) stress are derived via autograd.
+* OMol requires a total-charge field; the wrapper reads ``charge`` off
+  the input ``AtomicData`` / ``Batch`` and defaults to 0 if absent.
+  Spin multiplicity (``spin`` on the batch) defaults to 1 for OMol and
+  0 for periodic tasks.
+* ``active_outputs`` is task-aware: ``{"energy", "forces"}`` for
+  molecular tasks, ``{"energy", "forces", "stress"}`` for periodic.
+
+``torch.compile``
+-----------------
+The UMA wrapper has no ``compile_model`` flag: fairchem owns compilation
+through the ``compile`` field on ``InferenceSettings``, reached via
+:meth:`from_checkpoint`'s ``inference_settings`` argument. Use
+``inference_settings="turbo"`` for fairchem's optimized preset (also enables
+tf32 / merge_mole, changing numerics), or pass an ``InferenceSettings`` instance
+with only ``compile=True`` for a pure compile toggle::
+
+      from fairchem.core.units.mlip_unit.api.inference import (
+          InferenceSettings,
+      )
+
+      wrapper = UMAWrapper.from_checkpoint(
+          "uma-s-1p1",
+          task_name="omat",
+          device="cuda",
+          inference_settings=InferenceSettings(compile=True),
+      )
+"""
+
+from __future__ import annotations
+
+import contextlib
+from pathlib import Path
+from typing import Any
+
+import torch
+from torch import nn
+
+from nvalchemi._optional import OptionalDependency
+from nvalchemi._typing import ModelOutputs
+from nvalchemi.data import AtomicData, Batch
+from nvalchemi.distributed._core.context import current_dd_context
+from nvalchemi.distributed._core.enums import Scope
+from nvalchemi.distributed.compile_bridge import force_compile_static
+from nvalchemi.distributed.helpers import (
+    distributed_method,
+    refresh_neighbors,
+    system_sum,
+)
+from nvalchemi.models.base import (
+    BaseModelMixin,
+    ModelConfig,
+    NeighborConfig,
+    NeighborListFormat,
+)
+
+__all__ = ["UMAWrapper"]
+
+
+# UMA task names; module-level so the wrapper can validate and tests can iterate.
+_UMA_TASKS: tuple[str, ...] = ("omol", "omat", "oc20", "odac", "omc")
+
+# Periodic tasks (stress supported); ``omol`` is molecular (no stress).
+_PBC_TASKS: frozenset[str] = frozenset({"omat", "oc20", "odac", "omc"})
+
+
+# Fixed-shape caps for compiled MD. fairchem's compiled graph needs static
+# shapes, but per-rank atom/edge counts drift across an MD trajectory, forcing
+# repeated recompiles. We pad inputs to fixed per-rank capacities: the atom dim
+# grows to ``n_cap`` with inert "dead" atoms and the edge dim to ``e_cap`` with
+# dead edges longer than the cutoff (zero contribution). Caps grow on overflow
+# and persist, so there is one recompile per grow, then steady state.
+_CAP_GROWTH = 1.15  # fractional headroom over the first / overflowing real count
+_DEAD_COORD = 1.0e4  # base coordinate for inert dead atoms (well outside any box)
+# Round capacities up to a stride so step-to-step count fluctuation lands in the
+# same bucket; edges swing more than atoms, so they get a coarser stride.
+_CAP_STRIDE: dict[str, int] = {"n_cap": 64, "e_cap": 1024}
+
+
+def _pad_capped_graph(
+    backbone: Any, fc_data: Any, n_real: int, cap_state: dict[str, int]
+) -> Any:
+    """Pad ``fc_data`` to fixed per-rank atom/edge capacities for compiled MD.
+
+    Builds the real edge list with fairchem's ``generate_graph``, then pads atoms
+    to ``n_cap`` and edges to ``e_cap`` with inert dead atoms / dead edges and
+    writes the fixed-shape ``edge_index`` / ``cell_offsets`` / ``nedges``. Mutates
+    and returns ``fc_data``; the caller sets the backbone's ``otf_graph`` so it
+    consumes these precomputed edges.
+    """
+    import torch as _t  # noqa: PLC0415
+    from fairchem.core.graph.compute import generate_graph  # noqa: PLC0415
+
+    from nvalchemi.distributed.graph_padder import resolve_cap  # noqa: PLC0415
+
+    device = fc_data.pos.device
+    dtype = fc_data.pos.dtype
+
+    # Real edges via fairchem's own graph generation.
+    pbc = fc_data.pbc
+    pbc2d = _t.atleast_2d(pbc)
+    gd = generate_graph(
+        fc_data,
+        cutoff=backbone.cutoff,
+        max_neighbors=backbone.max_neighbors,
+        enforce_max_neighbors_strictly=backbone.enforce_max_neighbors_strictly,
+        radius_pbc_version=backbone.radius_pbc_version,
+        pbc=pbc2d,
+    )
+    edge_index = gd["edge_index"]  # (2, E)
+    cell_offsets = gd["cell_offsets"].to(dtype)  # (E, 3)
+    e_real = int(edge_index.shape[1])
+
+    # Persistent grow-only per-rank caps (>= 2 dead-atom slots for the dead edge).
+    n_cap = resolve_cap(
+        cap_state, "n_cap", n_real, initial_factor=_CAP_GROWTH,
+        grow_factor=_CAP_GROWTH, stride=_CAP_STRIDE["n_cap"], extra=2,
+    )
+    e_cap = resolve_cap(
+        cap_state, "e_cap", e_real, initial_factor=_CAP_GROWTH,
+        grow_factor=_CAP_GROWTH, stride=_CAP_STRIDE["e_cap"],
+    )
+    n_dead = n_cap - n_real
+    e_dead = e_cap - e_real
+
+    # Pad atoms with inert dead atoms (Z=0, batch=0, no edges reference them).
+    # Two anchors sit far apart so the dead-edge length exceeds the cutoff.
+    if n_dead > 0:
+        dead_pos = _t.zeros(n_dead, 3, dtype=dtype, device=device)
+        dead_pos[:, 0] = _DEAD_COORD
+        if n_dead >= 2:
+            dead_pos[1, 0] = _DEAD_COORD + 2.0 * float(backbone.cutoff)
+        fc_data.pos = _t.cat([fc_data.pos, dead_pos], dim=0)
+        fc_data.atomic_numbers = _t.cat(
+            [fc_data.atomic_numbers,
+             _t.zeros(n_dead, dtype=fc_data.atomic_numbers.dtype, device=device)],
+            dim=0,
+        )
+        fc_data.batch = _t.cat(
+            [fc_data.batch,
+             _t.zeros(n_dead, dtype=fc_data.batch.dtype, device=device)],
+            dim=0,
+        )
+        # Keep natoms summing to n_cap by charging the dead atoms to system 0.
+        fc_data.natoms = fc_data.natoms.clone()
+        fc_data.natoms[0] = fc_data.natoms[0] + n_dead
+        fixed = getattr(fc_data, "fixed", None)
+        if fixed is not None:
+            fc_data.fixed = _t.cat(
+                [fixed, _t.zeros(n_dead, dtype=fixed.dtype, device=device)], dim=0
+            )
+        tags = getattr(fc_data, "tags", None)
+        if tags is not None:
+            fc_data.tags = _t.cat(
+                [tags, _t.zeros(n_dead, dtype=tags.dtype, device=device)], dim=0
+            )
+
+    # Pad edges between the two dead anchors at indices [n_real, n_real+1]: their
+    # 2*cutoff separation gives a zero envelope, hence zero contribution.
+    if e_dead > 0:
+        a = n_real
+        b = n_real + 1 if n_dead >= 2 else n_real
+        dead_ei = _t.tensor(
+            [[a] * e_dead, [b] * e_dead], dtype=edge_index.dtype, device=device
+        )
+        dead_co = _t.zeros(e_dead, 3, dtype=dtype, device=device)
+        edge_index = _t.cat([edge_index, dead_ei], dim=1)
+        cell_offsets = _t.cat([cell_offsets, dead_co], dim=0)
+
+    fc_data.edge_index = edge_index
+    fc_data.cell_offsets = cell_offsets
+    fc_data.nedges = _t.tensor(
+        [edge_index.shape[1]], dtype=_t.long, device=device
+    )
+    return fc_data
+
+
+class _UMAGraphPadder:
+    """UMA's :class:`~nvalchemi.distributed.graph_padder.GraphPadder`.
+
+    UMA rebuilds its edge list inside the padder via fairchem's ``generate_graph``,
+    so the edge count is known only partway through :meth:`pad`. The padder owns
+    the whole caps lifecycle: graph rebuild + dead-atom/dead-edge padding
+    (:meth:`pad`), the backbone ``otf_graph`` save/restore (:meth:`restore`), and
+    the per-atom dead-row strip (:meth:`unpad`).
+    """
+
+    def __init__(self, backbone: Any) -> None:
+        self._backbone = backbone
+        # Real owned+ghost atom count of the last padded graph, saved by pad() so
+        # unpad() knows where the dead rows begin. One forward at a time.
+        self._n_real: int | None = None
+        # Backbone ``otf_graph`` flag saved while the fixed-shape graph is in use;
+        # ``None`` means not currently padded.
+        self._orig_otf_graph: bool | None = None
+
+    def pad(self, data: Any, cap_state: dict[str, int]) -> Any:
+        """Rebuild and pad the fairchem graph to fixed per-rank caps.
+
+        Parameters
+        ----------
+        data : Any
+            The fairchem ``AtomicData`` graph to pad in place.
+        cap_state : dict[str, int]
+            Persistent per-rank capacity state (``n_cap`` / ``e_cap``).
+
+        Returns
+        -------
+        Any
+            ``data``, padded to fixed shapes. Also switches the backbone to
+            ``otf_graph=False`` so it consumes the precomputed edges;
+            :meth:`restore` puts the flag back.
+        """
+        self._n_real = int(data.pos.shape[0])
+        out = _pad_capped_graph(self._backbone, data, self._n_real, cap_state)
+        self._orig_otf_graph = self._backbone.otf_graph
+        self._backbone.otf_graph = False
+        return out
+
+    def unpad(self, output: dict[str, Any]) -> dict[str, Any]:
+        """Strip the inert dead-atom rows from per-atom outputs.
+
+        Parameters
+        ----------
+        output : dict[str, Any]
+            The raw fairchem output dict (per-atom ``forces`` are padded).
+
+        Returns
+        -------
+        dict[str, Any]
+            ``output`` with ``forces`` sliced back to the real atom count.
+        """
+        if self._n_real is not None and "forces" in output:
+            output["forces"] = output["forces"][: self._n_real]
+        return output
+
+    def restore(self) -> None:
+        """Restore the backbone's ``otf_graph`` flag.
+
+        Idempotent: a no-op when no pad happened. Called in a ``finally`` so a
+        forward error never leaves the backbone stuck on the fixed-shape path.
+
+        Returns
+        -------
+        None
+        """
+        if self._orig_otf_graph is not None:
+            self._backbone.otf_graph = self._orig_otf_graph
+            self._orig_otf_graph = None
+
+
+@torch._dynamo.disable  # type: ignore[misc]
+def _eager_block_refresh(x: "torch.Tensor") -> "torch.Tensor":
+    """Eager ghost-row refresh of the per-node features ``x``.
+
+    Delegates to :func:`~nvalchemi.distributed.helpers.refresh_neighbors`, which
+    halo-exchanges this rank's owned rows into its ghost rows. The
+    ``@torch._dynamo.disable`` is load-bearing: it re-reads the per-step halo
+    routing eagerly instead of baking the first step's into the compiled graph,
+    keeping the collective in lockstep across ranks. The backward routes ghost-row
+    gradients to owners; single-process is the identity.
+    """
+    return refresh_neighbors(x)
+
+
+@distributed_method
+def _distributed_escn_block_forward(
+    ctx: Any,
+    original: Any,
+    block_self: Any,
+    x: "torch.Tensor",
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Adapter for ``eSCNMD_Block.forward`` under domain decomposition.
+
+    Each message-passing block aggregates neighbor features into every node, so
+    owned atoms read their ghost neighbors; ``x``'s ghost rows are refreshed from
+    their owners (via :func:`_eager_block_refresh`) before the block runs.
+    ``@distributed_method`` runs the stock block off the halo path.
+
+    Parameters
+    ----------
+    ctx : DistributedContext
+        The live context (supplied by :func:`distributed_method`; unused here).
+    original : callable
+        The unpatched ``eSCNMD_Block.forward``.
+    block_self : eSCNMD_Block
+        The block instance.
+    x : torch.Tensor
+        Per-node features over this rank's owned+ghost atoms.
+    *args, **kwargs
+        Remaining block-forward arguments, passed through unchanged.
+
+    Returns
+    -------
+    Any
+        The block's output, computed on ghost-refreshed features.
+    """
+    return original(block_self, _eager_block_refresh(x), *args, **kwargs)
+
+
+def _distributed_reduce_node_to_system(
+    node_values: "torch.Tensor",
+    batch: "torch.Tensor",
+    num_systems: int,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Halo-aware replacement for fairchem ``reduce_node_to_system``.
+
+    Under domain decomposition ``node_values`` arrives over this rank's
+    ``owned + ghost`` atoms, so the stock per-system reduce would leave a
+    rank-local value. Per-node energy (1-D) reduces owned rows only and all-reduces
+    in fp64 to the global per-system energy; the per-atom virial (multi-D) reduces
+    all local rows here, deferring the cross-rank sum to consolidation.
+    ``energy_part`` equals ``reduced`` (fairchem derives forces/stress from it via
+    autograd). Single-process falls back to the stock reduce.
+
+    Parameters
+    ----------
+    node_values : torch.Tensor
+        Per-node values over this rank's owned+ghost atoms — 1-D for energy,
+        multi-D for the virial.
+    batch : torch.Tensor
+        Per-node system index, ``(n_local,)``.
+    num_systems : int
+        Number of systems in the (global) batch.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor]
+        ``(reduced, energy_part)`` — both the per-system value fairchem expects;
+        equal here.
+    """
+    import torch as _t  # noqa: PLC0415
+
+    if current_dd_context().is_halo:
+        if node_values.dim() == 1:
+            # Per-node energy: owned-only scatter + all-reduce → global per-system
+            # energy, replicated.
+            reduced = system_sum(node_values, batch, num_systems, scope=Scope.OWNED)
+            return reduced, reduced
+
+        # Per-atom virial: scatter all local rows with no all-reduce here; the
+        # cross-rank sum is deferred to consolidation (all-reducing now would
+        # double-count fairchem's un-reduced per-rank cell-virial term).
+        out_shape = (num_systems,) + tuple(node_values.shape[1:])
+        sysv = _t.zeros(out_shape, device=node_values.device, dtype=node_values.dtype)
+        flat = node_values.reshape(node_values.shape[0], -1)
+        sysv = (
+            sysv.reshape(num_systems, -1)
+            .index_add(0, batch, flat)
+            .reshape(out_shape)
+        )
+        return sysv, sysv
+
+    # Stock (non-distributed) path: nothing to all-reduce, so
+    # ``reduced == system_values``.
+    out_shape = (num_systems,) + tuple(node_values.shape[1:])
+    system_values = _t.zeros(out_shape, device=node_values.device, dtype=_t.float64)
+    if node_values.dim() == 1:
+        system_values = system_values.index_add(
+            0, batch, node_values.to(_t.float64)
+        )
+    else:
+        flat_node = node_values.reshape(node_values.shape[0], -1)
+        system_values = (
+            system_values.reshape(num_systems, -1)
+            .index_add(0, batch, flat_node.to(_t.float64))
+            .reshape(out_shape)
+        )
+    return system_values, system_values
+
+
+@distributed_method
+def _distributed_undo_refs(
+    ctx: Any, original: Any, refs_self: Any, batch: Any, tensor: "torch.Tensor"
+) -> "torch.Tensor":
+    """Halo-aware replacement for ``ElementReferences.undo_refs``.
+
+    fairchem adds the element-reference energy back by reducing ``ref[Z]`` over
+    this rank's owned + ghost atoms, but the model energy was reduced owned-only
+    (see :func:`_distributed_reduce_node_to_system`), so including ghost references
+    over-counts. The fix sums references over owned atoms only, then all-reduces
+    across the mesh. ``@distributed_method`` falls back to stock off the halo path.
+
+    Parameters
+    ----------
+    ctx : DistributedContext
+        The live context, used for ``n_owned``.
+    original : callable
+        The unpatched ``ElementReferences.undo_refs``.
+    refs_self : ElementReferences
+        The element-references module.
+    batch : Any
+        fairchem batch carrying ``atomic_numbers_full`` / ``batch_full``.
+    tensor : torch.Tensor
+        Per-system energies ``(num_systems, …)`` to add references onto.
+
+    Returns
+    -------
+    torch.Tensor
+        ``tensor`` plus the global owned-only reference sum, replicated per rank.
+    """
+    n_owned = ctx.n_owned
+    num_systems = int(tensor.shape[0])
+    elem_refs = refs_self.element_references
+    z_owned = batch.atomic_numbers_full[:n_owned].to(
+        dtype=torch.long, device=elem_refs.device
+    )
+    owned_batch = batch.batch_full[:n_owned]
+    per_atom = elem_refs[z_owned].to(dtype=tensor.dtype)
+    # Owned-only references summed per system + all-reduced across the mesh
+    # (inputs are pre-sliced, so system_sum's own owned slice is a no-op).
+    ref_sum = system_sum(per_atom, owned_batch, num_systems, scope=Scope.OWNED)
+    return tensor + ref_sum.view(tensor.shape)
+
+
+@distributed_method
+def _distributed_get_composition_info(
+    ctx: Any, original: Any, backbone_self: Any, data: Any
+) -> Any:
+    """Caps-aware replacement for ``eSCNMDBackbone._get_composition_info``.
+
+    Under fixed-shape caps the input carries inert dead atoms (``Z=0``) appended
+    beyond ``n_padded`` (see :func:`_pad_capped_graph`). Their count varies step to
+    step, so histogramming them would drift the composition and trip fairchem's
+    MoLE consistency check; the histogram covers the real ``owned+ghost`` atoms
+    only. ``@distributed_method`` falls back to stock off the halo path.
+
+    Parameters
+    ----------
+    ctx : DistributedContext
+        The live context, used for ``n_padded`` (the real owned+ghost count).
+    original : callable
+        The unpatched ``eSCNMDBackbone._get_composition_info``.
+    backbone_self : eSCNMDBackbone
+        The backbone instance.
+    data : Any
+        fairchem batch (its ``atomic_numbers`` includes the dead atoms).
+
+    Returns
+    -------
+    Any
+        ``(composition, charge, spin, dataset)`` with the composition histogram
+        over the real atoms only.
+    """
+    n = ctx.n_padded
+    an = data.atomic_numbers[:n].to(torch.int)
+    composition = data.atomic_numbers.new_zeros(
+        backbone_self.max_num_elements, dtype=torch.int
+    ).index_add(0, an, torch.ones(n, dtype=torch.int, device=an.device))
+    return (
+        composition,
+        getattr(data, "charge", None),
+        getattr(data, "spin", None),
+        getattr(data, "dataset", [None]),
+    )
+
+
+@distributed_method
+def _distributed_set_mole_coefficients(
+    ctx: Any,
+    original: Any,
+    backbone_self: Any,
+    atomic_numbers_full: "torch.Tensor",
+    batch_full: "torch.Tensor",
+    csd_mixed_emb: "torch.Tensor",
+) -> Any:
+    """Caps-aware replacement for ``eSCNMDMoeBackbone.set_MOLE_coefficients``.
+
+    The MoLE expert-mixing coefficients depend on a per-system mean of the
+    composition embedding. Under domain decomposition the input carries this rank's
+    ``owned + ghost`` atoms plus inert dead atoms (``Z=0``) from the caps padder
+    (see :func:`_pad_capped_graph`); both pollute the stock mean (dead rows add a
+    ``Z=0`` embedding, and a per-rank mean differs from the global one), shifting
+    every MoLE-linear weight by a small per-system amount.
+
+    The fix mirrors the energy reduction: average the composition embedding over
+    this rank's **owned** real atoms only (``Scope.OWNED`` drops ghost and dead
+    rows) and all-reduce across the mesh, yielding the global per-system mean the
+    single-process model computes. The remaining routing (``routing_mlp`` +
+    coefficient norm) is unchanged. ``@distributed_method`` falls back to stock off
+    the halo path. The merged path (compiled / ``merge_mole``) runs on CPU where
+    the mesh collective is unavailable and is already exact, so it too uses stock.
+
+    Parameters
+    ----------
+    ctx : DistributedContext
+        The live context, used for ``n_owned`` via :func:`system_sum`.
+    original : callable
+        The unpatched ``set_MOLE_coefficients``.
+    backbone_self : eSCNMDMoeBackbone
+        The MoLE backbone instance.
+    atomic_numbers_full : torch.Tensor
+        Per-atom numbers over ``owned + ghost + dead`` rows.
+    batch_full : torch.Tensor
+        Per-atom system index over the same rows.
+    csd_mixed_emb : torch.Tensor
+        The charge/spin/dataset embedding, ``(num_systems, sphere_channels)``.
+
+    Returns
+    -------
+    Any
+        ``None`` — the coefficients are written onto
+        ``backbone_self.global_mole_tensors`` in place, matching fairchem.
+    """
+    import numpy as _np  # noqa: PLC0415
+
+    # No experts, no composition gating, or the CPU merge prep where the mesh
+    # collective can't run (and the merged path is already exact): use stock.
+    if (
+        backbone_self.num_experts == 0
+        or not getattr(backbone_self, "use_composition_embedding", False)
+        or not atomic_numbers_full.is_cuda
+    ):
+        return original(
+            backbone_self, atomic_numbers_full, batch_full, csd_mixed_emb
+        )
+
+    nsys = int(csd_mixed_emb.shape[0])
+    n_owned = ctx.n_owned
+    with torch.autocast(
+        device_type=atomic_numbers_full.device.type, enabled=False
+    ):
+        # Owned real atoms only (excludes ghost and dead rows); pre-slice so
+        # system_sum's own owned slice is a no-op, matching _distributed_undo_refs.
+        z_owned = atomic_numbers_full[:n_owned]
+        b_owned = batch_full[:n_owned]
+        comp_by_atom = backbone_self.composition_embedding(z_owned)
+        # Global per-system sum + owned count, both all-reduced across the mesh.
+        comp_sum = system_sum(comp_by_atom, b_owned, nsys, scope=Scope.OWNED)
+        ones = comp_by_atom.new_ones(comp_by_atom.shape[0], 1)
+        count = system_sum(ones, b_owned, nsys, scope=Scope.OWNED)
+        # fairchem's index_reduce(mean, include_self) seeds an extra zero row on
+        # model_version 1.0; match it so the denominator is identical.
+        include_self = 1.0 if _np.isclose(backbone_self.model_version, 1.0).item() else 0.0
+        composition = comp_sum / (count + include_self).clamp_min(1.0)
+
+        embeddings = [composition.unsqueeze(0), csd_mixed_emb[None]]
+        pre_norm = backbone_self.routing_mlp(
+            torch.vstack(embeddings).transpose(0, 1).reshape(nsys, -1)
+        )
+        backbone_self.global_mole_tensors.expert_mixing_coefficients = (
+            backbone_self.mole_expert_coefficient_norm(
+                backbone_self.mole_dropout(pre_norm)
+            )
+        )
+    return None
+
+
+@OptionalDependency.UMA.require
+class UMAWrapper(nn.Module, BaseModelMixin):
+    """Wrapper for fairchem's UMA (Universal Models for Atoms).
+
+    Wraps a :class:`fairchem.core.units.mlip_unit.MLIPPredictUnit` — the
+    level at which energy / forces / stress are computed by fairchem
+    (the raw backbone only produces node embeddings). Task is fixed at
+    construction; ``active_outputs`` reflects what that task supports.
+
+    Parameters
+    ----------
+    predict_unit : fairchem.core.units.mlip_unit.MLIPPredictUnit
+        Pre-loaded UMA prediction unit. Use :meth:`from_checkpoint` for
+        the typical construction path that resolves a registered
+        checkpoint name and downloads via HuggingFace Hub.
+    task_name : str
+        UMA task: one of ``_UMA_TASKS``. Determines which per-task head
+        in the multi-task model is used and which inputs (charge, spin)
+        must be populated.
+
+    Attributes
+    ----------
+    model_config : ModelConfig
+        Task-dependent outputs + autograd + neighbor config.
+    task_name : str
+        The UMA task this wrapper is pinned to.
+    """
+
+    def __init__(self, predict_unit: Any, task_name: str = "omol") -> None:
+        super().__init__()
+        if task_name not in _UMA_TASKS:
+            raise ValueError(
+                f"UMAWrapper task_name {task_name!r} must be one of {_UMA_TASKS}"
+            )
+
+        # Validate the checkpoint supports this task at construction, not on
+        # first forward.
+        available = list(predict_unit.dataset_to_tasks.keys())
+        if task_name not in available:
+            raise ValueError(
+                f"Checkpoint does not ship a '{task_name}' head. "
+                f"Available: {available}. Load a different checkpoint "
+                f"or pick one of the available tasks."
+            )
+
+        self.predict_unit = predict_unit
+        self.task_name = task_name
+        self._is_pbc_task = task_name in _PBC_TASKS
+        self._cutoff = self._extract_cutoff()
+
+        # Task-dependent output set. Energy + forces are universal;
+        # stress only makes sense for periodic tasks.
+        outputs: set[str] = {"energy", "forces"}
+        autograd_outputs: set[str] = {"forces"}
+        active_outputs: set[str] = {"energy", "forces"}
+        if self._is_pbc_task:
+            outputs.add("stress")
+            autograd_outputs.add("stress")
+            active_outputs.add("stress")
+
+        self.model_config = ModelConfig(
+            outputs=frozenset(outputs),
+            autograd_outputs=frozenset(autograd_outputs),
+            autograd_inputs=frozenset({"positions"}),
+            # All optional (not required for OMol) to keep one config shape
+            # across tasks — the adapter fills charge/spin defaults.
+            required_inputs=frozenset(),
+            optional_inputs=frozenset({"cell", "charge", "spin", "tags"}),
+            supports_pbc=True,
+            needs_pbc=self._is_pbc_task,
+            neighbor_config=NeighborConfig(
+                cutoff=self._cutoff,
+                format=NeighborListFormat.COO,
+                half_list=False,
+            ),
+            active_outputs=active_outputs,
+        )
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        name_or_path: str | Path,
+        task_name: str = "omol",
+        device: str | torch.device = "cpu",
+        inference_settings: Any = "default",
+        overrides: dict | None = None,
+    ) -> "UMAWrapper":
+        """Resolve and load a UMA checkpoint.
+
+        Accepts either a registered model name
+        (``"uma-s-1p1"`` / ``"uma-s-1p2"`` / ``"uma-m-1p1"``) or a
+        local filesystem path to a ``.pt`` file. The multi-task
+        checkpoints ship all five task heads; ``task_name`` picks which
+        one the wrapper exposes via :attr:`model_config.active_outputs`.
+
+        Parameters
+        ----------
+        name_or_path : str | Path
+            Registered model name (see
+            ``fairchem.core.calculate.pretrained_mlip.available_models``)
+            or a local file path.
+        task_name : str
+            One of ``omol``, ``omat``, ``oc20``, ``odac``, ``omc``.
+            Defaults to ``omol`` (molecular chemistry) — the most
+            common entry point; override explicitly for crystals /
+            catalysis.
+        device : str | torch.device
+            Target device for inference. Defaults to ``"cpu"``.
+        inference_settings : InferenceSettings | str
+            fairchem inference configuration. Either a preset name
+            (``"default"`` or ``"turbo"``) or a
+            ``fairchem.core.units.mlip_unit.api.inference.InferenceSettings``
+            instance. ``torch.compile`` is reached through this argument
+            — see the module docstring's *torch.compile* section.
+            Defaults to ``"default"``.
+        overrides : dict | None
+            Optional overrides forwarded to fairchem's inference-settings
+            builder.
+
+        Returns
+        -------
+        UMAWrapper
+            A wrapper pinned to ``task_name`` over the loaded predict unit.
+
+        Raises
+        ------
+        ValueError
+            If ``name_or_path`` is neither a registered model name nor a local
+            file path.
+        """
+        import os as _os
+
+        from fairchem.core.calculate import pretrained_mlip  # noqa: PLC0415
+        from fairchem.core.units.mlip_unit import load_predict_unit  # noqa: PLC0415
+
+        if isinstance(device, torch.device):
+            device = device.type
+
+        name_str = str(name_or_path)
+        if name_str in pretrained_mlip.available_models:
+            predict_unit = pretrained_mlip.get_predict_unit(
+                name_str,
+                inference_settings=inference_settings,
+                overrides=overrides,
+                device=device,
+            )
+        elif _os.path.isfile(name_str):
+            predict_unit = load_predict_unit(
+                name_str,
+                inference_settings=inference_settings,
+                overrides=overrides,
+                device=device,
+            )
+        else:
+            raise ValueError(
+                f"{name_str!r} is neither a registered model name nor a "
+                f"local file path. Known names: "
+                f"{sorted(pretrained_mlip.available_models)[:6]}..."
+            )
+        return cls(predict_unit, task_name=task_name)
+
+    def _extract_cutoff(self) -> float:
+        """Pull the radial cutoff from the loaded backbone.
+
+        UMA's ASE calculator uses a 6.0 Å radius when external graph
+        generation is enabled; the inference-settings default is 6.0.
+        Prefer the backbone's own ``r_max`` attribute when present.
+        """
+        backbone = getattr(self.predict_unit.model.module, "backbone", None)
+        if backbone is not None:
+            r_max = getattr(backbone, "r_max", None)
+            if r_max is not None:
+                return float(r_max.item() if hasattr(r_max, "item") else r_max)
+            cutoff = getattr(backbone, "cutoff", None)
+            if cutoff is not None:
+                return float(cutoff)
+        return 6.0
+
+    # ------------------------------------------------------------------
+    # BaseModelMixin contract
+    # ------------------------------------------------------------------
+
+    @property
+    def cutoff(self) -> float:
+        """Radial cutoff (Å) for neighbor-list construction."""
+        return self._cutoff
+
+    @property
+    def distribution_spec(self) -> Any:
+        """MLIPSpec for UMA under domain decomposition.
+
+        Each rank computes a full forward over its ``owned + ghost`` atoms on plain
+        tensors; DD happens only at the boundaries: per-block ghost-row feature
+        refresh, owned-only + all-reduce per-system energy reduction, and
+        forces/stress through fairchem's autograd (ghost contributions routed to
+        owners in consolidation). Nothing is sharded (``shard_fields`` is empty);
+        the spec carries the fixed-shape-caps :class:`_UMAGraphPadder`.
+
+        Returns
+        -------
+        MLIPSpec
+            The memoized halo spec: boundary adapters, empty ``shard_fields``, and
+            a :class:`CompilePolicy` carrying the graph padder.
+        """
+        cached = getattr(self, "_dist_spec_cache", None)
+        if cached is not None:
+            return cached
+
+        import dataclasses  # noqa: PLC0415
+
+        from fairchem.core.models.uma.escn_md import (  # noqa: PLC0415
+            eSCNMDBackbone,
+        )
+        from fairchem.core.models.uma.escn_md_block import (  # noqa: PLC0415
+            eSCNMD_Block,
+        )
+        from fairchem.core.models.uma.escn_moe import (  # noqa: PLC0415
+            eSCNMDMoeBackbone,
+        )
+        from fairchem.core.modules.normalization.element_references import (  # noqa: PLC0415
+            ElementReferences,
+        )
+
+        from nvalchemi.distributed.spec import (  # noqa: PLC0415
+            SPEC_UMA_HALO,
+            MethodAdapter,
+            PythonAdapter,
+        )
+
+        helpers = (
+            # Per-block ghost-row refresh of the node features.
+            MethodAdapter(eSCNMD_Block, "forward", _distributed_escn_block_forward),
+            # Owned-only + all_reduce per-system energy reduction.
+            # reduce_node_to_system is re-exported under two modules (the
+            # ``escn_md`` binding is used by the stress heads), so patch both.
+            PythonAdapter(
+                module_path="fairchem.core.models.uma.outputs",
+                attr_name="reduce_node_to_system",
+                replacement=_distributed_reduce_node_to_system,
+            ),
+            PythonAdapter(
+                module_path="fairchem.core.models.uma.escn_md",
+                attr_name="reduce_node_to_system",
+                replacement=_distributed_reduce_node_to_system,
+            ),
+            # Element-reference undo: sum refs over owned atoms only + all_reduce
+            # (the owned-only model energy would otherwise be over-counted).
+            MethodAdapter(ElementReferences, "undo_refs", _distributed_undo_refs),
+            # MoLE composition check: histogram the real atoms only so dead atoms
+            # don't drift the composition.
+            MethodAdapter(
+                eSCNMDBackbone, "_get_composition_info", _distributed_get_composition_info
+            ),
+            # MoLE expert-coefficient gating: average the composition embedding
+            # over global owned real atoms (drop ghost + dead caps rows) so the
+            # mixing coefficients match the single-process model.
+            MethodAdapter(
+                eSCNMDMoeBackbone,
+                "set_MOLE_coefficients",
+                _distributed_set_mole_coefficients,
+            ),
+        )
+        # Halo preset + boundary helpers only (no custom_ops). Stress is a
+        # per-rank partial virial summed across the mesh in consolidation.
+        from nvalchemi.distributed.spec import (  # noqa: PLC0415
+            CompilePolicy,
+            OutputKind,
+            OutputSpec,
+            Reduce,
+        )
+
+        # The fixed-shape-caps padder rides CompilePolicy.graph_padder; it pads the
+        # fairchem graph built inside adapt_input.
+        backbone = self.predict_unit.model.module.backbone
+        spec = dataclasses.replace(
+            SPEC_UMA_HALO,
+            distribution=dataclasses.replace(
+                SPEC_UMA_HALO.distribution,
+                adapters=helpers,
+                shard_fields=(),
+            ),
+            outputs={
+                "stress": OutputSpec(
+                    kind=OutputKind.PER_GRAPH, reduce=Reduce.ALL_REDUCE
+                )
+            },
+            compile=CompilePolicy(graph_padder=_UMAGraphPadder(backbone)),
+        )
+        self._dist_spec_cache = spec
+        return spec
+
+    @property
+    def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Shape of the per-node backbone embedding.
+
+        eSCN-MD (and eSEN) backbones produce ``[N, (lmax+1)^2, sphere_channels]``,
+        read off the backbone's ``sph_feature_size`` / ``sphere_channels`` attrs.
+
+        Returns
+        -------
+        dict[str, tuple[int, ...]]
+            ``{"node_embeddings": (sph_feature_size, sphere_channels)}``.
+
+        Raises
+        ------
+        RuntimeError
+            If the predict unit's module exposes no ``backbone``.
+        """
+        backbone = getattr(self.predict_unit.model.module, "backbone", None)
+        if backbone is None:
+            raise RuntimeError(
+                "predict_unit.model.module has no .backbone attribute — "
+                "embedding_shapes cannot be inferred."
+            )
+        sph = int(getattr(backbone, "sph_feature_size"))
+        ch = int(getattr(backbone, "sphere_channels"))
+        return {"node_embeddings": (sph, ch)}
+
+    def compute_embeddings(
+        self, data: AtomicData | Batch, **kwargs: Any
+    ) -> AtomicData | Batch:
+        """Run the backbone only and attach node embeddings.
+
+        UMA/eSEN backbones return ``{"embedding": [N, sph, ch], "batch": [N]}``;
+        the embedding is attached as a node property so pipelines can consume it
+        without re-running the heads.
+
+        Parameters
+        ----------
+        data : AtomicData | Batch
+            The input system; an ``AtomicData`` is promoted to a ``Batch``.
+        **kwargs
+            Forwarded to :meth:`adapt_input`.
+
+        Returns
+        -------
+        AtomicData | Batch
+            *data*, with ``node_embeddings`` ``[N, sph, ch]`` attached when the
+            backbone returns an embedding.
+        """
+        if isinstance(data, AtomicData):
+            data = Batch.from_data_list([data])
+
+        fc_data = self.adapt_input(data, **kwargs)
+        fc_data = fc_data.to(next(self.predict_unit.model.parameters()).device)
+        backbone = self.predict_unit.model.module.backbone
+        with torch.no_grad():
+            out = backbone(fc_data)
+        if "embedding" in out:
+            data.add_key("node_embeddings", [out["embedding"]], level="node")
+        return data
+
+    # ------------------------------------------------------------------
+    # adapt_input / adapt_output
+    # ------------------------------------------------------------------
+
+    def adapt_input(self, data: AtomicData | Batch, **kwargs: Any) -> Any:
+        """Convert an nvalchemi ``AtomicData`` / ``Batch`` to a fairchem graph.
+
+        Tensor-native (no ASE round trip): tensors stay on
+        ``data.positions.device``, preserving GPU residency and autograd.
+        ``edge_index`` is left empty ``(2, 0)`` so fairchem's ``MLIPPredictUnit``
+        rebuilds the graph internally, matching the default ``FAIRChemCalculator``
+        path. Charge/spin default to per-system zeros unless provided on the batch.
+
+        Parameters
+        ----------
+        data : AtomicData | Batch
+            The input system; an ``AtomicData`` is promoted to a single-graph
+            ``Batch``.
+        **kwargs
+            Unused; accepted for interface compatibility.
+
+        Returns
+        -------
+        fairchem.core.datasets.atomic_data.AtomicData
+            The fairchem graph: ``pos`` ``[N, 3]``, ``atomic_numbers`` ``[N]``,
+            ``cell`` ``[B, 3, 3]``, ``pbc`` ``[B, 3]``, per-system
+            ``charge`` / ``spin`` ``[B]``, and empty ``edge_index`` ``[2, 0]``.
+        """
+        from fairchem.core.datasets.atomic_data import (  # noqa: PLC0415
+            AtomicData as FCAtomicData,
+        )
+
+        if isinstance(data, AtomicData):
+            data = Batch.from_data_list([data])
+
+        device = data.positions.device
+        target_dtype = self.predict_unit.inference_settings.base_precision_dtype
+
+        # Nothing is sharded: under DD every input arrives plain (owned+ghost) and
+        # fairchem's GNN never sees a ShardTensor.
+        pos = data.positions.to(target_dtype)
+        atomic_numbers = data.atomic_numbers.to(torch.long)
+        batch_idx = data.batch_idx.to(torch.long)
+        n_systems = int(data.num_graphs)
+        total_atoms = pos.shape[0]
+
+        # Per-system atom counts — precomputed on the batch.
+        natoms = data.num_nodes_per_graph.to(torch.long)
+
+        # Batch already shapes cell/pbc as (B, 3, 3) / (B, 3) — just cast.
+        cell = getattr(data, "cell", None)
+        if cell is None:
+            cell = torch.zeros(n_systems, 3, 3, dtype=target_dtype, device=device)
+        else:
+            cell = cell.to(target_dtype)
+
+        pbc = getattr(data, "pbc", None)
+        if pbc is None:
+            pbc = torch.full(
+                (n_systems, 3), self._is_pbc_task, dtype=torch.bool, device=device
+            )
+        else:
+            pbc = pbc.to(torch.bool)
+
+        # charge/spin: typed fields are float (B, 1); fairchem wants per-system
+        # long (B,), so flatten + cast.
+        charge = getattr(data, "charge", None)
+        if charge is None:
+            charge = torch.zeros(n_systems, dtype=torch.long, device=device)
+        else:
+            charge = charge.to(torch.long).reshape(n_systems)
+
+        spin = getattr(data, "spin", None)
+        if spin is None:
+            spin = torch.zeros(n_systems, dtype=torch.long, device=device)
+        else:
+            spin = spin.to(torch.long).reshape(n_systems)
+
+        # Empty edges — predict_unit rebuilds the graph internally.
+        edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        cell_offsets = torch.empty((0, 3), dtype=target_dtype, device=device)
+        nedges = torch.zeros(n_systems, dtype=torch.long, device=device)
+
+        fixed = torch.zeros(total_atoms, dtype=torch.long, device=device)
+        tags = torch.zeros(total_atoms, dtype=torch.long, device=device)
+
+        fc_data = FCAtomicData(
+            pos=pos,
+            atomic_numbers=atomic_numbers,
+            cell=cell,
+            pbc=pbc,
+            natoms=natoms,
+            edge_index=edge_index,
+            cell_offsets=cell_offsets,
+            nedges=nedges,
+            charge=charge,
+            spin=spin,
+            fixed=fixed,
+            tags=tags,
+            batch=batch_idx,
+            sid=[""] * n_systems,
+            dataset=[self.task_name] * n_systems,
+        )
+
+        return fc_data
+
+    def adapt_output(
+        self, raw: dict, data: AtomicData | Batch | None = None
+    ) -> ModelOutputs:
+        """Map fairchem's prediction dict to nvalchemi's output keys.
+
+        Parameters
+        ----------
+        raw : dict
+            fairchem's prediction dict: ``"energy"`` (per-system), ``"forces"``
+            (per-atom ``[N, 3]``), and optionally ``"stress"`` (per-system).
+        data : AtomicData | Batch | None, optional
+            The input system the outputs were computed for. Unused here.
+
+        Returns
+        -------
+        ModelOutputs
+            The active subset of ``energy`` ``[B, 1]``, ``forces`` ``[N, 3]``, and
+            ``stress`` ``[B, 3, 3]``.
+        """
+        out: dict[str, torch.Tensor] = {}
+        active = self.model_config.active_outputs
+        target_dtype = self.predict_unit.inference_settings.base_precision_dtype
+
+        if "energy" in active:
+            energy = raw["energy"]
+            # fairchem returns energy in fp64; cast to base precision so all
+            # outputs share one dtype.
+            energy = energy.to(target_dtype)
+            # Ensure per-system 2D shape (n_graphs, 1).
+            if energy.dim() == 1:
+                energy = energy.unsqueeze(-1)
+            out["energy"] = energy
+        if "forces" in active:
+            out["forces"] = raw["forces"]
+        if "stress" in active and "stress" in raw:
+            stress = raw["stress"]
+            if stress.dim() == 2 and stress.shape[-1] == 9:
+                # fairchem sometimes flattens stress; reshape to (n, 3, 3).
+                stress = stress.reshape(-1, 3, 3)
+            out["stress"] = stress
+
+        return out
+
+    # ------------------------------------------------------------------
+    # forward
+    # ------------------------------------------------------------------
+
+    def forward(self, data: AtomicData | Batch, **kwargs: Any) -> ModelOutputs:
+        """Run the UMA predict unit on ``data``.
+
+        Pipeline: ``adapt_input`` -> ``MLIPPredictUnit.predict`` -> ``adapt_output``.
+        The single distribution touchpoint is ``ctx.maybe_pad_graph``, which under
+        compiled domain decomposition pads the fairchem graph to stable per-rank
+        shapes (a no-op single-process). The two blocks below handle fairchem's own
+        compile requirements: CPU routing for the first-call MoLE merge, and
+        forcing static shapes.
+
+        Parameters
+        ----------
+        data : AtomicData | Batch
+            Input structure(s); promoted to a ``Batch`` by ``adapt_input``.
+
+        Returns
+        -------
+        ModelOutputs
+            ``energy`` (per system) plus ``forces`` / ``stress`` per
+            ``model_config.active_outputs``.
+        """
+        fc_data = current_dd_context().maybe_pad_graph(self.adapt_input(data, **kwargs))
+
+        settings = getattr(self.predict_unit, "inference_settings", None)
+        first_call = not getattr(self.predict_unit, "lazy_model_intialized", True)
+        compiling = settings is not None and getattr(settings, "compile", False)
+        if first_call and settings is not None and (
+            getattr(settings, "merge_mole", False) or compiling
+        ):
+            fc_data = fc_data.to(torch.device("cpu"))
+        static_cm = (
+            force_compile_static()
+            if (first_call and compiling)
+            else contextlib.nullcontext()
+        )
+        with static_cm:
+            raw = self.predict_unit.predict(fc_data, undo_element_references=True)
+        return self.adapt_output(raw, data=data)

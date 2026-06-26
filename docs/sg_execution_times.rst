@@ -6,7 +6,7 @@
 
 Computation times
 =================
-**00:00.026** total execution time for 19 files **from all galleries**:
+**00:05.372** total execution time for 20 files **from all galleries**:
 
 .. container::
 
@@ -32,8 +32,14 @@ Computation times
    * - Example
      - Time
      - Mem (MB)
-   * - :ref:`sphx_glr_examples_distributed_02_distributed_monitoring.py` (``../examples/distributed/02_distributed_monitoring.py``)
-     - 00:00.026
+   * - :ref:`sphx_glr_examples_intermediate_02_trajectory_zarr_io.py` (``../examples/intermediate/02_trajectory_zarr_io.py``)
+     - 00:04.514
+     - 0.0
+   * - :ref:`sphx_glr_examples_intermediate_04_inflight_batching.py` (``../examples/intermediate/04_inflight_batching.py``)
+     - 00:00.516
+     - 0.0
+   * - :ref:`sphx_glr_examples_distributed_01_distributed_pipeline.py` (``../examples/distributed/01_distributed_pipeline.py``)
+     - 00:00.341
      - 0.0
    * - :ref:`sphx_glr_examples_advanced_01_biased_potential.py` (``../examples/advanced/01_biased_potential.py``)
      - 00:00.000
@@ -56,6 +62,9 @@ Computation times
    * - :ref:`sphx_glr_examples_advanced_07_composable_model_composition.py` (``../examples/advanced/07_composable_model_composition.py``)
      - 00:00.000
      - 0.0
+   * - :ref:`sphx_glr_examples_advanced_08_aimnet2_ewald_pipeline.py` (``../examples/advanced/08_aimnet2_ewald_pipeline.py``)
+     - 00:00.000
+     - 0.0
    * - :ref:`sphx_glr_examples_basic_01_data_structures.py` (``../examples/basic/01_data_structures.py``)
      - 00:00.000
      - 0.0
@@ -71,19 +80,13 @@ Computation times
    * - :ref:`sphx_glr_examples_basic_05_nvt_langevin.py` (``../examples/basic/05_nvt_langevin.py``)
      - 00:00.000
      - 0.0
-   * - :ref:`sphx_glr_examples_distributed_01_distributed_pipeline.py` (``../examples/distributed/01_distributed_pipeline.py``)
+   * - :ref:`sphx_glr_examples_distributed_02_distributed_monitoring.py` (``../examples/distributed/02_distributed_monitoring.py``)
      - 00:00.000
      - 0.0
    * - :ref:`sphx_glr_examples_intermediate_01_multistage_pipeline.py` (``../examples/intermediate/01_multistage_pipeline.py``)
      - 00:00.000
      - 0.0
-   * - :ref:`sphx_glr_examples_intermediate_02_trajectory_zarr_io.py` (``../examples/intermediate/02_trajectory_zarr_io.py``)
-     - 00:00.000
-     - 0.0
-   * - :ref:`sphx_glr_examples_intermediate_03_npt_variable_cell.py` (``../examples/intermediate/03_npt_variable_cell.py``)
-     - 00:00.000
-     - 0.0
-   * - :ref:`sphx_glr_examples_intermediate_04_inflight_batching.py` (``../examples/intermediate/04_inflight_batching.py``)
+   * - :ref:`sphx_glr_examples_intermediate_03_npt_barostat_validation.py` (``../examples/intermediate/03_npt_barostat_validation.py``)
      - 00:00.000
      - 0.0
    * - :ref:`sphx_glr_examples_intermediate_05_safety_and_monitoring.py` (``../examples/intermediate/05_safety_and_monitoring.py``)

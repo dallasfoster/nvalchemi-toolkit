@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for ``nvalchemi.dynamics.hooks.periodic`` — Tier 1 periodic hook.
+"""Unit tests for ``nvalchemi.hooks.periodic`` — Tier 1 periodic hook.
 
 Covers :class:`WrapPeriodicHook`.
 """
@@ -22,9 +22,9 @@ from __future__ import annotations
 import torch
 
 from nvalchemi.data import AtomicData, Batch
-from nvalchemi.dynamics.base import BaseDynamics, Hook, HookStageEnum
-from nvalchemi.dynamics.hooks.periodic import WrapPeriodicHook
-from nvalchemi.models.demo import DemoModelWrapper
+from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
+from nvalchemi.hooks import Hook, HookContext, WrapPeriodicHook
+from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -51,7 +51,7 @@ def _make_periodic_batch(
     batch = Batch.from_data_list(data_list).to(device)
     total_atoms = n_graphs * atoms_per_graph
     batch["forces"] = torch.zeros(total_atoms, 3, device=device)
-    batch["energies"] = torch.zeros(n_graphs, 1, device=device)
+    batch["energy"] = torch.zeros(n_graphs, 1, device=device)
     # Normalize cell/pbc to (B, 3, 3) and (B, 3) via storage API
     batch["cell"] = (
         torch.eye(3, device=device).unsqueeze(0).expand(n_graphs, -1, -1) * cell_size
@@ -61,7 +61,45 @@ def _make_periodic_batch(
 
 
 def _make_dynamics() -> BaseDynamics:
-    return BaseDynamics(DemoModelWrapper())
+    return BaseDynamics(DemoModelWrapper(DemoModel()))
+
+
+def _make_ctx(batch: Batch, dynamics: BaseDynamics) -> HookContext:
+    """Build a HookContext from a batch and dynamics instance."""
+    converged = dynamics._last_converged
+    if converged is not None:
+        mask = torch.zeros(
+            batch.num_graphs, dtype=torch.bool, device=batch.positions.device
+        )
+        mask[converged] = True
+    else:
+        mask = None
+    return HookContext(
+        batch=batch,
+        step_count=dynamics.step_count,
+        model=dynamics.model,
+        converged_mask=mask,
+        global_rank=dynamics.global_rank,
+    )
+
+
+def _make_ctx(batch: Batch, dynamics: BaseDynamics) -> HookContext:
+    """Build a HookContext from a batch and dynamics instance."""
+    converged = dynamics._last_converged
+    if converged is not None:
+        mask = torch.zeros(
+            batch.num_graphs, dtype=torch.bool, device=batch.positions.device
+        )
+        mask[converged] = True
+    else:
+        mask = None
+    return HookContext(
+        batch=batch,
+        step_count=dynamics.step_count,
+        model=dynamics.model,
+        converged_mask=mask,
+        global_rank=dynamics.global_rank,
+    )
 
 
 # ===========================================================================
@@ -86,8 +124,9 @@ class TestWrapPeriodicHook:
             device=device,
         )
 
-        hook = WrapPeriodicHook()
-        hook(batch, dynamics)
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        ctx = _make_ctx(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_POST_UPDATE)
 
         assert (batch.positions >= 0.0).all()
         assert (batch.positions < 10.0 + 1e-6).all()
@@ -113,8 +152,9 @@ class TestWrapPeriodicHook:
         )
         positions_before = batch.positions.clone()
 
-        hook = WrapPeriodicHook()
-        hook(batch, dynamics)
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        ctx = _make_ctx(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_POST_UPDATE)
 
         assert torch.allclose(batch.positions, positions_before, atol=1e-5)
 
@@ -134,8 +174,9 @@ class TestWrapPeriodicHook:
             device=device,
         )
 
-        hook = WrapPeriodicHook()
-        hook(batch, dynamics)
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        ctx = _make_ctx(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_POST_UPDATE)
 
         expected = torch.tensor(
             [[2.0, 7.0, 25.0], [5.0, 5.0, -5.0], [0.0, 0.0, 0.0]],
@@ -160,8 +201,9 @@ class TestWrapPeriodicHook:
         )
         positions_before = batch.positions.clone()
 
-        hook = WrapPeriodicHook()
-        hook(batch, dynamics)
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        ctx = _make_ctx(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_POST_UPDATE)
 
         assert torch.allclose(batch.positions, positions_before)
 
@@ -183,8 +225,9 @@ class TestWrapPeriodicHook:
             device=device,
         )
 
-        hook = WrapPeriodicHook()
-        hook(batch, dynamics)
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        ctx = _make_ctx(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_POST_UPDATE)
 
         expected = torch.tensor(
             [[6.5, 5.0, 5.0], [5.0, 5.0, 5.0], [0.0, 0.0, 0.0]],
@@ -207,8 +250,9 @@ class TestWrapPeriodicHook:
         )
         positions_ref = batch.positions
 
-        hook = WrapPeriodicHook()
-        hook(batch, dynamics)
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        ctx = _make_ctx(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_POST_UPDATE)
 
         assert positions_ref is batch.positions
 
@@ -237,8 +281,9 @@ class TestWrapPeriodicHook:
             device=device,
         )
 
-        hook = WrapPeriodicHook()
-        hook(batch, dynamics)
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        ctx = _make_ctx(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_POST_UPDATE)
 
         expected = torch.tensor(
             [[2.0, 0.0, 0.0], [5.0, 5.0, 5.0], [2.0, 0.0, 0.0], [3.0, 3.0, 3.0]],
@@ -247,19 +292,19 @@ class TestWrapPeriodicHook:
         assert torch.allclose(batch.positions, expected, atol=1e-5)
 
     def test_stage_is_after_post_update(self) -> None:
-        hook = WrapPeriodicHook()
-        assert hook.stage == HookStageEnum.AFTER_POST_UPDATE
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        assert hook.stage == DynamicsStage.AFTER_POST_UPDATE
 
     def test_default_frequency_is_one(self) -> None:
-        hook = WrapPeriodicHook()
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
         assert hook.frequency == 1
 
     def test_custom_frequency(self) -> None:
-        hook = WrapPeriodicHook(frequency=10)
+        hook = WrapPeriodicHook(frequency=10, stage=DynamicsStage.AFTER_POST_UPDATE)
         assert hook.frequency == 10
 
     def test_is_hook(self) -> None:
-        hook = WrapPeriodicHook()
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
         assert isinstance(hook, Hook)
 
 
@@ -285,8 +330,9 @@ class TestWrapPeriodicHookDimensionSqueeze:
             device=device,
         )
 
-        hook = WrapPeriodicHook()
-        hook(batch, dynamics)  # must not raise and must produce correct wrapped pos
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        ctx = _make_ctx(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_POST_UPDATE)  # must not raise
 
         # Atom 0 at 12.0 in a 10.0-cell wraps to 2.0
         assert torch.allclose(
@@ -305,8 +351,9 @@ class TestWrapPeriodicHookDimensionSqueeze:
             device=device,
         )
 
-        hook = WrapPeriodicHook()
-        hook(batch, dynamics)
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        ctx = _make_ctx(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_POST_UPDATE)
 
         assert torch.allclose(
             batch.positions[0, 0], torch.tensor(2.0, device=device), atol=1e-5
@@ -324,8 +371,9 @@ class TestWrapPeriodicHookDimensionSqueeze:
             device=device,
         )
 
-        hook = WrapPeriodicHook()
-        hook(batch, dynamics)
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        ctx = _make_ctx(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_POST_UPDATE)
 
         # -1.0 wraps to 9.0 in a 10.0-cell
         assert torch.allclose(
@@ -344,17 +392,16 @@ class TestWrapPeriodicHookCompile:
         return kw
 
     def test_compiles_fullgraph(self, device: str) -> None:
-        """WrapPeriodicHook compiles with fullgraph=True."""
+        """WrapPeriodicHook._wrap_positions compiles with fullgraph=True."""
         batch = _make_periodic_batch(cell_size=10.0, device=device)
-        dynamics = _make_dynamics()
         batch["positions"] = torch.tensor(
             [[12.0, 0.0, 0.0], [5.0, 5.0, 5.0], [0.0, 0.0, 0.0]],
             device=device,
         )
 
-        hook = WrapPeriodicHook()
-        compiled_hook = torch.compile(hook, **self._compile_kwargs(device))
-        compiled_hook(batch, dynamics)
+        hook = WrapPeriodicHook(stage=DynamicsStage.AFTER_POST_UPDATE)
+        compiled = torch.compile(hook._wrap_positions, **self._compile_kwargs(device))
+        compiled(batch)
 
         expected = torch.tensor(
             [[2.0, 0.0, 0.0], [5.0, 5.0, 5.0], [0.0, 0.0, 0.0]],

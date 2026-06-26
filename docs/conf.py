@@ -68,13 +68,13 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
     "sphinx.ext.autosummary",
+    "sphinx.ext.intersphinx",
     "sphinx_favicon",
     "myst_parser",
     "sphinx_design",
     "sphinx_togglebutton",
     "sphinx.ext.graphviz",
     "sphinx_gallery.gen_gallery",
-    "model_card_ext",
 ]
 
 source_suffix = [".rst", ".md"]
@@ -86,7 +86,6 @@ templates_path = ["templates"]
 exclude_patterns = [
     "_build",
     "sphinxext.py",
-    "model_card_ext.py",
     "Thumbs.db",
     ".DS_Store",
 ]
@@ -112,7 +111,12 @@ html_theme_options = {
     "navbar_start": [
         "navbar-logo",
     ],
-    "external_links": [],
+    "external_links": [
+        {
+            "name": "Changelog",
+            "url": "https://github.com/NVIDIA/nvalchemi-toolkit/blob/main/CHANGELOG.md",
+        },
+    ],
     "icon_links": [
         {
             # Label for this link
@@ -168,3 +172,6 @@ sphinx_gallery_conf = {
     "min_reported_time": 0,
     "capture_repr": ("_repr_html_", "__repr__"),
 }
+
+# mapping for other packages
+intersphinx_mapping = {"torch": ("https://pytorch.org/docs/stable/", None)}

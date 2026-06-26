@@ -27,9 +27,10 @@ import pytest
 import torch
 
 from nvalchemi.data import AtomicData, Batch
+from nvalchemi.dynamics._units import fs_to_internal_time
 from nvalchemi.dynamics.integrators.nph import NPH
 from nvalchemi.dynamics.integrators.npt import NPT
-from nvalchemi.models.demo import DemoModelWrapper
+from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -37,14 +38,17 @@ from nvalchemi.models.demo import DemoModelWrapper
 
 
 def _make_barostat_batch(
-    n_atoms: int = 4, n_graphs: int = 1, device: str = "cpu"
+    n_atoms: int = 4,
+    n_graphs: int = 1,
+    device: str = "cpu",
+    int_dtype: torch.dtype = torch.long,
 ) -> Batch:
     """Build a minimal Batch suitable for NPH / NPT integrator tests."""
     dtype = torch.float32
     atoms_per = n_atoms // n_graphs
     data_list = [
         AtomicData(
-            atomic_numbers=torch.tensor([18] * atoms_per, dtype=torch.long),
+            atomic_numbers=torch.tensor([18] * atoms_per, dtype=int_dtype),
             positions=torch.randn(atoms_per, 3),
         )
         for _ in range(n_graphs)
@@ -85,7 +89,7 @@ class TestNPHIntegrator:
     def nph(self):
         """Return a freshly constructed NPH integrator."""
         return NPH(
-            model=DemoModelWrapper(),
+            model=DemoModelWrapper(DemoModel()),
             dt=0.001,
             pressure=1.0,
             barostat_time=100.0,
@@ -105,14 +109,14 @@ class TestNPHIntegrator:
 
     def test_init_stores_parameters(self, nph):
         """Constructor arguments are stored on the integrator."""
-        assert nph._dt_init == 0.001
+        assert nph._dt_init == fs_to_internal_time(0.001)
         assert nph._pressure_init == 1.0
-        assert nph._barostat_time_init == 100.0
+        assert nph._barostat_time_init == fs_to_internal_time(100.0)
         assert nph.pressure_coupling == "isotropic"
 
     def test_needs_keys(self):
         """NPH declares the correct set of required input keys."""
-        assert NPH.__needs_keys__ == {"forces", "stresses"}
+        assert NPH.__needs_keys__ == {"forces", "stress"}
 
     def test_provides_keys(self):
         """NPH declares the correct set of provided output keys."""
@@ -173,6 +177,14 @@ class TestNPHIntegrator:
         nph.pre_update(batch)
         nph.post_update(batch)
 
+    @pytest.mark.parametrize("int_dtype", [torch.int32, torch.int64])
+    def test_pre_post_update_with_int_dtypes(self, nph, device, int_dtype: torch.dtype):
+        """NPH pre_update/post_update work with both int32 and int64 indices."""
+        batch = _make_barostat_batch(int_dtype=int_dtype, device=device)
+        nph._init_state(batch)
+        nph.pre_update(batch)
+        nph.post_update(batch)
+
     def test_pre_update_modifies_positions(self, nph_with_state):
         """pre_update changes at least some atomic positions in the batch."""
         nph, batch = nph_with_state
@@ -194,6 +206,59 @@ class TestNPHIntegrator:
         assert nph._state.W.shape == (M,)
         assert nph._state.cell_velocity.shape == (M, 3, 3)
 
+    # ------------------------------------------------------------------
+    # Non-isotropic modes
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "mode,pressure",
+        [
+            ("anisotropic", torch.tensor([[1.0, 1.0, 1.0]])),
+            ("triclinic", torch.eye(3).unsqueeze(0)),
+        ],
+    )
+    def test_W_divided_for_non_isotropic(self, mode, pressure):
+        """Barostat mass W is divided by 3 for non-isotropic modes."""
+        nph_iso = NPH(
+            model=DemoModelWrapper(DemoModel()),
+            dt=0.001,
+            pressure=1.0,
+            barostat_time=100.0,
+            pressure_coupling="isotropic",
+        )
+        nph_aniso = NPH(
+            model=DemoModelWrapper(DemoModel()),
+            dt=0.001,
+            pressure=pressure,
+            barostat_time=100.0,
+            pressure_coupling=mode,
+        )
+        batch = _make_barostat_batch()
+        nph_iso._init_state(batch)
+        nph_aniso._init_state(batch)
+        assert torch.allclose(nph_iso._state.W / 3, nph_aniso._state.W, atol=1e-6)
+
+    @pytest.mark.parametrize(
+        "mode,pressure",
+        [
+            ("anisotropic", torch.tensor([[1.0, 1.0, 1.0]])),
+            ("triclinic", torch.eye(3).unsqueeze(0)),
+        ],
+    )
+    def test_pre_post_update_runs_for_non_isotropic_modes(self, mode, pressure):
+        """pre_update and post_update complete for non-isotropic modes."""
+        nph = NPH(
+            model=DemoModelWrapper(DemoModel()),
+            dt=0.001,
+            pressure=pressure,
+            barostat_time=100.0,
+            pressure_coupling=mode,
+        )
+        batch = _make_barostat_batch()
+        nph._init_state(batch)
+        nph.pre_update(batch)
+        nph.post_update(batch)
+
 
 # ---------------------------------------------------------------------------
 # NPT tests
@@ -212,7 +277,7 @@ class TestNPTIntegrator:
     def npt(self):
         """Return a freshly constructed NPT integrator with chain_length=3."""
         return NPT(
-            model=DemoModelWrapper(),
+            model=DemoModelWrapper(DemoModel()),
             dt=0.001,
             temperature=300.0,
             pressure=1.0,
@@ -235,17 +300,17 @@ class TestNPTIntegrator:
 
     def test_init_stores_parameters(self, npt):
         """Constructor arguments are stored on the integrator."""
-        assert npt._dt_init == 0.001
+        assert npt._dt_init == fs_to_internal_time(0.001)
         assert npt._temperature_init == 300.0
         assert npt._pressure_init == 1.0
-        assert npt._barostat_time_init == 100.0
-        assert npt._thermostat_time_init == 100.0
+        assert npt._barostat_time_init == fs_to_internal_time(100.0)
+        assert npt._thermostat_time_init == fs_to_internal_time(100.0)
         assert npt.pressure_coupling == "isotropic"
         assert npt.chain_length == 3
 
     def test_needs_keys(self):
         """NPT declares the correct set of required input keys."""
-        assert NPT.__needs_keys__ == {"forces", "stresses"}
+        assert NPT.__needs_keys__ == {"forces", "stress"}
 
     def test_provides_keys(self):
         """NPT declares the correct set of provided output keys."""
@@ -314,7 +379,7 @@ class TestNPTIntegrator:
     def test_chain_length_respected(self):
         """The NHC arrays have the requested chain_length as their second dimension."""
         npt5 = NPT(
-            model=DemoModelWrapper(),
+            model=DemoModelWrapper(DemoModel()),
             dt=0.001,
             temperature=300.0,
             pressure=1.0,
@@ -326,3 +391,110 @@ class TestNPTIntegrator:
         npt5._init_state(batch)
         assert npt5._state.nhc_Q.shape[1] == 5
         assert npt5._state.nhc_b_Q.shape[1] == 5
+
+    # ------------------------------------------------------------------
+    # Non-isotropic modes
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "mode,pressure",
+        [
+            ("anisotropic", torch.tensor([[1.0, 1.0, 1.0]])),
+            ("triclinic", torch.eye(3).unsqueeze(0)),
+        ],
+    )
+    def test_init_state_preserves_pressure_shape(self, mode, pressure):
+        """_init_state keeps anisotropic [M,3] and triclinic [M,3,3] shapes."""
+        npt = NPT(
+            model=DemoModelWrapper(DemoModel()),
+            dt=0.001,
+            temperature=300.0,
+            pressure=pressure,
+            barostat_time=100.0,
+            thermostat_time=100.0,
+            pressure_coupling=mode,
+        )
+        batch = _make_barostat_batch()
+        npt._init_state(batch)
+        assert npt._state.pressure.shape == pressure.shape
+
+    @pytest.mark.parametrize(
+        "mode,pressure",
+        [
+            ("isotropic", 1.0),
+            ("anisotropic", torch.tensor([[1.0, 1.0, 1.0]])),
+            ("triclinic", torch.eye(3).unsqueeze(0)),
+        ],
+    )
+    def test_nhc_b_Q_shape_all_modes(self, mode, pressure):
+        """Barostat NHC chain masses have shape [M, chain_length] for all modes."""
+        chain_length = 3
+        npt = NPT(
+            model=DemoModelWrapper(DemoModel()),
+            dt=0.001,
+            temperature=300.0,
+            pressure=pressure,
+            barostat_time=100.0,
+            thermostat_time=100.0,
+            pressure_coupling=mode,
+            chain_length=chain_length,
+        )
+        batch = _make_barostat_batch()
+        npt._init_state(batch)
+        M = batch.num_graphs
+        assert npt._state.nhc_b_Q.shape == (M, chain_length)
+
+    @pytest.mark.parametrize(
+        "mode,pressure",
+        [
+            ("anisotropic", torch.tensor([[1.0, 1.0, 1.0]])),
+            ("triclinic", torch.eye(3).unsqueeze(0)),
+        ],
+    )
+    def test_W_divided_for_non_isotropic(self, mode, pressure):
+        """Barostat mass W is divided by 3 for non-isotropic modes."""
+        npt_iso = NPT(
+            model=DemoModelWrapper(DemoModel()),
+            dt=0.001,
+            temperature=300.0,
+            pressure=1.0,
+            barostat_time=100.0,
+            thermostat_time=100.0,
+            pressure_coupling="isotropic",
+        )
+        npt_aniso = NPT(
+            model=DemoModelWrapper(DemoModel()),
+            dt=0.001,
+            temperature=300.0,
+            pressure=pressure,
+            barostat_time=100.0,
+            thermostat_time=100.0,
+            pressure_coupling=mode,
+        )
+        batch = _make_barostat_batch()
+        npt_iso._init_state(batch)
+        npt_aniso._init_state(batch)
+        assert torch.allclose(npt_iso._state.W / 3, npt_aniso._state.W, atol=1e-6)
+
+    @pytest.mark.parametrize(
+        "mode,pressure",
+        [
+            ("anisotropic", torch.tensor([[1.0, 1.0, 1.0]])),
+            ("triclinic", torch.eye(3).unsqueeze(0)),
+        ],
+    )
+    def test_pre_post_update_runs_for_non_isotropic_modes(self, mode, pressure):
+        """pre_update and post_update complete for non-isotropic modes."""
+        npt = NPT(
+            model=DemoModelWrapper(DemoModel()),
+            dt=0.001,
+            temperature=300.0,
+            pressure=pressure,
+            barostat_time=100.0,
+            thermostat_time=100.0,
+            pressure_coupling=mode,
+        )
+        batch = _make_barostat_batch()
+        npt._init_state(batch)
+        npt.pre_update(batch)
+        npt.post_update(batch)

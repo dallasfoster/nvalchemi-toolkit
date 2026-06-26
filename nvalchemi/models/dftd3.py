@@ -23,7 +23,8 @@ Usage
 ::
 
     from nvalchemi.models.dftd3 import DFTD3ModelWrapper
-    from nvalchemi.dynamics.hooks import NeighborListHook
+    from nvalchemi.hooks import NeighborListHook
+    from nvalchemi.dynamics.base import DynamicsStage
 
     # PBE-D3(BJ) parameters (Grimme 2010)
     model = DFTD3ModelWrapper(
@@ -32,23 +33,26 @@ Usage
         s8=0.7875,
     )
 
-    nl_hook = NeighborListHook(model.model_card.neighbor_config)
+    nl_hook = NeighborListHook(model.model_config.neighbor_config, stage=DynamicsStage.BEFORE_COMPUTE)
     dynamics.register_hook(nl_hook)
     dynamics.model = model
 
 Notes
 -----
 * Forces are computed **analytically** inside the Warp kernel (not via
-  autograd), so :attr:`~ModelCard.forces_via_autograd` is ``False``.
-* Positions and cell are converted from Å → Bohr before the kernel call
+  autograd), so ``"forces"`` is NOT in ``autograd_outputs``.
+* Positions and cell are converted from Å -> Bohr before the kernel call
   and outputs are converted back to eV/Å.
 * D3 parameters are loaded from a ``.pt`` cache file (default location
   ``~/.cache/nvalchemiops/dftd3_parameters.pt``).  When the file is absent,
   :func:`load_dftd3_params` calls :func:`extract_dftd3_parameters` which
   downloads the Fortran reference archive from the Grimme group website,
   parses it in-memory, and caches the result automatically.
-* Stress/virial computation (needed for NPT/NPH) is available via
-  ``model_config.compute_stresses = True``.
+* Stress/virial computation (needed for NPT/NPH) is enabled by including
+  ``"stress"`` in ``model_config.active_outputs``.
+* The reference Fortran DFT-D3 implementation uses a cutoff of 95 Bohr
+  (~50 Å) with no smoothing.  This wrapper defaults to a shorter cutoff
+  (15 Å) with C5-style smoothing controlled by ``smoothing_fraction``.
 """
 
 from __future__ import annotations
@@ -67,10 +71,8 @@ from torch import nn
 
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data import AtomicData, Batch
-from nvalchemi.models._ops.neighbor_filter import prepare_neighbors_for_model
 from nvalchemi.models.base import (
     BaseModelMixin,
-    ModelCard,
     ModelConfig,
     NeighborConfig,
     NeighborListFormat,
@@ -89,6 +91,7 @@ __all__ = [
 BOHR_TO_ANGSTROM: float = 0.529177210544
 ANGSTROM_TO_BOHR: float = 1.0 / BOHR_TO_ANGSTROM
 HARTREE_TO_EV: float = 27.211386245981
+
 
 # ---------------------------------------------------------------------------
 # DFT-D3 reference parameter source
@@ -272,11 +275,11 @@ def extract_dftd3_parameters(
     -------
     dict[str, torch.Tensor]
         ``"rcov"``   — covalent radii, shape ``[95]``, Bohr (float32)
-        ``"r4r2"``   — ⟨r⁴⟩/⟨r²⟩ expectation values, shape ``[95]`` (float32)
+        ``"r4r2"``   — <r4>/<r2> expectation values, shape ``[95]`` (float32)
         ``"c6ab"``   — C6 reference coefficients, shape ``[95, 95, 5, 5]`` (float32)
         ``"cn_ref"`` — CN reference grid, shape ``[95, 95, 5, 5]`` (float32)
 
-        Index 0 is reserved for padding; valid atomic numbers are 1–94.
+        Index 0 is reserved for padding; valid atomic numbers are 1-94.
 
     Raises
     ------
@@ -444,16 +447,17 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
     s8 : float
         C8 coefficient scaling factor (dimensionless, functional-specific).
     cutoff : float, optional
-        Interaction cutoff in Å.  Defaults to ``50.0`` Å (≈95 Bohr), which
-        covers virtually all D3 interactions.
+        Interaction cutoff in Å.  Defaults to ``15.0`` Å.
     k1 : float, optional
         Steepness of the CN counting function (1/Bohr).  Defaults to ``16.0``.
     k3 : float, optional
         Gaussian width for CN interpolation.  Defaults to ``-4.0``.
     s6 : float, optional
         C6 scaling factor.  Defaults to ``1.0``.
-    max_neighbors : int, optional
-        Maximum neighbors per atom for the neighbor matrix.  Defaults to 128.
+    smoothing_fraction : float, optional
+        Fraction of the cutoff radius over which the interaction is smoothly
+        tapered to zero.  Smoothing begins at ``cutoff * (1 - smoothing_fraction)``
+        and reaches zero at ``cutoff``.  Defaults to ``0.2``.
     auto_download : bool, optional
         Automatically download D3 parameters if the cache file is missing.
         Defaults to ``True``.
@@ -465,7 +469,7 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
     ----------
     model_config : ModelConfig
         Mutable configuration controlling which outputs are computed.
-        Set ``model.model_config.compute_stresses = True`` to enable
+        Include ``"stress"`` in ``model_config.active_outputs`` to enable
         virial computation for NPT/NPH simulations.
     rcov, r4r2, c6ab, cn_ref : nn.Buffer
         D3 reference parameters registered as module buffers so they move
@@ -477,15 +481,27 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
         a1: float,
         a2: float,
         s8: float,
-        cutoff: float = 50.0,
+        cutoff: float = 15.0,
         k1: float = 16.0,
         k3: float = -4.0,
         s6: float = 1.0,
-        max_neighbors: int = 128,
+        smoothing_fraction: float = 0.2,
         auto_download: bool = True,
         param_file: Path | str | None = None,
     ) -> None:
         super().__init__()
+        if cutoff <= 0.0:
+            raise ValueError(f"cutoff must be positive, got {cutoff!r}")
+        if a1 < 0.0:
+            raise ValueError(f"a1 must be non-negative, got {a1!r}")
+        if a2 < 0.0:
+            raise ValueError(f"a2 must be non-negative, got {a2!r}")
+        if s8 < 0.0:
+            raise ValueError(f"s8 must be non-negative, got {s8!r}")
+        if not (0.0 <= smoothing_fraction < 1.0):
+            raise ValueError(
+                f"smoothing_fraction must be in [0, 1), got {smoothing_fraction!r}"
+            )
         self.a1 = a1
         self.a2 = a2
         self.s8 = s8
@@ -493,9 +509,23 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
         self.k1 = k1
         self.k3 = k3
         self.s6 = s6
-        self.max_neighbors = max_neighbors
-        self.model_config = ModelConfig()
-        self._model_card: ModelCard = self._build_model_card()
+        self.smoothing_fraction = smoothing_fraction
+
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "forces", "stress"}),
+            active_outputs={"energy", "forces"},
+            autograd_outputs=frozenset(),
+            autograd_inputs=frozenset({"positions"}),
+            required_inputs=frozenset(),
+            optional_inputs=frozenset(),
+            supports_pbc=True,
+            needs_pbc=False,
+            neighbor_config=NeighborConfig(
+                cutoff=self.cutoff,
+                format=NeighborListFormat.MATRIX,
+                half_list=False,
+            ),
+        )
 
         # Load D3 parameters and register as buffers so .to(device) works.
         d3_params = load_dftd3_params(
@@ -510,26 +540,33 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
     # BaseModelMixin required properties
     # ------------------------------------------------------------------
 
-    def _build_model_card(self) -> ModelCard:
-        return ModelCard(
-            forces_via_autograd=False,
-            supports_energies=True,
-            supports_forces=True,
-            supports_stresses=True,
-            supports_pbc=True,
-            needs_pbc=False,
-            supports_non_batch=False,
-            neighbor_config=NeighborConfig(
-                cutoff=self.cutoff,
-                format=NeighborListFormat.MATRIX,
-                half_list=False,
-                max_neighbors=self.max_neighbors,
-            ),
-        )
-
     @property
-    def model_card(self) -> ModelCard:
-        return self._model_card
+    def distribution_spec(self) -> Any:
+        """Domain-decomposition spec for DFT-D3(BJ).
+
+        DFTD3 has no global coupling (coordination numbers, C6 interpolation,
+        and the dispersion sum are all within-cutoff), so it needs no cross-rank
+        op. The only seam is the per-system energy total: the wrapper emits raw
+        per-atom dispersion energies under ``atomic_energies`` and the framework
+        reduces them owned-aware, so :meth:`forward` carries no distributed
+        logic. Forces are direct per-atom, owned-only.
+
+        Returns
+        -------
+        MLIPSpec
+            :data:`~nvalchemi.distributed.spec.SPEC_DFTD3_HALO`.
+        """
+        import dataclasses  # noqa: PLC0415
+
+        from nvalchemi.distributed.spec import SPEC_DFTD3_HALO  # noqa: PLC0415
+
+        return dataclasses.replace(
+            SPEC_DFTD3_HALO,
+            distribution=dataclasses.replace(
+                SPEC_DFTD3_HALO.distribution, shard_fields=()
+            ),
+            node_energy_key="atomic_energies",
+        )
 
     @property
     def embedding_shapes(self) -> dict[str, tuple[int, ...]]:
@@ -576,18 +613,16 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
                 raise KeyError(f"'{key}' required but not found in input data.")
             input_dict[key] = value
 
-        input_dict["batch_idx"] = data.batch.to(torch.int32)
-        input_dict["ptr"] = data.ptr.to(torch.int32)
+        input_dict["batch_idx"] = data.batch_idx.to(torch.int32)
+        input_dict["ptr"] = data.batch_ptr.to(torch.int32)
         input_dict["num_graphs"] = data.num_graphs
         input_dict["fill_value"] = data.num_nodes
 
-        # Collect neighbor tensors (with optional filtering to model cutoff).
-        neighbor_dict = prepare_neighbors_for_model(
-            data, self.cutoff, NeighborListFormat.MATRIX, data.num_nodes
+        # In a pipeline, neighbor data is adapted to this model's cutoff/format
+        # before forward().
+        input_dict["neighbor_matrix_shifts"] = getattr(
+            data, "neighbor_matrix_shifts", None
         )
-        input_dict["neighbor_matrix"] = neighbor_dict["neighbor_matrix"]
-        input_dict["num_neighbors"] = neighbor_dict["num_neighbors"]
-        input_dict["neighbor_shifts"] = neighbor_dict.get("neighbor_shifts", None)
 
         # Optional PBC cell.
         try:
@@ -606,29 +641,41 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
         Adapt the model output to the framework output format.
         """
         output: ModelOutputs = OrderedDict()
-        output["energies"] = model_output["energies"]
-        if self.model_config.compute_forces:
+        output["energy"] = model_output["energy"]
+        if "forces" in self.model_config.active_outputs:
             output["forces"] = model_output["forces"]
-        if self.model_config.compute_stresses:
-            if "virials" in model_output:
-                # The dftd3 kernel accumulates the virial as W = -Σ r_ij ⊗ F_ij
-                # (negative convention).  The framework convention for
-                # batch.stress is the positive physical virial W_phys = +Σ r_ij ⊗ F_ij
-                # (energy units, eV).  Negate here to match LJ convention.
-                output["stresses"] = -model_output["virials"]
-            elif "stresses" in model_output:
-                output["stresses"] = model_output["stresses"]
+        if (
+            "atomic_energies" in self.model_config.active_outputs
+            and "atomic_energies" in model_output
+        ):
+            output["atomic_energies"] = model_output["atomic_energies"]
+        if "stress" in self.model_config.active_outputs:
+            if "virial" in model_output:
+                if not hasattr(data, "cell") or data.cell is None:
+                    raise ValueError(
+                        "stress output requires cell for volume computation"
+                    )
+                # Cauchy stress sigma = W/V (eV/A^3).
+                virial = model_output["virial"]
+                volume = torch.det(data.cell).abs().view(-1, 1, 1)
+                output["stress"] = virial / volume
+            elif "stress" in model_output:
+                output["stress"] = model_output["stress"]
+            else:
+                raise RuntimeError(
+                    "'stress' is in active_outputs but missing from model output"
+                )
         return output
 
     def output_data(self) -> set[str]:
         """
         Return the set of keys that the model produces.
         """
-        keys: set[str] = {"energies"}
-        if self.model_config.compute_forces:
+        keys: set[str] = {"energy"}
+        if "forces" in self.model_config.active_outputs:
             keys.add("forces")
-        if self.model_config.compute_stresses:
-            keys.add("stresses")
+        if "stress" in self.model_config.active_outputs:
+            keys.add("stress")
         return keys
 
     # ------------------------------------------------------------------
@@ -643,16 +690,16 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
         data : Batch
             Batch containing ``positions``, ``atomic_numbers``,
             ``neighbor_matrix``, ``num_neighbors``, and optionally
-            ``cell`` / ``neighbor_shifts`` (populated by
-            :class:`~nvalchemi.dynamics.hooks.NeighborListHook`).
+            ``cell`` / ``neighbor_matrix_shifts`` (populated by
+            :class:`~nvalchemi.hooks.NeighborListHook`).
 
         Returns
         -------
         ModelOutputs
-            OrderedDict with keys ``"energies"`` (shape ``[B, 1]``, eV),
+            OrderedDict with keys ``"energy"`` (shape ``[B, 1]``, eV),
             ``"forces"`` (shape ``[N, 3]``, eV/Å), and optionally
-            ``"stresses"`` (shape ``[B, 3, 3]``, eV — the physical virial
-            ``+Σ r_ij ⊗ F_ij``).
+            ``"stress"`` (shape ``[B, 3, 3]``, eV/Å³ — Cauchy stress
+            ``W/V``).
         """
         from nvalchemiops.torch.interactions.dispersion import (  # lazy
             D3Parameters,
@@ -664,7 +711,9 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
         positions = inp["positions"]  # (N, 3) Å
         numbers = inp["atomic_numbers"].to(torch.int32)  # (N,)
         neighbor_matrix = inp["neighbor_matrix"].contiguous()  # (N, K) int32
-        neighbor_shifts = inp.get("neighbor_shifts")  # (N, K, 3) int32 or None
+        neighbor_matrix_shifts = inp.get(
+            "neighbor_matrix_shifts"
+        )  # (N, K, 3) int32 or None
         batch_idx = inp["batch_idx"].contiguous()  # (N,) int32
         fill_value = inp["fill_value"]  # int
         B = inp["num_graphs"]
@@ -677,10 +726,7 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
         if cell is not None:
             cell_bohr = cell * ANGSTROM_TO_BOHR
 
-        # Also scale a2 from Bohr to Bohr (no conversion needed — a2 is
-        # already stored in Bohr, matching the kernel's expectation).
-
-        compute_virial = self.model_config.compute_stresses
+        compute_virial = "stress" in self.model_config.active_outputs
 
         d3_params = D3Parameters(
             rcov=self.rcov,
@@ -689,6 +735,16 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
             cn_ref=self.cn_ref,
         )
 
+        smoothing_on = self.cutoff * (1.0 - self.smoothing_fraction)
+        smoothing_off = self.cutoff
+
+        # Emit per-atom dispersion energies when the per-system total is
+        # assembled from them (PBC path) or when atomic_energies is requested;
+        # a plain non-PBC run takes the kernel's energy directly.
+        want_atomic = (
+            "atomic_energies" in self.model_config.active_outputs
+            or cell_bohr is not None
+        )
         result = dftd3(
             positions=positions_bohr,
             numbers=numbers,
@@ -698,39 +754,60 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
             k1=self.k1,
             k3=self.k3,
             s6=self.s6,
+            s5_smoothing_on=smoothing_on * ANGSTROM_TO_BOHR,
+            s5_smoothing_off=smoothing_off * ANGSTROM_TO_BOHR,
             d3_params=d3_params,
             fill_value=fill_value,
             batch_idx=batch_idx,
             cell=cell_bohr,
             neighbor_matrix=neighbor_matrix,
-            neighbor_matrix_shifts=neighbor_shifts,
+            neighbor_matrix_shifts=neighbor_matrix_shifts,
             compute_virial=compute_virial,
+            compute_atomic_energies=want_atomic,
             num_systems=B,
         )
 
-        # dftd3 returns (energy[B], forces[N,3], coord_num[N])
-        # or (energy[B], forces[N,3], coord_num[N], virial[B,3,3]) when compute_virial=True.
-        if compute_virial:
-            energy_ha, forces_ha_bohr, _coord_num, virial_ha = result
-        else:
-            energy_ha, forces_ha_bohr, _coord_num = result
-            virial_ha = None
+        # Return order (see ``dftd3``): energy, forces, coord_num, virial
+        # (if requested), atomic_energies always last (if requested).
+        result = list(result)
+        energy_ha = result[0]
+        forces_ha_bohr = result[1]
+        virial_ha = result[3] if compute_virial else None
+        atomic_energy_ha = result[-1] if want_atomic else None
 
-        # Convert units: Hartree → eV, Hartree/Bohr → eV/Å.
-        energies_ev = energy_ha.to(positions.dtype) * HARTREE_TO_EV  # (B,)
-        energies_ev = energies_ev.unsqueeze(-1)  # (B, 1)
+        # Convert units: Hartree -> eV, Hartree/Bohr -> eV/Å.
+        atomic_energies_ev: torch.Tensor | None = None
+        if want_atomic:
+            # Per-atom energies -> per-system totals; accumulate in fp64 so the
+            # total is order-independent.
+            atomic_energies_ev = atomic_energy_ha.to(torch.float64) * HARTREE_TO_EV
+            energies_ev = (
+                torch.zeros(B, dtype=torch.float64, device=positions.device)
+                .scatter_add_(0, batch_idx.to(torch.long), atomic_energies_ev)
+                .to(positions.dtype)
+                .unsqueeze(-1)
+            )  # (B, 1)
+        else:
+            energies_ev = (
+                energy_ha.to(positions.dtype) * HARTREE_TO_EV
+            ).unsqueeze(-1)  # (B, 1)
 
         forces_ev_ang = forces_ha_bohr.to(positions.dtype) * (
             HARTREE_TO_EV / BOHR_TO_ANGSTROM
         )  # (N, 3)
 
         model_output: dict[str, Any] = {
-            "energies": energies_ev,
+            "energy": energies_ev,
             "forces": forces_ev_ang,
         }
+        if (
+            atomic_energies_ev is not None
+            and "atomic_energies" in self.model_config.active_outputs
+        ):
+            model_output["atomic_energies"] = atomic_energies_ev
         if virial_ha is not None:
-            # Virial: Hartree → eV (purely energy units, no length scaling).
-            model_output["virials"] = virial_ha.to(positions.dtype) * HARTREE_TO_EV
+            # Virial: Hartree -> eV (purely energy units, no length scaling).
+            model_output["virial"] = virial_ha.to(positions.dtype) * HARTREE_TO_EV
 
         return self.adapt_output(model_output, data)
 

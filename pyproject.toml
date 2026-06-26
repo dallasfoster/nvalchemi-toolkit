@@ -12,8 +12,8 @@ readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = {file="LICENSE"}
 dependencies = [
-    "ase>=3.27.0",
-    "nvalchemi-toolkit-ops[torch]>=0.3.0",
+    "nvalchemi-toolkit-ops[torch]>=0.3.1",
+    "nvidia-physicsnemo==2.1.1",
     "torch>=2.5.1",
     "loguru",
     "numpy",
@@ -24,6 +24,7 @@ dependencies = [
     "plum-dispatch>=2.5.7",
     "zarr>=3",
     "periodictable==2.0.2",
+    "rich>=13.0.0",
 ]
 keywords = [
     "machine learning",
@@ -56,13 +57,22 @@ nvalchemi-io-test = "nvalchemi.data.io_test:main"
 
 # these are intended to be user-facing
 [project.optional-dependencies]
-training = [
-    "nvidia-physicsnemo[datapipes-extras]>=2.0.0"
+aimnet = [
+    "aimnet"
+]
+ase = [
+    "ase>=3.27.0",
+]
+pymatgen = [
+    "pymatgen>=2025.10.7",
 ]
 mace = [
-    "cuequivariance-ops-torch-cu12>=0.9.0",
-    "cuequivariance-torch>=0.9.0",
+    "cuequivariance-ops-torch-cu12>=0.8.0",
+    "cuequivariance-torch>=0.8.0",
     "mace-torch==0.3.15",
+]
+uma = [
+    "fairchem-core>=2.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -75,11 +85,39 @@ override-dependencies = [
   "python-hostlist; sys_platform == 'never'"
 ]
 
+# MACE 0.3.15 pins ``e3nn==0.4.4``; fairchem-core (required by UMA)
+# needs ``e3nn>=0.5``. The two extras cannot be installed in the same
+# environment. Declaring them as conflicting lets uv produce separate
+# resolutions — users pick one:
+#   uv sync --extra mace
+#   uv sync --extra uma
+# Both may be installed in parallel environments (e.g. via
+# ``uv venv .venv-mace`` + ``uv venv .venv-uma``) when a developer
+# needs to iterate on both stacks.
+conflicts = [
+    [
+        { extra = "mace" },
+        { extra = "uma" },
+    ],
+]
+
+# Pin nvalchemi-toolkit-ops to the 0.4.0-rc branch ahead of the 0.4.0
+# release. The branch adds a Warp-tile-based ``exclusive_scan_int32`` that
+# replaces the ``wp.utils.array_scan`` calls inside ``batch_build_cell_list``
+# (those use ``wp_alloc_device_async``, which is illegal during CUDA graph
+# stream capture), along with updated electrostatics/dftd3 models and
+# neighbor-list utilities. Repoint to the released version once 0.4.0 ships.
+[tool.uv.sources]
+nvalchemi-toolkit-ops = { git = "https://github.com/NVIDIA/nvalchemi-toolkit-ops.git", branch = "0.4.0-rc" }
+
 # these are intended to be developer facing
 [dependency-groups]
 build = [
     "ninja>=1.11.1.4",
-    "setuptools>=70.0.0",
+    # <81: setuptools 81 removed ``pkg_resources``, which fairchem-core's
+    # ``torchtnt`` dependency still imports at module load (the UMA stack
+    # fails to import otherwise).
+    "setuptools>=70.0.0,<81",
 ]
 dev = [
     "pre-commit",
@@ -98,7 +136,8 @@ dev = [
     "hypothesis>=6.135.10",
     "hypothesis-torch>=1.0.11",
     "rdkit>=2025.3.3",
-    "pytest-dependency>=0.6.0"
+    "pytest-dependency>=0.6.0",
+    "pytest-testmon>=2.2.0",
 ]
 distribution = [
   "pyarmor==9.1.8",
@@ -118,7 +157,6 @@ docs = [
     "python-dotenv==1.1.1"
 ]
 
-
 [tool.setuptools.packages.find]
 include = ["nvalchemi", "nvalchemi.*"]
 
@@ -128,7 +166,10 @@ url = "https://pypi.nvidia.com"
 format = "flat"
 
 [tool.ruff]
-exclude = [".licenses/", ".ci/", ".github/", ".git/", "build/", "dist/"]
+exclude = [".licenses/", ".ci/", ".github/", ".git/", "build/", "dist/", "nvalchemi/distributed/_core/_upstream/"]
+# force-exclude so pre-commit (which passes explicit file paths) still skips the
+# vendored _upstream copy.
+force-exclude = true
 
 [tool.ruff.lint]
 # Enable flake8/pycodestyle (`E`), Pyflakes (`F`), flake8-bandit (`S`),
@@ -145,6 +186,9 @@ ignore = ["E501", "S311", "F722", "F821"]
 "__init__.py" = ["F401"]
 "docs/*.py" = ["F401"]
 "examples/*.py" = ["E402", "S101"]
+# Benchmarks insert the suite dir on sys.path before importing it (E402) and
+# use asserts as sanity gates (S101) — same policy as examples/tests.
+"benchmark/**/*.py" = ["E402", "S101"]
 
 # Ignore `S101` (assertions) in all `test` files.
 "test/*.py" = ["S101"]
@@ -152,6 +196,11 @@ ignore = ["E501", "S311", "F722", "F821"]
 [tool.pytest.ini_options]
 testpaths = ["test"]
 norecursedirs = [".git", "third_party"]
+# Make the shared distributed-test helpers importable from any subfolder
+# (test/distributed/{_core,validate,model}/…) via ``from _helpers import …`` /
+# ``from _toy_gnn import …``. conftest *fixtures* auto-apply to subdirs; the
+# module-level helper classes need test/distributed on the path.
+pythonpath = ["test/distributed"]
 # show extra info on xfailed, xpassed, and skipped tests
 addopts = ["-vv", "-r", "xfXs"]
 markers = [
@@ -163,7 +212,7 @@ asyncio_mode = "auto"
 # ==== Coverage.py configuration (ran using pytest-cov) ====
 # See: https://coverage.readthedocs.io/en/latest/config.html
 [tool.coverage.run]
-branch = true
+branch = false
 concurrency = ["multiprocessing", "thread"]
 source = ["nvalchemi"]
 omit = [
@@ -208,5 +257,5 @@ fail-under = 95
 color = true
 omit-covered-files = false
 verbose = 2
-exclude = ["setup.py", "test/*", "docs", "build"]
+exclude = ["setup.py", "test/*", "docs", "build", "examples", "nvalchemi/distributed/_core/_upstream"]
 ignore-regex = ["^get$", "^mock_.*", ".*BaseClass.*"]

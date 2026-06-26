@@ -33,13 +33,16 @@ from nvalchemi.dynamics.base import (
     BufferConfig,
     ConvergenceHook,
     DistributedPipeline,
+    DynamicsStage,
     FusedStage,
     Hook,
-    HookStageEnum,
     _CommunicationMixin,
 )
-from nvalchemi.models.base import BaseModelMixin, ModelCard
-from nvalchemi.models.demo import DemoModelWrapper
+from nvalchemi.dynamics.hooks import ConvergedSnapshotHook
+from nvalchemi.dynamics.sinks import HostMemory
+from nvalchemi.hooks._context import HookContext
+from nvalchemi.models.base import BaseModelMixin, ModelConfig
+from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
 # -----------------------------------------------------------------------------
 # DemoModelWrapper Subclasses for Testing
@@ -52,7 +55,7 @@ class CountingDemoModel(DemoModelWrapper):
     # TODO: refactor this just to use register hook
 
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(DemoModel())
         self.forward_count = 0
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
@@ -62,29 +65,42 @@ class CountingDemoModel(DemoModelWrapper):
 
 
 class NonConservativeDemoModel(DemoModelWrapper):
-    """DemoModelWrapper with forces_via_autograd=False."""
+    """DemoModelWrapper with forces computed directly (not via autograd).
 
-    @property
-    def model_card(self) -> ModelCard:
-        """Return a non-conservative model card."""
-        return ModelCard(
-            forces_via_autograd=False,
-            supports_energies=True,
-            supports_forces=True,
-            supports_stresses=False,
-            supports_hessians=False,
-            supports_dipoles=False,
-            supports_non_batch=True,
+    Overrides forward to compute dummy analytical forces (negative of
+    embedding gradient direction) so that ``requires_grad`` is not needed
+    on positions.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(DemoModel())
+        self.model_config = ModelConfig(
+            outputs=frozenset({"energy", "forces"}),
+            autograd_outputs=frozenset(),
+            autograd_inputs=frozenset({"positions"}),
             neighbor_config=None,
             needs_pbc=False,
         )
+
+    def forward(self, data: Any, **kwargs: Any) -> Any:
+        """Compute energies and dummy analytical forces."""
+        model_inputs = self.adapt_input(data, **kwargs)
+        # Call the underlying DemoModel with compute_forces=False to avoid autograd
+        model_inputs["compute_forces"] = False
+        model_outputs = self.model(**model_inputs)
+        # Add dummy analytical forces (non-zero, non-conservative)
+        N = data.positions.shape[0]
+        model_outputs["forces"] = torch.randn(
+            N, 3, dtype=data.positions.dtype, device=data.positions.device
+        )
+        return self.adapt_output(model_outputs, data)
 
 
 class CountingNonConservativeDemoModel(NonConservativeDemoModel):
     """Non-conservative DemoModelWrapper that tracks forward calls."""
 
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__()  # NonConservativeDemoModel.__init__ handles DemoModel()
         self.forward_count = 0
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
@@ -109,7 +125,7 @@ def create_batch_with_status(n_graphs: int = 3, device: str = "cpu") -> Batch:
     ]
     batch = Batch.from_data_list(data_list, device=device)
     batch.forces = torch.zeros(batch.num_nodes, 3)
-    batch.energies = torch.zeros(batch.num_graphs, 1)
+    batch.energy = torch.zeros(batch.num_graphs, 1)
     return batch
 
 
@@ -144,7 +160,7 @@ class TestConvergenceHook:
 
     def setup_method(self) -> None:
         """Set up test fixtures before each test method."""
-        self.model = DemoModelWrapper()
+        self.model = DemoModelWrapper(DemoModel())
 
     def test_satisfies_hook_protocol(self) -> None:
         """ConvergenceHook should satisfy the Hook protocol."""
@@ -155,11 +171,12 @@ class TestConvergenceHook:
         """ConvergenceHook should have correct default attributes."""
         hook = ConvergenceHook()
         assert hook.frequency == 1
-        assert hook.stage == HookStageEnum.AFTER_STEP
-        # Default criteria is fmax with threshold 0.05
+        assert hook.stage == DynamicsStage.AFTER_STEP
+        # Default criteria uses forces with norm reduction and threshold 0.05
         assert len(hook.criteria) == 1
-        assert hook.criteria[0].key == "fmax"
+        assert hook.criteria[0].key == "forces"
         assert hook.criteria[0].threshold == 0.05
+        assert hook.criteria[0].reduce_op == "norm"
         # Default status migration is disabled
         assert hook.source_status is None
         assert hook.target_status is None
@@ -167,14 +184,13 @@ class TestConvergenceHook:
     def test_migrates_converged_samples(self) -> None:
         """Hook should migrate all converged samples with matching status."""
         batch = create_batch_with_status(n_graphs=3)
-        # All converged, all with source_status=0
-        batch.fmax = torch.tensor([0.01, 0.02, 0.03])
+        # All converged (force norms below 0.05), all with source_status=0
+        batch.forces = torch.tensor([[0.01, 0, 0], [0.02, 0, 0], [0.03, 0, 0]])
         batch.status = torch.tensor([0, 0, 0])
 
         hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1)
-        dynamics = BaseDynamics(model=self.model)
-
-        hook(batch, dynamics)
+        ctx = HookContext(batch=batch, step_count=0)
+        hook(ctx, DynamicsStage.AFTER_STEP)
 
         # All should be migrated to status=1
         assert (batch.status == 1).all()
@@ -182,14 +198,13 @@ class TestConvergenceHook:
     def test_ignores_wrong_status(self) -> None:
         """Hook should ignore converged samples with wrong source_status."""
         batch = create_batch_with_status(n_graphs=3)
-        # All converged, but source_status=2 doesn't match
-        batch.fmax = torch.tensor([0.01, 0.02, 0.03])
+        # All converged (force norms below 0.05), but source_status=2 doesn't match
+        batch.forces = torch.tensor([[0.01, 0, 0], [0.02, 0, 0], [0.03, 0, 0]])
         batch.status = torch.tensor([2, 2, 2])
 
         hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1)
-        dynamics = BaseDynamics(model=self.model)
-
-        hook(batch, dynamics)
+        ctx = HookContext(batch=batch, step_count=0)
+        hook(ctx, DynamicsStage.AFTER_STEP)
 
         # All should remain at status=2
         assert (batch.status == 2).all()
@@ -197,14 +212,13 @@ class TestConvergenceHook:
     def test_ignores_unconverged(self) -> None:
         """Hook should ignore samples that haven't converged."""
         batch = create_batch_with_status(n_graphs=3)
-        # All have correct status, but fmax too high
-        batch.fmax = torch.tensor([0.1, 0.2, 0.3])
+        # All have correct status, but force norms too high
+        batch.forces = torch.tensor([[0.1, 0, 0], [0.2, 0, 0], [0.3, 0, 0]])
         batch.status = torch.tensor([0, 0, 0])
 
         hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1)
-        dynamics = BaseDynamics(model=self.model)
-
-        hook(batch, dynamics)
+        ctx = HookContext(batch=batch, step_count=0)
+        hook(ctx, DynamicsStage.AFTER_STEP)
 
         # All should remain at status=0
         assert (batch.status == 0).all()
@@ -216,13 +230,14 @@ class TestConvergenceHook:
         # Sample 1: converged but wrong status -> no migrate
         # Sample 2: not converged but correct status -> no migrate
         # Sample 3: not converged and wrong status -> no migrate
-        batch.fmax = torch.tensor([0.01, 0.01, 0.1, 0.1])
+        batch.forces = torch.tensor(
+            [[0.01, 0, 0], [0.01, 0, 0], [0.1, 0, 0], [0.1, 0, 0]]
+        )
         batch.status = torch.tensor([0, 2, 0, 2])
 
         hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1)
-        dynamics = BaseDynamics(model=self.model)
-
-        hook(batch, dynamics)
+        ctx = HookContext(batch=batch, step_count=0)
+        hook(ctx, DynamicsStage.AFTER_STEP)
 
         expected = torch.tensor([1, 2, 0, 2])
         assert torch.equal(batch.status, expected)
@@ -230,67 +245,63 @@ class TestConvergenceHook:
     def test_custom_threshold(self) -> None:
         """Hook should use custom threshold correctly."""
         batch = create_batch_with_status(n_graphs=3)
-        batch.fmax = torch.tensor([0.01, 0.05, 0.1])
+        batch.forces = torch.tensor([[0.01, 0, 0], [0.05, 0, 0], [0.1, 0, 0]])
         batch.status = torch.tensor([0, 0, 0])
 
         # Use higher threshold - all should converge
         hook = ConvergenceHook.from_fmax(0.2, source_status=0, target_status=1)
-        dynamics = BaseDynamics(model=self.model)
-
-        hook(batch, dynamics)
+        ctx = HookContext(batch=batch, step_count=0)
+        hook(ctx, DynamicsStage.AFTER_STEP)
 
         assert (batch.status == 1).all()
 
-    def test_no_fmax_raises_key_error(self) -> None:
-        """Hook should raise KeyError if batch has no fmax attribute."""
+    def test_no_forces_raises_key_error(self) -> None:
+        """Hook should raise KeyError if batch has no forces attribute."""
         batch = create_batch_with_status(n_graphs=3)
         batch.status = torch.tensor([0, 0, 0])
-        # No fmax attribute
+        batch.forces = None  # Clear forces
 
         hook = ConvergenceHook()
-        dynamics = BaseDynamics(model=self.model)
+        ctx = HookContext(batch=batch, step_count=0)
 
-        # With the new API, missing fmax raises KeyError
-        with pytest.raises(KeyError, match="fmax"):
-            hook(batch, dynamics)
+        with pytest.raises(KeyError, match="forces"):
+            hook(ctx, DynamicsStage.AFTER_STEP)
 
     def test_no_status_is_noop(self) -> None:
         """Hook should be a no-op if batch has no status attribute."""
         batch = create_batch_with_status(n_graphs=3)
-        batch.fmax = torch.tensor([0.01, 0.02, 0.03])
+        batch.forces = torch.tensor([[0.01, 0, 0], [0.02, 0, 0], [0.03, 0, 0]])
         # No status attribute - delete it if it exists
         if hasattr(batch, "status"):
             delattr(batch, "status")
 
         hook = ConvergenceHook()
-        dynamics = BaseDynamics(model=self.model)
+        ctx = HookContext(batch=batch, step_count=0)
 
         # Should not raise, just no-op
-        hook(batch, dynamics)
+        hook(ctx, DynamicsStage.AFTER_STEP)
 
     def test_1d_status_tensor(self) -> None:
         """Hook should handle 1D status tensor (shape (B,))."""
         batch = create_batch_with_status(n_graphs=3)
-        batch.fmax = torch.tensor([0.01, 0.02, 0.03])
+        batch.forces = torch.tensor([[0.01, 0, 0], [0.02, 0, 0], [0.03, 0, 0]])
         batch.status = torch.tensor([0, 0, 0])  # 1D tensor
 
         hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1)
-        dynamics = BaseDynamics(model=self.model)
-
-        hook(batch, dynamics)
+        ctx = HookContext(batch=batch, step_count=0)
+        hook(ctx, DynamicsStage.AFTER_STEP)
 
         assert (batch.status == 1).all()
 
     def test_2d_status_tensor(self) -> None:
         """Hook should handle 2D status tensor (shape (B, 1))."""
         batch = create_batch_with_status(n_graphs=3)
-        batch.fmax = torch.tensor([[0.01], [0.02], [0.03]])  # (B, 1)
+        batch.forces = torch.tensor([[0.01, 0, 0], [0.02, 0, 0], [0.03, 0, 0]])
         batch.status = torch.tensor([[0], [0], [0]])  # (B, 1)
 
         hook = ConvergenceHook.from_fmax(0.05, source_status=0, target_status=1)
-        dynamics = BaseDynamics(model=self.model)
-
-        hook(batch, dynamics)
+        ctx = HookContext(batch=batch, step_count=0)
+        hook(ctx, DynamicsStage.AFTER_STEP)
 
         # Should have updated all to 1 (in-place on the original tensor)
         assert (batch.status.view(-1) == 1).all()
@@ -383,19 +394,77 @@ class TestFusedStage:
 
     def test_convergence_migration_auto_registered(self) -> None:
         """ConvergenceHook should be auto-registered between adjacent sub-stages."""
-        dynamics0 = BaseDynamics(model=self.model)
+        # Use a high threshold so DemoModel forces always trigger convergence
+        dynamics0 = BaseDynamics(
+            model=self.model,
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
+        )
         dynamics1 = BaseDynamics(model=self.model)
 
         fused = FusedStage(sub_stages=[(0, dynamics0), (1, dynamics1)])
 
         batch = create_batch_with_status(n_graphs=3)
         batch.status = torch.tensor([0, 0, 0])
-        batch.fmax = torch.tensor([0.01, 0.01, 0.01])  # All converged
 
         fused.step(batch)
 
         # All should have migrated to status=1 via auto-registered ConvergenceHook
         assert (batch.status == 1).all()
+
+    def test_single_stage_auto_registers_migration_hook(self) -> None:
+        """Single-stage FusedStage with convergence_hook auto-registers 0 -> exit_status."""
+        dynamics0 = BaseDynamics(
+            model=self.model,
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
+        )
+
+        fused = FusedStage(sub_stages=[(0, dynamics0)])
+
+        batch = create_batch_with_status(n_graphs=3)
+        batch.status = torch.tensor([0, 0, 0])
+
+        fused.step(batch)
+
+        assert (batch.status == fused.exit_status).all()
+
+    def test_single_stage_no_convergence_hook_skips_auto_registration(self) -> None:
+        """Single-stage FusedStage without convergence_hook skips migration hook."""
+        dynamics0 = BaseDynamics(model=self.model)
+
+        conv_hooks_before = [
+            h
+            for h in dynamics0.hooks
+            if isinstance(h, ConvergenceHook) and h.source_status is not None
+        ]
+
+        FusedStage(sub_stages=[(0, dynamics0)])
+
+        conv_hooks_after = [
+            h
+            for h in dynamics0.hooks
+            if isinstance(h, ConvergenceHook) and h.source_status is not None
+        ]
+        assert len(conv_hooks_after) == len(conv_hooks_before)
+
+    def test_single_stage_converged_snapshot_no_overflow(self) -> None:
+        """ConvergedSnapshotHook must not overflow when converged samples graduate."""
+        n_graphs = 3
+        sink = HostMemory(capacity=n_graphs)
+        dynamics0 = BaseDynamics(
+            model=self.model,
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
+            hooks=[ConvergedSnapshotHook(sink=sink)],
+        )
+
+        fused = FusedStage(sub_stages=[(0, dynamics0)])
+
+        batch = create_batch_with_status(n_graphs=n_graphs)
+        batch.status = torch.tensor([0, 0, 0])
+
+        for _ in range(3):
+            fused.step(batch)
+
+        assert len(sink) == n_graphs
 
     def test_all_complete_true(self) -> None:
         """all_complete should return True when all samples at exit status."""
@@ -417,15 +486,15 @@ class TestFusedStage:
         """run() should stop when all samples reach exit_status."""
         model = CountingNonConservativeDemoModel()
         dynamics = BaseDynamics(model=model)
-        # Register convergence hook: migrate 0 -> 1 when fmax < 0.1
-        hook = ConvergenceHook.from_fmax(0.1, source_status=0, target_status=1)
+        # Register convergence hook: migrate 0 -> 1 with high threshold
+        # so DemoModel forces always trigger convergence
+        hook = ConvergenceHook.from_fmax(1e6, source_status=0, target_status=1)
         dynamics.register_hook(hook)
 
         fused = FusedStage(sub_stages=[(0, dynamics)])
 
         batch = create_batch_with_status(n_graphs=3)
         batch.status = torch.tensor([0, 0, 0])
-        batch.fmax = torch.tensor([0.05, 0.05, 0.05])  # Below threshold → converge
 
         fused.run(batch)
 
@@ -440,13 +509,12 @@ class TestFusedStage:
 
         # Create single-stage fused, auto-registered hook migrates 0 -> 1
         fused = FusedStage(sub_stages=[(0, dynamics0)])
-        # Manually register hook since single stage has no adjacent to auto-wire
-        hook = ConvergenceHook.from_fmax(0.1, source_status=0, target_status=1)
+        # Manually register hook with high threshold so forces always converge
+        hook = ConvergenceHook.from_fmax(1e6, source_status=0, target_status=1)
         dynamics0.register_hook(hook)
 
         batch = create_batch_with_status(n_graphs=3)
         batch.status = torch.tensor([0, 0, 0])
-        batch.fmax = torch.tensor([0.05, 0.05, 0.05])  # Converged
 
         # exit_status is 1 (len(sub_stages) == 1)
         fused.run(batch)
@@ -591,8 +659,15 @@ class TestFusedStage:
         within a single step since hooks fire sequentially in AFTER_STEP.
         With 3 sub-stages (0, 1, 2), hooks 0->1 and 1->2 are auto-registered.
         """
-        dynamics0 = BaseDynamics(model=self.model)
-        dynamics1 = BaseDynamics(model=self.model)
+        # Use high-threshold convergence hooks so DemoModel forces always converge
+        dynamics0 = BaseDynamics(
+            model=self.model,
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
+        )
+        dynamics1 = BaseDynamics(
+            model=self.model,
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
+        )
         dynamics2 = BaseDynamics(model=self.model)
 
         # Create 3-stage fused: auto-hooks 0->1 and 1->2 are registered
@@ -600,7 +675,6 @@ class TestFusedStage:
 
         batch = create_batch_with_status(n_graphs=3)
         batch.status = torch.tensor([0, 0, 0])
-        batch.fmax = torch.tensor([0.01, 0.01, 0.01])  # Converged
 
         # Hooks fire sequentially in AFTER_STEP, so converged samples
         # cascade through all stages within a single step: 0 -> 1 -> 2
@@ -737,7 +811,8 @@ class TestFusedStage:
         """Verify FusedStage.run() terminates by convergence, not n_steps."""
         model = CountingNonConservativeDemoModel()
         dynamics = BaseDynamics(model=model)
-        hook = ConvergenceHook.from_fmax(0.1, source_status=0, target_status=1)
+        # High threshold so DemoModel forces always trigger convergence
+        hook = ConvergenceHook.from_fmax(1e6, source_status=0, target_status=1)
         dynamics.register_hook(hook)
 
         # Set a large n_steps — should be ignored, convergence stops it early
@@ -745,7 +820,6 @@ class TestFusedStage:
 
         batch = create_batch_with_status(n_graphs=3)
         batch.status = torch.tensor([0, 0, 0])
-        batch.fmax = torch.tensor([0.05, 0.05, 0.05])
 
         fused.run(batch)
 
@@ -847,7 +921,7 @@ class TestCommunicationMixinStreamContext:
 
     def setup_method(self) -> None:
         """Set up test fixtures before each test method."""
-        self.model = DemoModelWrapper()
+        self.model = DemoModelWrapper(DemoModel())
 
     def test_enter_creates_stream_on_cuda(self) -> None:
         """__enter__ creates a CUDA stream and enters a StreamContext on CUDA devices."""
@@ -1288,16 +1362,16 @@ class TestDistributedPipelineComposition:
 class _TrackingHook:
     """Minimal hook that records every call for testing."""
 
-    def __init__(self, stage: HookStageEnum, frequency: int = 1) -> None:
+    def __init__(self, stage: DynamicsStage, frequency: int = 1) -> None:
         self.stage = stage
         self.frequency = frequency
         self.call_count = 0
         self.call_step_counts: list[int] = []
 
-    def __call__(self, batch: Batch, dynamics: BaseDynamics) -> None:
+    def __call__(self, ctx: HookContext, stage: DynamicsStage) -> None:
         """Record the call and current step count."""
         self.call_count += 1
-        self.call_step_counts.append(dynamics.step_count)
+        self.call_step_counts.append(ctx.step_count)
 
 
 # -----------------------------------------------------------------------------
@@ -1340,8 +1414,8 @@ class TestFusedStageSubstageHooks:
         dynamics0 = BaseDynamics(model=self.model)
         dynamics1 = BaseDynamics(model=self.model)
 
-        hook0 = _TrackingHook(HookStageEnum.AFTER_STEP)
-        hook1 = _TrackingHook(HookStageEnum.AFTER_STEP)
+        hook0 = _TrackingHook(DynamicsStage.AFTER_STEP)
+        hook1 = _TrackingHook(DynamicsStage.AFTER_STEP)
         dynamics0.register_hook(hook0)
         dynamics1.register_hook(hook1)
 
@@ -1364,7 +1438,7 @@ class TestFusedStageSubstageHooks:
         """
         dynamics0 = BaseDynamics(model=self.model)
 
-        hook = _TrackingHook(HookStageEnum.BEFORE_STEP)
+        hook = _TrackingHook(DynamicsStage.BEFORE_STEP)
         dynamics0.register_hook(hook)
 
         fused = FusedStage(sub_stages=[(0, dynamics0)])
@@ -1385,7 +1459,7 @@ class TestFusedStageSubstageHooks:
         """
         dynamics0 = BaseDynamics(model=self.model)
 
-        hook = _TrackingHook(HookStageEnum.AFTER_COMPUTE)
+        hook = _TrackingHook(DynamicsStage.AFTER_COMPUTE)
         dynamics0.register_hook(hook)
 
         fused = FusedStage(sub_stages=[(0, dynamics0)])
@@ -1406,8 +1480,8 @@ class TestFusedStageSubstageHooks:
         """
         dynamics0 = BaseDynamics(model=self.model)
 
-        hook_before = _TrackingHook(HookStageEnum.BEFORE_PRE_UPDATE)
-        hook_after = _TrackingHook(HookStageEnum.AFTER_POST_UPDATE)
+        hook_before = _TrackingHook(DynamicsStage.BEFORE_PRE_UPDATE)
+        hook_after = _TrackingHook(DynamicsStage.AFTER_POST_UPDATE)
         dynamics0.register_hook(hook_before)
         dynamics0.register_hook(hook_after)
 
@@ -1425,23 +1499,22 @@ class TestFusedStageSubstageHooks:
     def test_substage_on_converge_hooks_fire(self) -> None:
         """ON_CONVERGE hooks on substages should fire when convergence is detected.
 
-        Creates a substage with a convergence hook configured for fmax < 0.1,
-        registers an ON_CONVERGE hook, creates a batch where fmax is below
-        threshold (converged), and verifies the ON_CONVERGE hook fired.
+        Creates a substage with a high convergence threshold so DemoModel
+        forces always trigger convergence, registers an ON_CONVERGE hook,
+        and verifies it fired.
         """
         dynamics0 = BaseDynamics(
             model=self.model,
-            convergence_hook=ConvergenceHook.from_fmax(0.1),
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
         )
 
-        hook = _TrackingHook(HookStageEnum.ON_CONVERGE)
+        hook = _TrackingHook(DynamicsStage.ON_CONVERGE)
         dynamics0.register_hook(hook)
 
         fused = FusedStage(sub_stages=[(0, dynamics0)])
 
         batch = create_batch_with_status(n_graphs=3)
         batch.status = torch.tensor([0, 0, 0])
-        batch.fmax = torch.tensor([0.01, 0.01, 0.01])  # All converged
 
         fused.step(batch)
 
@@ -1450,27 +1523,70 @@ class TestFusedStageSubstageHooks:
     def test_substage_on_converge_does_not_fire_when_not_converged(self) -> None:
         """ON_CONVERGE hooks should NOT fire when samples are not converged.
 
-        Creates a substage with a convergence hook configured for fmax < 0.1,
-        registers an ON_CONVERGE hook, creates a batch where fmax is above
-        threshold (not converged), and verifies the ON_CONVERGE hook did not fire.
+        Uses threshold of 0 so DemoModel forces never satisfy convergence,
+        and verifies the ON_CONVERGE hook did not fire.
         """
         dynamics0 = BaseDynamics(
             model=self.model,
-            convergence_hook=ConvergenceHook.from_fmax(0.1),
+            convergence_hook=ConvergenceHook.from_fmax(0.0),
         )
 
-        hook = _TrackingHook(HookStageEnum.ON_CONVERGE)
+        hook = _TrackingHook(DynamicsStage.ON_CONVERGE)
         dynamics0.register_hook(hook)
 
         fused = FusedStage(sub_stages=[(0, dynamics0)])
 
         batch = create_batch_with_status(n_graphs=3)
         batch.status = torch.tensor([0, 0, 0])
-        batch.fmax = torch.tensor([1.0, 1.0, 1.0])  # Not converged
 
         fused.step(batch)
 
         assert hook.call_count == 0
+
+    def test_on_converge_only_fires_for_active_samples(self) -> None:
+        """ON_CONVERGE converged_mask should only include samples active in that stage.
+
+        Two-stage FusedStage where both stages use high-threshold convergence.
+        Samples [0,1] are at status 0, sample [2] at status 1.
+        Stage-0's ON_CONVERGE mask must be [True, True, False],
+        stage-1's ON_CONVERGE mask must be [False, False, True].
+        """
+
+        class _MaskCapture:
+            stage = DynamicsStage.ON_CONVERGE
+            frequency = 1
+
+            def __init__(self) -> None:
+                self.masks: list[torch.Tensor] = []
+
+            def __call__(self, ctx: HookContext, stage: DynamicsStage) -> None:
+                self.masks.append(ctx.converged_mask.clone())
+
+        dynamics0 = BaseDynamics(
+            model=self.model,
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
+        )
+        dynamics1 = BaseDynamics(
+            model=self.model,
+            convergence_hook=ConvergenceHook.from_fmax(1e6),
+        )
+
+        cap0 = _MaskCapture()
+        cap1 = _MaskCapture()
+        dynamics0.register_hook(cap0)
+        dynamics1.register_hook(cap1)
+
+        fused = FusedStage(sub_stages=[(0, dynamics0), (1, dynamics1)])
+
+        batch = create_batch_with_status(n_graphs=3)
+        batch.status = torch.tensor([0, 0, 1])
+
+        fused.step(batch)
+
+        assert len(cap0.masks) == 1
+        assert cap0.masks[0].tolist() == [True, True, False]
+        assert len(cap1.masks) == 1
+        assert cap1.masks[0].tolist() == [False, False, True]
 
     def test_non_applicable_stages_not_fired(self) -> None:
         """BEFORE_COMPUTE, AFTER_PRE_UPDATE, and BEFORE_POST_UPDATE should NOT fire on substages.
@@ -1485,9 +1601,9 @@ class TestFusedStageSubstageHooks:
         """
         dynamics0 = BaseDynamics(model=self.model)
 
-        hook_before_compute = _TrackingHook(HookStageEnum.BEFORE_COMPUTE)
-        hook_after_pre = _TrackingHook(HookStageEnum.AFTER_PRE_UPDATE)
-        hook_before_post = _TrackingHook(HookStageEnum.BEFORE_POST_UPDATE)
+        hook_before_compute = _TrackingHook(DynamicsStage.BEFORE_COMPUTE)
+        hook_after_pre = _TrackingHook(DynamicsStage.AFTER_PRE_UPDATE)
+        hook_before_post = _TrackingHook(DynamicsStage.BEFORE_POST_UPDATE)
         dynamics0.register_hook(hook_before_compute)
         dynamics0.register_hook(hook_after_pre)
         dynamics0.register_hook(hook_before_post)
@@ -1535,7 +1651,7 @@ class TestFusedStageSubstageHooks:
         """
         dynamics0 = BaseDynamics(model=self.model)
 
-        hook = _TrackingHook(HookStageEnum.AFTER_STEP, frequency=3)
+        hook = _TrackingHook(DynamicsStage.AFTER_STEP, frequency=3)
         dynamics0.register_hook(hook)
 
         fused = FusedStage(sub_stages=[(0, dynamics0)])
@@ -1568,8 +1684,8 @@ class TestFusedStageSubstageHooks:
         dynamics0 = BaseDynamics(model=self.model)
         dynamics1 = BaseDynamics(model=self.model)
 
-        hook_before = _TrackingHook(HookStageEnum.BEFORE_PRE_UPDATE)
-        hook_after = _TrackingHook(HookStageEnum.AFTER_POST_UPDATE)
+        hook_before = _TrackingHook(DynamicsStage.BEFORE_PRE_UPDATE)
+        hook_after = _TrackingHook(DynamicsStage.AFTER_POST_UPDATE)
         dynamics0.register_hook(hook_before)
         dynamics0.register_hook(hook_after)
 

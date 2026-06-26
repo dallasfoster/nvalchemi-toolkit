@@ -28,8 +28,7 @@ Protocols and enums
    :toctree: _generated
    :nosignatures:
 
-   Hook
-   HookStageEnum
+   DynamicsStage
 
 Convergence
 -----------
@@ -49,17 +48,19 @@ Hooks
    :toctree: _generated
    :nosignatures:
 
-   BiasedPotentialHook
    ConvergedSnapshotHook
    EnergyDriftMonitorHook
    FreezeAtomsHook
    LoggingHook
    MaxForceClampHook
    NaNDetectorHook
-   NeighborListHook
    ProfilerHook
    SnapshotHook
-   WrapPeriodicHook
+
+General-purpose hooks (:class:`~nvalchemi.hooks.NeighborListHook`,
+:class:`~nvalchemi.hooks.BiasedPotentialHook`,
+:class:`~nvalchemi.hooks.WrapPeriodicHook`) and the core hook
+protocol are documented in :ref:`hooks-api`.
 
 Data sinks
 ----------
@@ -74,18 +75,6 @@ Data sinks
    GPUBuffer
    HostMemory
    ZarrData
-
-Sink configuration
-------------------
-
-.. currentmodule:: nvalchemi.data.datapipes
-
-.. autosummary::
-   :toctree: _generated
-   :nosignatures:
-
-   ZarrArrayConfig
-   ZarrWriteConfig
 
 Sampling
 --------

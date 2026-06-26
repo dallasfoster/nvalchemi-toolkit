@@ -16,7 +16,7 @@
 Logging hook for recording per-sample simulation observables.
 
 Provides :class:`LoggingHook`, which computes and logs per-graph scalar
-statistics (energies, temperatures, max forces, etc.) at a configurable
+statistics (energy, temperatures, max forces, etc.) at a configurable
 frequency.  Each graph in the batch is written as an individual row,
 together with the current step and status (stage) information.
 
@@ -42,23 +42,23 @@ import contextlib
 import csv
 import io
 from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
 from typing import TYPE_CHECKING, Literal, get_args
 
 import torch
 from tensordict import TensorDict
 
-from nvalchemi.dynamics.hooks._base import _ObserverHook
+from nvalchemi.data import Batch
+from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.hooks._utils import (
     scatter_reduce_per_graph,
     temperature_per_graph,
 )
+from nvalchemi.hooks._context import HookContext
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
-
-    from nvalchemi.data import Batch
-    from nvalchemi.dynamics.base import BaseDynamics
 
 # Boltzmann constant in eV/K — consistent with typical atomistic MD unit
 # systems (positions in Å, masses in amu, velocities in Å/fs, energy in eV).
@@ -69,7 +69,7 @@ __all__ = ["LoggingHook"]
 LogBackend = Literal["csv", "tensorboard", "custom"]
 
 
-class LoggingHook(_ObserverHook):
+class LoggingHook:
     """Log per-sample scalar observables from the simulation.
 
     At each firing step, this hook computes per-graph scalars from the
@@ -81,7 +81,7 @@ class LoggingHook(_ObserverHook):
     * **status** — the sample's status code (from ``batch.status``),
       indicating which pipeline stage it belongs to.  Always ``0`` for
       single-stage dynamics.
-    * **energy** — per-graph potential energy (from ``batch.energies``).
+    * **energy** — per-graph potential energy (from ``batch.energy``).
     * **fmax** — per-graph maximum atomic force norm.
     * **temperature** — per-graph instantaneous kinetic temperature
       (from ``batch.velocities`` and ``batch.atomic_masses`` via the
@@ -124,9 +124,10 @@ class LoggingHook(_ObserverHook):
         ``"tensorboard"``).  Default ``None``.
     custom_scalars : dict[str, Callable] | None, optional
         Additional named scalars to compute and log.  Each callable
-        receives ``(batch, dynamics)`` and returns either a ``(B,)``
-        tensor (per-graph values) or a ``float`` (broadcast to all
-        graphs).  Name collisions override defaults.  Default ``None``.
+        receives ``(ctx,)`` — a :class:`HookContext` — and returns
+        either a ``(B,)`` tensor (per-graph values) or a ``float``
+        (broadcast to all graphs).  Name collisions override defaults.
+        Default ``None``.
     writer_fn : Callable[[int, list[dict[str, float]]], None] | None, optional
         Custom writer function, required when ``backend="custom"``.
         Receives ``(step_count, rows)``.  Default ``None``.
@@ -140,8 +141,8 @@ class LoggingHook(_ObserverHook):
 
     Using custom scalars:
 
-    >>> def pressure(batch, dynamics):
-    ...     return compute_pressure(batch.stresses, batch.cell)
+    >>> def pressure(ctx):
+    ...     return compute_pressure(ctx.batch.stress, ctx.batch.cell)
     >>> hook = LoggingHook(
     ...     backend="csv",
     ...     log_path="md_log.csv",
@@ -165,11 +166,13 @@ class LoggingHook(_ObserverHook):
         frequency: int = 1,
         log_path: str | Path | None = None,
         custom_scalars: (
-            dict[str, Callable[[Batch, BaseDynamics], float | torch.Tensor]] | None
+            dict[str, Callable[[HookContext], float | torch.Tensor]] | None
         ) = None,
         writer_fn: (Callable[[int, list[dict[str, float]]], None] | None) = None,
+        stage: Enum = DynamicsStage.AFTER_STEP,
     ) -> None:
-        super().__init__(frequency=frequency)
+        self.frequency = frequency
+        self.stage = stage
 
         self._csv_file: io.TextIOWrapper | None = None
         self._csv_writer: csv.DictWriter | None = None
@@ -230,29 +233,46 @@ class LoggingHook(_ObserverHook):
     # ------------------------------------------------------------------
 
     @torch.compiler.disable
-    def __call__(self, batch: Batch, dynamics: BaseDynamics) -> None:
+    def _log(
+        self,
+        batch: Batch,
+        step_count: int,
+        ctx: HookContext,
+    ) -> None:
         """Compute per-graph scalars and dispatch to the logging backend.
 
-        When a CUDA stream has been set up (via :meth:`__enter__`), the
-        column computation and ``non_blocking`` D2H transfer run on that
-        side stream so they do not stall the default compute stream.
+        Parameters
+        ----------
+        batch : Batch
+            The current batch of atomic data.
+        step_count : int
+            The current step number.
+        ctx : HookContext
+            The hook context (required for custom_scalars).
         """
         device = batch.device
         use_stream = self._stream is not None and device.type == "cuda"
 
+        td = self._compute_columns(batch, step_count, ctx)
+        td = _snapshot_tensordict(td)
+
         if use_stream:
             main_stream = torch.cuda.current_stream(device)
-            ctx = torch.cuda.stream(self._stream)
+            stream_ctx = torch.cuda.stream(self._stream)
         else:
-            ctx = contextlib.nullcontext()
+            stream_ctx = contextlib.nullcontext()
 
-        with ctx:
+        with stream_ctx:
             if use_stream:
                 self._stream.wait_stream(main_stream)
-            td = self._compute_columns(batch, dynamics)
             td = td.to("cpu", non_blocking=True)
 
-        self._executor.submit(self._dispatch, td, dynamics.step_count)
+        self._executor.submit(self._dispatch, td, step_count)
+
+    @torch.compiler.disable
+    def __call__(self, ctx: HookContext, stage: Enum) -> None:
+        """Log scalar observables for the current step."""
+        self._log(ctx.batch, ctx.step_count, ctx)
 
     # ------------------------------------------------------------------
     # Column computation (on-device)
@@ -261,16 +281,25 @@ class LoggingHook(_ObserverHook):
     def _compute_columns(
         self,
         batch: Batch,
-        dynamics: BaseDynamics,
+        step_count: int,
+        ctx: HookContext,
     ) -> TensorDict:
-        """Build a ``TensorDict(batch_size=[B])`` of per-graph scalars."""
+        """Build a ``TensorDict(batch_size=[B])`` of per-graph scalars.
+
+        Parameters
+        ----------
+        batch : Batch
+            The current batch of atomic data.
+        step_count : int
+            The current step number.
+        ctx : HookContext
+            The hook context (required for custom_scalars).
+        """
         dev = batch.device
         num_graphs = batch.num_graphs
 
         td = TensorDict(
-            step=torch.full(
-                (num_graphs,), dynamics.step_count, device=dev, dtype=torch.int64
-            ),
+            step=torch.full((num_graphs,), step_count, device=dev, dtype=torch.int64),
             graph_idx=torch.arange(num_graphs, device=dev, dtype=torch.int64),
             batch_size=[num_graphs],
         )
@@ -284,14 +313,16 @@ class LoggingHook(_ObserverHook):
         else:
             td.set("status", torch.zeros(num_graphs, device=dev))
 
-        if batch.energies is not None:
-            td.set("energy", batch.energies.squeeze(-1))
+        if batch.energy is not None:
+            td.set("energy", batch.energy.squeeze(-1))
 
         if batch.forces is not None:
             norms = torch.linalg.vector_norm(batch.forces, dim=-1)
             td.set(
                 "fmax",
-                scatter_reduce_per_graph(norms, batch.batch, num_graphs, reduce="amax"),
+                scatter_reduce_per_graph(
+                    norms, batch.batch_idx, num_graphs, reduce="amax"
+                ),
             )
 
         if getattr(batch, "velocities", None) is not None:
@@ -300,7 +331,7 @@ class LoggingHook(_ObserverHook):
                 temperature_per_graph(
                     batch.velocities,
                     batch.atomic_masses,
-                    batch.batch,
+                    batch.batch_idx,
                     num_graphs,
                     batch.num_nodes_per_graph,
                 ),
@@ -308,7 +339,8 @@ class LoggingHook(_ObserverHook):
 
         if self.custom_scalars:
             for name, fn in self.custom_scalars.items():
-                val = fn(batch, dynamics)
+                # custom_scalars receive (ctx,) — a HookContext
+                val = fn(ctx)
                 if isinstance(val, torch.Tensor):
                     td.set(name, val)
                 else:
@@ -361,6 +393,14 @@ class LoggingHook(_ObserverHook):
                     continue
                 tag = f"{key}/graph_{graph_idx}" if len(rows) > 1 else key
                 self._tb_writer.add_scalar(tag, value, step)
+
+
+def _snapshot_tensordict(td: TensorDict) -> TensorDict:
+    """Clone logged columns so async dispatch never aliases live batch tensors."""
+    return TensorDict(
+        {key: td[key].detach().clone() for key in td.keys()},
+        batch_size=td.batch_size,
+    )
 
 
 def _tensordict_to_rows(td: TensorDict) -> list[dict[str, float]]:
