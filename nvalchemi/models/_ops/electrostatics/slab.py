@@ -136,8 +136,6 @@ def slab_normals_and_axis(
         :math:`1/V` (zero for non-slab systems; never used there).
     """
     cell64 = cell.to(torch.float64)
-    num_systems = cell64.shape[0]
-    device = cell64.device
 
     n_false = (~pbc).sum(dim=1)  # (B,)
     is_slab = n_false == 1
