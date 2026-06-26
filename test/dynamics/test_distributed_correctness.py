@@ -115,7 +115,7 @@ def _make_model(device: torch.device) -> LennardJonesModelWrapper:
 def _make_nve(model: LennardJonesModelWrapper) -> NVE:
     """Instantiate NVE integrator with a neighbor-list hook."""
     nl_hook = NeighborListHook(
-        config=model.model_card.neighbor_config,
+        config=model.model_config.neighbor_config,
         skin=1.0,
     )
     return NVE(model=model, dt=1.0, hooks=[nl_hook])
@@ -140,7 +140,7 @@ def _test_single_step_force_correctness(rank: int, world_size: int) -> None:
     device = torch.device(f"cuda:{rank}")
 
     # Build the same system deterministically on every rank.
-    data = _create_argon_system(n_atoms=100, seed=42)
+    data = _create_argon_system(n_atoms=343, seed=42)
 
     # --- Reference: single-GPU step on rank 0 ---
     if rank == 0:
@@ -160,7 +160,7 @@ def _test_single_step_force_correctness(rank: int, world_size: int) -> None:
     nve = _make_nve(model)
 
     config = DomainConfig(
-        cutoff=model.model_card.neighbor_config.cutoff,
+        cutoff=model.model_config.neighbor_config.cutoff,
         skin=1.0,
         mesh=mesh,
         mesh_dim="domain",
@@ -209,7 +209,7 @@ def _test_nve_energy_conservation(rank: int, world_size: int) -> None:
     device = torch.device(f"cuda:{rank}")
     n_steps = 100
 
-    data = _create_argon_system(n_atoms=100, seed=42)
+    data = _create_argon_system(n_atoms=343, seed=42)
 
     # --- Reference trajectory on rank 0 ---
     ref_energies: list[float] = []
@@ -230,7 +230,7 @@ def _test_nve_energy_conservation(rank: int, world_size: int) -> None:
     nve = _make_nve(model)
 
     config = DomainConfig(
-        cutoff=model.model_card.neighbor_config.cutoff,
+        cutoff=model.model_config.neighbor_config.cutoff,
         skin=1.0,
         mesh=mesh,
         mesh_dim="domain",
@@ -294,7 +294,7 @@ def _test_atom_count_conservation(rank: int, world_size: int) -> None:
     device = torch.device(f"cuda:{rank}")
     n_steps = 50
 
-    data = _create_argon_system(n_atoms=100, seed=42)
+    data = _create_argon_system(n_atoms=343, seed=42)
     initial_n_atoms = data.positions.shape[0]
 
     from torch.distributed import DeviceMesh
@@ -304,7 +304,7 @@ def _test_atom_count_conservation(rank: int, world_size: int) -> None:
     nve = _make_nve(model)
 
     config = DomainConfig(
-        cutoff=model.model_card.neighbor_config.cutoff,
+        cutoff=model.model_config.neighbor_config.cutoff,
         skin=1.0,
         mesh=mesh,
         mesh_dim="domain",
@@ -352,7 +352,7 @@ def test_atom_count_conservation():
 def _test_partition_distributes_atoms(rank: int, world_size: int) -> None:
     """Verify that after partition(), each rank has a disjoint subset of atoms."""
     device = torch.device(f"cuda:{rank}")
-    data = _create_argon_system(n_atoms=100, seed=42)
+    data = _create_argon_system(n_atoms=343, seed=42)
     initial_n = data.positions.shape[0]
 
     from torch.distributed import DeviceMesh
@@ -408,7 +408,7 @@ def test_partition_distributes_atoms():
 def _test_step_completes(rank: int, world_size: int) -> None:
     """Verify that dd.step() completes without error for 5 steps."""
     device = torch.device(f"cuda:{rank}")
-    data = _create_argon_system(n_atoms=100, seed=42)
+    data = _create_argon_system(n_atoms=343, seed=42)
 
     from torch.distributed import DeviceMesh
 
