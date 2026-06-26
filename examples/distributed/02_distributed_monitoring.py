@@ -21,7 +21,7 @@ comprehensive observability to the FIRE → NVTLangevin topology:
 
 * :class:`~nvalchemi.dynamics.hooks.LoggingHook` on each rank, writing
   per-graph scalars (energy, fmax, temperature) to rank-specific CSV files.
-* :class:`~nvalchemi.dynamics.hooks.ProfilerHook` on each rank, recording
+* :class:`~nvalchemi.dynamics.hooks.StageTimingHook` on each rank, recording
   step timings to rank-specific CSV files.
 * :class:`~nvalchemi.dynamics.ZarrData` sink on the Langevin ranks
   instead of HostMemory — completed trajectories are persisted to disk.
@@ -48,7 +48,7 @@ import torch.distributed as dist
 from ase.build import molecule
 from loguru import logger
 
-from nvalchemi.data import AtomicData, Batch
+from nvalchemi.data import AtomicData
 from nvalchemi.dynamics import (
     FIRE,
     ConvergenceHook,
@@ -57,17 +57,18 @@ from nvalchemi.dynamics import (
     SizeAwareSampler,
     ZarrData,
 )
-from nvalchemi.dynamics.base import BufferConfig, HookStageEnum
-from nvalchemi.dynamics.hooks import ConvergedSnapshotHook, LoggingHook, ProfilerHook
-from nvalchemi.models.demo import DemoModelWrapper
+from nvalchemi.dynamics.base import BufferConfig, DynamicsStage
+from nvalchemi.dynamics.hooks import ConvergedSnapshotHook, LoggingHook, StageTimingHook
+from nvalchemi.hooks import DynamicsContext
+from nvalchemi.models.demo import DemoModel, DemoModelWrapper
 
 logging.basicConfig(level=logging.INFO)
 
-# When run outside ``torchrun`` (e.g. during a Sphinx docs build), the
-# distributed environment variables ``RANK`` and ``WORLD_SIZE`` are absent.
-# We detect this and skip the pipeline launch so the example renders in
-# the gallery without requiring multiple GPUs.
+# Distributed examples are launcher-only. Sphinx sets this flag during docs
+# builds, and torchrun sets rank/world-size variables during real launches.
+_DOCS_BUILD = os.environ.get("NVALCHEMI_SPHINX_BUILD") == "1"
 _DISTRIBUTED_ENV = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+_RUN_DISTRIBUTED_EXAMPLE = _DISTRIBUTED_ENV and not _DOCS_BUILD
 
 # ---------------------------------------------------------------------------
 # Helpers (identical to 01_distributed_pipeline)
@@ -79,7 +80,7 @@ def atoms_to_data(atoms) -> AtomicData:
     data = AtomicData.from_atoms(atoms)
     n = data.num_nodes
     data.forces = torch.zeros(n, 3)
-    data.energies = torch.zeros(1, 1)
+    data.energy = torch.zeros(1, 1)
     data.add_node_property("velocities", torch.zeros(n, 3))
     return data
 
@@ -104,22 +105,25 @@ class InMemoryDataset:
 
 
 class DownstreamDoneHook:
-    """Set ``stage.done = True`` after *patience* consecutive idle steps."""
+    """Set ``stage.done = True`` after *patience* consecutive idle steps.
 
-    stage = HookStageEnum.AFTER_STEP
+    The dispatching dynamics engine is available as ``ctx.workflow``.
+    """
+
+    stage = DynamicsStage.AFTER_STEP
     frequency = 1
 
     def __init__(self, patience: int = 5) -> None:
         self.patience = patience
         self._idle_steps = 0
 
-    def __call__(self, batch: Batch, dynamics) -> None:
-        if batch.num_graphs == 0:
+    def __call__(self, ctx: DynamicsContext, stage_: DynamicsStage) -> None:
+        if ctx.batch.num_graphs == 0:
             self._idle_steps += 1
         else:
             self._idle_steps = 0
-        if self._idle_steps >= self.patience:
-            dynamics.done = True
+        if self._idle_steps >= self.patience and ctx.workflow is not None:
+            ctx.workflow.done = True
 
 
 def build_dataset() -> list[AtomicData]:
@@ -141,14 +145,13 @@ def build_dataset() -> list[AtomicData]:
 #
 # :class:`~nvalchemi.dynamics.hooks.LoggingHook` records per-graph scalar
 # observables (energy, fmax, temperature) at a configurable step interval.
-# :class:`~nvalchemi.dynamics.hooks.ProfilerHook` records wall-clock time
+# :class:`~nvalchemi.dynamics.hooks.StageTimingHook` records wall-clock time
 # between hook stages, optionally with NVTX annotations for Nsight Systems.
 #
-# Both hooks are created *inside* the stage factory functions so that the
-# rank number — obtained via ``dist.get_rank()`` after the process group is
-# initialised — is available at construction time.  The hooks are used as
-# context managers via ``with`` to guarantee that background I/O threads are
-# flushed and file handles are closed when the pipeline exits.
+# Both hooks are created after ``dist.get_rank()`` is available so each rank can
+# write separate files. ``LoggingHook`` is entered as a context manager for its
+# background writer; ``StageTimingHook`` is closed explicitly after the run so
+# its CSV handle is flushed.
 
 
 # %%
@@ -167,16 +170,16 @@ def build_dataset() -> list[AtomicData]:
 # Stage construction with monitoring
 # ----------------------------------------
 # The stage factories are extended from example 01 to accept and attach
-# ``LoggingHook`` and ``ProfilerHook`` instances.  The hooks are passed in
-# as context managers so the ``with`` block in ``main()`` can flush and close
-# them after ``pipeline.run()`` returns.
+# ``LoggingHook`` and ``StageTimingHook`` instances.  The stage receives both
+# hooks in its normal hook list; lifecycle management happens around
+# ``pipeline.run()`` in ``main()``.
 
 
 def make_fire(
     model: DemoModelWrapper,
     rank: int,
     logging_hook: LoggingHook,
-    profiler_hook: ProfilerHook,
+    profiler_hook: StageTimingHook,
     **kwargs,
 ) -> FIRE:
     """Create a FIRE optimiser stage with logging and profiling."""
@@ -204,11 +207,12 @@ def make_langevin(
     sink: ZarrData,
     rank: int,
     logging_hook: LoggingHook,
-    profiler_hook: ProfilerHook,
+    profiler_hook: StageTimingHook,
     **kwargs,
 ) -> NVTLangevin:
     """Create an NVTLangevin MD stage with snapshot, logging, and profiling hooks."""
-    return NVTLangevin(
+    done_hook = DownstreamDoneHook(patience=10)
+    stage = NVTLangevin(
         model=model,
         dt=0.5,
         temperature=300.0,
@@ -216,7 +220,7 @@ def make_langevin(
         n_steps=20,
         hooks=[
             ConvergedSnapshotHook(sink=sink, frequency=1),
-            DownstreamDoneHook(patience=10),
+            done_hook,
             logging_hook,
             profiler_hook,
         ],
@@ -232,6 +236,7 @@ def make_langevin(
         ),
         **kwargs,
     )
+    return stage
 
 
 # %%
@@ -245,7 +250,7 @@ def make_langevin(
 
 def main() -> None:
     """Launch two monitored FIRE -> Langevin pipelines on 4 GPUs."""
-    model = DemoModelWrapper()
+    model = DemoModelWrapper(DemoModel())
 
     # Dataset (only used by ranks 0 and 2)
     all_data = build_dataset()
@@ -268,7 +273,7 @@ def main() -> None:
 
     buffer_cfg = BufferConfig(num_systems=4, num_nodes=50, num_edges=0)
 
-    if not _DISTRIBUTED_ENV:
+    if not _RUN_DISTRIBUTED_EXAMPLE:
         logger.info(
             "Not running under torchrun — skipping pipeline launch. "
             "Run with: torchrun --nproc_per_node=4 "
@@ -295,7 +300,9 @@ def main() -> None:
     class _DeferredMain:
         """Helper that constructs stages after the process group is ready."""
 
-        def run(self) -> None:
+        def run(
+            self,
+        ) -> tuple[int, LoggingHook, LoggingHook, StageTimingHook, StageTimingHook]:
             rank = dist.get_rank() if dist.is_initialized() else 0
 
             # Per-rank hook instances — each rank writes to its own files.
@@ -304,18 +311,20 @@ def main() -> None:
                 log_path=f"fire_rank{rank}_log.csv",
                 frequency=10,
             )
-            fire_profiler = ProfilerHook(
+            fire_profiler = StageTimingHook(
                 "step",
                 log_path=f"fire_profile_rank{rank}.csv",
+                show_console=False,
             )
             langevin_logger = LoggingHook(
                 backend="csv",
                 log_path=f"langevin_rank{rank}_log.csv",
                 frequency=5,
             )
-            langevin_profiler = ProfilerHook(
+            langevin_profiler = StageTimingHook(
                 "step",
                 log_path=f"langevin_profile_rank{rank}.csv",
+                show_console=False,
             )
 
             stages = {
@@ -364,9 +373,13 @@ def main() -> None:
             }
 
             pipeline = DistributedPipeline(stages=stages, **pipeline_kwargs)
-            with fire_logger, langevin_logger:
-                with pipeline:
-                    pipeline.run()
+            try:
+                with fire_logger, langevin_logger:
+                    with pipeline:
+                        pipeline.run()
+            finally:
+                fire_profiler.close()
+                langevin_profiler.close()
 
             return rank, fire_logger, langevin_logger, fire_profiler, langevin_profiler
 
@@ -435,9 +448,9 @@ def _print_post_run_summary(num_ranks: int) -> None:
             if not rows:
                 print(f"{r:<6} {role_map[r]:<12} {'0':<12} {'n/a':<16} {'n/a':<12}")
                 continue
-            energies = [float(row["energy"]) for row in rows if row.get("energy")]
+            energy = [float(row["energy"]) for row in rows if row.get("energy")]
             fmaxes = [float(row["fmax"]) for row in rows if row.get("fmax")]
-            mean_energy = sum(energies) / len(energies) if energies else float("nan")
+            mean_energy = sum(energy) / len(energy) if energy else float("nan")
             mean_fmax = sum(fmaxes) / len(fmaxes) if fmaxes else float("nan")
             print(
                 f"{r:<6} {role_map[r]:<12} {len(rows):<12} "
@@ -449,8 +462,9 @@ def _print_post_run_summary(num_ranks: int) -> None:
     print()
     print(f"{'Rank':<6} {'Profile rows':<16} {'Mean step time (s)':<22}")
     print("-" * 44)
+    profile_prefix = {0: "fire", 1: "langevin", 2: "fire", 3: "langevin"}
     for r in range(num_ranks):
-        profile_path = f"profile_rank{r}.csv"
+        profile_path = f"{profile_prefix[r]}_profile_rank{r}.csv"
         try:
             with open(profile_path, newline="") as f:
                 reader = csv.DictReader(f)
@@ -458,7 +472,7 @@ def _print_post_run_summary(num_ranks: int) -> None:
             if not rows:
                 print(f"{r:<6} {'0':<16} {'n/a':<22}")
                 continue
-            # ProfilerHook CSV rows contain a "delta_s" column for elapsed time.
+            # StageTimingHook CSV rows contain a "delta_s" column for elapsed time.
             deltas = [float(row["delta_s"]) for row in rows if row.get("delta_s")]
             mean_delta = sum(deltas) / len(deltas) if deltas else float("nan")
             print(f"{r:<6} {len(rows):<16} {mean_delta:<22.6f}")

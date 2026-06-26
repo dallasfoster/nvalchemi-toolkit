@@ -32,17 +32,21 @@ The hook maintains *staging buffers* — persistent GPU tensors that are
 refreshed each step via ``Tensor.copy_()`` — to avoid per-step dynamic
 allocation inside the ``neighbor_list`` dispatcher.
 
-``neighbor_list`` selects between ``batch_naive`` (avg < 2000 atoms/system)
-and ``batch_cell_list`` (avg >= 2000), see https://nvidia.github.io/nvalchemi-toolkit-ops/userguide/components/neighborlist.html.
-Both paths normally allocate auxiliary tensors on-demand with CPU-GPU syncs
-(e.g. ``.item()`` calls). :meth:`NeighborListHook._alloc_nl_kwargs`
-computes these **once** when the batch shape is first seen (or changes)
-and caches them in ``NeighborListHook._buf_nl_kwargs``:
+For PBC systems, ``NeighborListHook`` runs the ``nvalchemiops`` selector
+once per batch shape and caches the resulting explicit strategy name (for
+example ``batch_cell_list_pair_centric`` or ``batch_cluster_tile``). For
+non-PBC systems it keeps the legacy size threshold between naive and cell-list
+methods. The selected paths normally allocate auxiliary tensors on demand with
+CPU-GPU syncs (e.g. ``.item()`` calls), so
+:meth:`NeighborListHook._alloc_nl_kwargs` computes these **once** when the batch
+shape is first seen (or changes) and caches them in
+``NeighborListHook._buf_nl_kwargs``:
 
 * *Naive, no PBC*: no extra kwargs needed.
 * *Naive, PBC*: ``shift_range_per_dimension``, ``num_shifts_per_system``,
   ``max_shifts_per_system``, and ``max_atoms_per_system``.
 * *Cell list*: seven cell-list scratch tensors via ``allocate_cell_list``.
+* *Cluster tile*: batch cluster-tile sort/group/tile scratch tensors.
 
 **NPT note**: geometry-dependent kwargs (shift ranges, cell-list sizes) are
 fixed when the staging buffers are first allocated for a given ``(N, B)``
@@ -56,13 +60,27 @@ from __future__ import annotations
 from enum import Enum
 
 import torch
+from nvalchemiops.neighbors.base_dispatch import neighbor_list_strategy_run_args
 from nvalchemiops.neighbors.neighbor_utils import estimate_max_neighbors
-from nvalchemiops.torch.neighbors import neighbor_list
+from nvalchemiops.torch.neighbors import neighbor_list, suggest_neighbor_list_method
 
 try:
     from nvalchemiops.torch.neighbors.batch_cell_list import (
         estimate_batch_cell_list_sizes,
     )
+except ImportError:
+    estimate_batch_cell_list_sizes = None
+
+try:
+    from nvalchemiops.torch.neighbors.batch_cluster_tile import (
+        allocate_batch_cluster_tile_list,
+        estimate_batch_max_tiles_per_group,
+    )
+except ImportError:
+    allocate_batch_cluster_tile_list = None
+    estimate_batch_max_tiles_per_group = None
+
+try:
     from nvalchemiops.torch.neighbors.neighbor_utils import (
         allocate_cell_list,
         compute_naive_num_shifts,
@@ -70,7 +88,6 @@ try:
 except ImportError:
     allocate_cell_list = None
     compute_naive_num_shifts = None
-    estimate_batch_cell_list_sizes = None
 
 try:
     from nvalchemiops.torch.neighbors.rebuild_detection import (
@@ -239,6 +256,9 @@ class NeighborListHook:
     stage : Enum | None, optional
         The workflow stage at which this hook runs.  Defaults to
         ``DynamicsStage.BEFORE_COMPUTE``.
+    use_cuda_graph : bool, optional
+        Opt into per-shape CUDA-graph capture of the neighbor-list
+        dispatch chain (cell-list path only).  Default ``False``.
     """
 
     def __init__(
@@ -292,13 +312,13 @@ class NeighborListHook:
         self._buf_pbc: torch.Tensor | None = None  # PBC only
 
         # Algorithm-specific pre-allocated kwargs forwarded to neighbor_list.
-        self._buf_nl_kwargs: dict[str, torch.Tensor] = {}
+        self._buf_nl_kwargs: dict[str, torch.Tensor | int] = {}
+        self._neighbor_list_method: str | None = None
 
-        # Set by ``_alloc_nl_kwargs`` based on the dispatcher's
-        # avg-atoms-per-system threshold; gates ``_NLGraphCache.capture``
-        # since only the cell-list path is currently graph-capturable
-        # (the naive dispatcher chain doesn't yet thread wrap-scratch
-        # kwargs through to the warp launcher).
+        # Set by ``_alloc_nl_kwargs`` based on the selected base algorithm;
+        # gates ``_NLGraphCache.capture`` since only the cell-list path is
+        # currently graph-capturable (the naive dispatcher chain doesn't yet
+        # thread wrap-scratch kwargs through to the warp launcher).
         self._using_cell_list_path: bool = False
 
         # Adaptive K-dimension state.
@@ -308,9 +328,10 @@ class NeighborListHook:
     # ------------------------------------------------------------------
     # Main hook entry point
     # ------------------------------------------------------------------
-    # Diagnostic: drop torch.compile entirely. ``dynamic=True`` still
-    # produces an 8 s upfront compile and an occasional ~1.8 s recompile
-    # when halo size changes; if eager is fast enough, we avoid both.
+    # Under DD the framework owns compilation, so drop torch.compile here.
+    # ``dynamic=True`` still produces an 8 s upfront compile and an
+    # occasional ~1.8 s recompile when halo size changes; eager is fast
+    # enough, so we avoid both.
     @torch.compiler.disable
     def __call__(self, ctx: HookContext, stage: Enum) -> None:
         """Recompute the neighbor list if needed and write it to the batch.
@@ -419,6 +440,7 @@ class NeighborListHook:
             num_neighbors=self._num_neighbors,
             neighbor_matrix_shifts=self._neighbor_matrix_shifts,
             rebuild_flags=rebuild_flags,
+            method=self._neighbor_list_method,
             **self._buf_nl_kwargs,
         )
 
@@ -512,7 +534,15 @@ class NeighborListHook:
             # Composition changed — check K before staging realloc.
             self._check_and_resize_k(N, batch.device, pbc)
             self._alloc_staging_buffers(
-                N, B, positions.dtype, batch.device, cell, pbc, batch_ptr
+                N,
+                B,
+                positions.dtype,
+                batch.device,
+                cell,
+                pbc,
+                batch_ptr,
+                positions=positions,
+                batch_idx=batch.batch_idx,
             )
             self._alloc_N = N
             self._alloc_B = B
@@ -742,6 +772,8 @@ class NeighborListHook:
         cell: torch.Tensor | None,
         pbc: torch.Tensor | None,
         batch_ptr: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        batch_idx: torch.Tensor | None = None,
     ) -> None:
         """Allocate persistent staging buffers for the current (N, B) shape."""
         self._buf_positions = torch.zeros(N, 3, dtype=dtype, device=device)
@@ -763,7 +795,11 @@ class NeighborListHook:
         # to compute max_atoms_per_system correctly — the staging buffer is still
         # all-zeros at this point and would give max_atoms = 0.
         ptr = batch_ptr if batch_ptr is not None else self._buf_batch_ptr
-        self._alloc_nl_kwargs(N, B, self._buf_positions, ptr, cell, pbc, device, dtype)
+        alloc_positions = positions if positions is not None else self._buf_positions
+        alloc_batch_idx = batch_idx if batch_idx is not None else self._buf_batch_idx
+        self._alloc_nl_kwargs(
+            N, B, alloc_positions, alloc_batch_idx, ptr, cell, pbc, device, dtype
+        )
 
     def _copy_to_staging_buffers(
         self,
@@ -791,6 +827,7 @@ class NeighborListHook:
         N: int,
         B: int,
         positions: torch.Tensor,
+        batch_idx: torch.Tensor,
         batch_ptr: torch.Tensor,
         cell: torch.Tensor | None,
         pbc: torch.Tensor | None,
@@ -799,39 +836,87 @@ class NeighborListHook:
     ) -> None:
         """Pre-allocate algorithm-specific kwargs to remove CPU-GPU syncs.
 
-        The ``neighbor_list`` dispatcher normally infers geometry-dependent
-        values (shift ranges, cell-list sizes) at call time using ``.item()``
-        synchronisations.  This method computes them **once** when the staging
-        buffers are allocated (or re-allocated after a shape change) and stores
-        the resulting tensors in ``_buf_nl_kwargs`` so they can be forwarded as
-        ``**kwargs`` on every ``neighbor_list`` call.
+        The ops dispatcher exposes a host-only cost model that can select
+        fine-grained strategies such as ``batch_cell_list_pair_centric`` and
+        ``batch_cluster_tile``.  Run that selector once when staging buffers are
+        allocated, cache the chosen method, and pre-allocate scratch tensors for
+        the selected base algorithm.
 
-        Algorithm selection mirrors the dispatcher threshold:
-
-        * ``avg_atoms < 2000`` -> ``batch_naive``
-        * ``avg_atoms >= 2000`` -> ``batch_cell_list``
-
-        Parameters
-        ----------
-        N, B : int
-            Total atom count and number of systems at alloc time.
-        positions : torch.Tensor
-            Staging buffer for positions (used to estimate bounding box for
-            non-PBC cell-list systems).
-        batch_ptr : torch.Tensor
-            Staging buffer for batch_ptr (used to get max_atoms_per_system).
-        cell, pbc : torch.Tensor or None
-            Cell and PBC flag tensors at alloc time.
-        device, dtype : torch.device, torch.dtype
-            Allocation target.
+        ``_using_cell_list_path`` is set from the selected base method so that
+        :class:`_NLGraphCache` capture is only attempted on the cell-list
+        dispatch path (the naive dispatcher chain doesn't yet thread the
+        wrap-scratch kwargs through to the warp launcher).
         """
         self._buf_nl_kwargs = {}
+        batch_ptr = batch_ptr.detach().to(dtype=torch.int32).contiguous()
+        self._neighbor_list_method = self._select_neighbor_list_method(
+            N, B, batch_ptr, cell, pbc, dtype
+        )
+        base_method = self._base_neighbor_list_method(self._neighbor_list_method)
+        self._using_cell_list_path = base_method.endswith("cell_list")
 
-        avg_atoms = N // max(B, 1)
-        use_cell_list = avg_atoms >= 2000
-        self._using_cell_list_path = use_cell_list
+        if base_method.endswith("cluster_tile"):
+            if (
+                allocate_batch_cluster_tile_list is None
+                or estimate_batch_max_tiles_per_group is None
+                or cell is None
+            ):
+                return
+            alloc_cell = cell.to(dtype).contiguous()
+            max_tiles_per_group = estimate_batch_max_tiles_per_group(
+                batch_ptr, self.config.cutoff + self.skin, alloc_cell
+            )
+            (
+                sorted_atom_index,
+                sort_inv,
+                sorted_pos_x,
+                sorted_pos_y,
+                sorted_pos_z,
+                batch_idx_sorted,
+                batch_ptr_padded,
+                group_system,
+                group_ptr,
+                group_ctr_x,
+                group_ctr_y,
+                group_ctr_z,
+                group_ext_x,
+                group_ext_y,
+                group_ext_z,
+                num_tiles,
+                tile_row_group,
+                tile_col_group,
+                tile_system,
+            ) = allocate_batch_cluster_tile_list(
+                batch_ptr,
+                device,
+                dtype=dtype,
+                max_tiles_per_group=max_tiles_per_group,
+            )
+            self._buf_nl_kwargs = {
+                "max_tiles_per_group": max_tiles_per_group,
+                "sorted_atom_index": sorted_atom_index,
+                "sort_inv": sort_inv,
+                "sorted_pos_x": sorted_pos_x,
+                "sorted_pos_y": sorted_pos_y,
+                "sorted_pos_z": sorted_pos_z,
+                "batch_idx_sorted": batch_idx_sorted,
+                "batch_ptr_padded": batch_ptr_padded,
+                "group_system": group_system,
+                "group_ptr": group_ptr,
+                "group_ctr_x": group_ctr_x,
+                "group_ctr_y": group_ctr_y,
+                "group_ctr_z": group_ctr_z,
+                "group_ext_x": group_ext_x,
+                "group_ext_y": group_ext_y,
+                "group_ext_z": group_ext_z,
+                "num_tiles": num_tiles,
+                "tile_row_group": tile_row_group,
+                "tile_col_group": tile_col_group,
+                "tile_system": tile_system,
+            }
+            return
 
-        if use_cell_list:
+        if base_method.endswith("cell_list"):
             if estimate_batch_cell_list_sizes is None or allocate_cell_list is None:
                 return  # nvalchemiops too old; fall back to dynamic allocation
             if cell is not None and pbc is not None:
@@ -842,7 +927,7 @@ class NeighborListHook:
                 # Non-PBC: synthesise a bounding-box cell from current positions
                 # with a 1.5x pad so that position drift during the simulation
                 # doesn't overflow the pre-allocated cell-list arrays.
-                expanded_idx = self._buf_batch_idx.unsqueeze(1).expand_as(positions)
+                expanded_idx = batch_idx.unsqueeze(1).expand_as(positions)
                 pos_min = torch.full((B, 3), float("inf"), dtype=dtype, device=device)
                 pos_min.scatter_reduce_(0, expanded_idx, positions, reduce="amin")
                 pos_max = torch.full((B, 3), float("-inf"), dtype=dtype, device=device)
@@ -876,26 +961,62 @@ class NeighborListHook:
                 "cell_atom_start_indices": cell_atom_start_indices,
                 "cell_atom_list": cell_atom_list,
             }
+            return
 
-        else:
-            # Naive algorithm.
-            if cell is not None and pbc is not None:
-                # PBC naive: pre-compute shift-range tensors so the dispatcher
-                # does not call compute_naive_num_shifts (which has .item()) on
-                # the hot path.
-                if compute_naive_num_shifts is None:
-                    return
-                shift_range, num_shifts, max_shifts = compute_naive_num_shifts(
-                    cell.to(dtype).contiguous(),
-                    self.config.cutoff + self.skin,
-                    pbc,
-                )
-                max_atoms = int((batch_ptr[1:] - batch_ptr[:-1]).max().item())
-                self._buf_nl_kwargs = {
-                    "shift_range_per_dimension": shift_range,
-                    "num_shifts_per_system": num_shifts,
-                    "max_shifts_per_system": max_shifts,
-                    "max_atoms_per_system": max_atoms,
-                }
-            # No-PBC naive: no extra kwargs required — the kernel has no
-            # CPU-sync allocations in this branch.
+        # Naive algorithm.
+        if cell is not None and pbc is not None:
+            # PBC naive: pre-compute shift-range tensors so the dispatcher
+            # does not call compute_naive_num_shifts (which has .item()) on
+            # the hot path.
+            if compute_naive_num_shifts is None:
+                return
+            shift_range, num_shifts, max_shifts = compute_naive_num_shifts(
+                cell.to(dtype).contiguous(),
+                self.config.cutoff + self.skin,
+                pbc,
+            )
+            max_atoms = int((batch_ptr[1:] - batch_ptr[:-1]).max().item())
+            self._buf_nl_kwargs = {
+                "shift_range_per_dimension": shift_range,
+                "num_shifts_per_system": num_shifts,
+                "max_shifts_per_system": max_shifts,
+                "max_atoms_per_system": max_atoms,
+            }
+        # No-PBC naive: no extra kwargs required — the kernel has no
+        # CPU-sync allocations in this branch.
+
+    def _select_neighbor_list_method(
+        self,
+        N: int,
+        B: int,
+        batch_ptr: torch.Tensor,
+        cell: torch.Tensor | None,
+        pbc: torch.Tensor | None,
+        dtype: torch.dtype,
+    ) -> str:
+        """Choose the explicit method to use inside the compiled hot path."""
+        fallback = "cell_list" if N // max(B, 1) >= 2000 else "naive"
+        if cell is None or pbc is None:
+            return fallback
+        try:
+            return suggest_neighbor_list_method(
+                batch_ptr,
+                cell.to(dtype).contiguous(),
+                pbc,
+                self.config.cutoff + self.skin,
+                half_fill=self.config.half_list,
+                return_neighbor_list=False,
+                positions_dtype=dtype,
+            )
+        except (RuntimeError, NotImplementedError, ValueError):
+            return fallback
+
+    @staticmethod
+    def _base_neighbor_list_method(method: str | None) -> str:
+        """Return the dispatcher base method for a fine-grained strategy name."""
+        if method is None:
+            return "naive"
+        try:
+            return neighbor_list_strategy_run_args(method)[0]
+        except ValueError:
+            return method

@@ -12,11 +12,11 @@ readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = {file="LICENSE"}
 dependencies = [
-    "nvalchemi-toolkit-ops[torch]>=0.3.1",
-    "nvidia-physicsnemo==2.1.1",
-    "torch>=2.5.1",
+    "nvalchemi-toolkit-ops>=0.3.1",
+    "torch>=2.8",
+    "click",
     "loguru",
-    "numpy",
+    "numpy<2.4",
     "jaxtyping>=0.3.2",
     "tensordict>=0.11.0",
     "pydantic>=2.11.7",
@@ -25,6 +25,8 @@ dependencies = [
     "zarr>=3",
     "periodictable==2.0.2",
     "rich>=13.0.0",
+    "plotext",
+    "nvidia-physicsnemo>=2.0.0",
 ]
 keywords = [
     "machine learning",
@@ -52,6 +54,7 @@ include = ["nvalchemi/**/*.py"]
 
 [project.scripts]
 nvalchemi-io-test = "nvalchemi.data.io_test:main"
+nvalchemi-training = "nvalchemi.training.cli:main"
 
 [project.urls]
 
@@ -63,13 +66,31 @@ aimnet = [
 ase = [
     "ase>=3.27.0",
 ]
+cu12 = [
+    "nvalchemi-toolkit-ops[torch-cu12]>=0.3.1; sys_platform != 'darwin'",
+    "nvidia-physicsnemo[cu12]>=2.0.0; sys_platform != 'darwin'",
+    "cuml-cu12>=25.6.0; sys_platform != 'darwin'",
+    "torch; sys_platform != 'darwin'",
+    "torchvision; sys_platform != 'darwin'",
+    "cuequivariance-ops-torch-cu12>=0.8.0; sys_platform != 'darwin'",
+]
+cu13 = [
+    "nvalchemi-toolkit-ops[torch-cu13]>=0.3.1; sys_platform != 'darwin'",
+    "nvidia-physicsnemo[cu13]>=2.0.0; sys_platform != 'darwin'",
+    "cuml-cu13>=25.6.0; sys_platform != 'darwin'",
+    "torch; sys_platform != 'darwin'",
+    "torchvision; sys_platform != 'darwin'",
+    "cuequivariance-ops-torch-cu13>=0.8.0; sys_platform != 'darwin'",
+]
 pymatgen = [
     "pymatgen>=2025.10.7",
 ]
 mace = [
-    "cuequivariance-ops-torch-cu12>=0.8.0",
     "cuequivariance-torch>=0.8.0",
     "mace-torch==0.3.15",
+]
+tensorboard = [
+    "tensorboard",
 ]
 uma = [
     "fairchem-core>=2.0.0",
@@ -81,42 +102,61 @@ packages = ["nvalchemi"]
 # === UV configuration ====
 [tool.uv]
 default-groups = ["dev", "build"]
+# Several PhysicsNeMo CUDA dependencies have placeholder packages on PyPI and
+# installable wheels on NVIDIA's index.
+index-strategy = "unsafe-best-match"
+conflicts = [
+  [
+    { extra = "cu12" },
+    { extra = "cu13" },
+  ],
+  # UMA's fairchem-core caps torch <2.9; the cuXX extras floor it at >=2.11
+  # (via toolkit-ops), so UMA forks a separate env (`uv sync --extra uma`).
+  [
+    { extra = "cu12" },
+    { extra = "uma" },
+  ],
+  [
+    { extra = "cu13" },
+    { extra = "uma" },
+  ],
+  # MACE 0.3.15 pins e3nn==0.4.4; fairchem-core (UMA) needs e3nn>=0.5 —
+  # mutually exclusive, so install one extra per environment.
+  [
+    { extra = "mace" },
+    { extra = "uma" },
+  ],
+]
 override-dependencies = [
   "python-hostlist; sys_platform == 'never'"
 ]
-
-# MACE 0.3.15 pins ``e3nn==0.4.4``; fairchem-core (required by UMA)
-# needs ``e3nn>=0.5``. The two extras cannot be installed in the same
-# environment. Declaring them as conflicting lets uv produce separate
-# resolutions — users pick one:
-#   uv sync --extra mace
-#   uv sync --extra uma
-# Both may be installed in parallel environments (e.g. via
-# ``uv venv .venv-mace`` + ``uv venv .venv-uma``) when a developer
-# needs to iterate on both stacks.
-conflicts = [
-    [
-        { extra = "mace" },
-        { extra = "uma" },
-    ],
+dependency-metadata = [
+  { name = "nvalchemi-toolkit-ops", version = "0.4.0", requires-dist = [
+    "warp-lang >= 1.13.0",
+    "numpy",
+    "torch>=2.8.0 ; extra == 'torch'",
+    "torch>=2.8.0 ; extra == 'torch-cu12'",
+    "torch>=2.8.0 ; extra == 'torch-cu13'",
+  ], provides-extra = ["torch", "torch-cu12", "torch-cu13"] },
 ]
 
-# Pin nvalchemi-toolkit-ops to the 0.4.0-rc branch ahead of the 0.4.0
-# release. The branch adds a Warp-tile-based ``exclusive_scan_int32`` that
-# replaces the ``wp.utils.array_scan`` calls inside ``batch_build_cell_list``
-# (those use ``wp_alloc_device_async``, which is illegal during CUDA graph
-# stream capture), along with updated electrostatics/dftd3 models and
-# neighbor-list utilities. Repoint to the released version once 0.4.0 ships.
 [tool.uv.sources]
-nvalchemi-toolkit-ops = { git = "https://github.com/NVIDIA/nvalchemi-toolkit-ops.git", branch = "0.4.0-rc" }
+nvalchemi-toolkit-ops = { git = "https://github.com/NVIDIA/nvalchemi-toolkit-ops.git", rev = "0.4.0-rc" }
+torch = [
+  { index = "pytorch-cu126", extra = "cu12", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cu130", extra = "cu13", marker = "sys_platform != 'darwin'" },
+]
+torchvision = [
+  { index = "pytorch-cu126", extra = "cu12", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cu130", extra = "cu13", marker = "sys_platform != 'darwin'" },
+]
 
 # these are intended to be developer facing
 [dependency-groups]
 build = [
     "ninja>=1.11.1.4",
-    # <81: setuptools 81 removed ``pkg_resources``, which fairchem-core's
-    # ``torchtnt`` dependency still imports at module load (the UMA stack
-    # fails to import otherwise).
+    # setuptools 81 dropped pkg_resources, which fairchem-core's torchtnt
+    # imports at load — pin <81 so the UMA stack imports.
     "setuptools>=70.0.0,<81",
 ]
 dev = [
@@ -163,7 +203,16 @@ include = ["nvalchemi", "nvalchemi.*"]
 [[tool.uv.index]]
 name = "nvidia"
 url = "https://pypi.nvidia.com"
-format = "flat"
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [tool.ruff]
 exclude = [".licenses/", ".ci/", ".github/", ".git/", "build/", "dist/", "nvalchemi/distributed/_core/_upstream/"]
@@ -239,6 +288,9 @@ omit = [
 ]
 show_missing = true
 fail_under = 75
+# Warn instead of aborting on missing source files (e.g. stale cached
+# baseline referencing files deleted in the current PR).
+ignore_errors = true
 
 [tool.coverage.xml]
 output = "nvalchemi.coverage.xml"

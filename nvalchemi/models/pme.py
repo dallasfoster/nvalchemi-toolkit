@@ -35,16 +35,18 @@ Usage
 
 Notes
 -----
-* With ``hybrid_forces=True``, forces are computed analytically inside the
-  Warp kernel as ``dE/dR`` at fixed charges. ``"forces"`` is in
-  ``autograd_outputs`` so the pipeline can add the charge chain-rule term
+* Forces are computed **analytically** inside the Warp kernel using
+  ``hybrid_forces=True``.  Direct kernel forces represent ``dE/dR|_q``
+  (derivative at fixed charges).  ``"forces"`` is in ``autograd_outputs``
+  so that the pipeline can add the charge chain-rule term
   ``(dE/dq)(dq/dR)`` via autograd on the energy.
 * Energy supports ``backward()`` through the charge pathway: when
-  ``charges.requires_grad``, the kernel injects analytical ``dE/dq`` into the
-  energy tensor.
-* Virial/stress is also computed analytically and returned detached, as
-  ``dE/d(strain)`` at fixed charges. With geometry-dependent charges, the
-  total stress is the kernel virial plus the autograd chain-rule term
+  ``charges.requires_grad``, the kernel injects analytical ``dE/dq``
+  into the energy tensor via ``_InjectChargeGrad``.
+* Virial/stress is also computed analytically by the kernel and returned
+  detached (no ``grad_fn``), representing ``dE/d(strain)|_q``.  In a
+  pipeline with geometry-dependent charges, the total stress is the sum
+  of the direct kernel virial and the autograd chain-rule term
   ``(dE/dq)(dq/d(strain))``.
 * Periodic boundary conditions are **required** (``needs_pbc=True``).
 * Input charges are read from ``data.charges`` (shape ``[N]``).
@@ -67,6 +69,7 @@ from torch import nn
 
 from nvalchemi._typing import ModelOutputs
 from nvalchemi.data import AtomicData, Batch
+from nvalchemi.models._utils import cell_cache_needs_update
 from nvalchemi.models.base import (
     BaseModelMixin,
     ModelConfig,
@@ -108,6 +111,19 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
     coulomb_constant : float, optional
         Coulomb prefactor :math:`k_e` in eV·Å/e².
         Defaults to ``14.3996`` (standard value for Å/e/eV unit system).
+    slab_correction : bool, optional
+        Whether to enable the two-dimensional slab correction. Defaults to
+        ``False``. When enabled, the input batch must provide ``data.pbc`` as
+        a boolean tensor with shape ``(B, 3)``. Rows with exactly one
+        ``False`` entry mark slab systems, for example ``[True, True, False]``
+        for a non-periodic z axis. Fully periodic rows are no-ops, so mixed
+        slab and three-dimensional periodic batches are supported.
+    rtol : float, optional
+        Relative tolerance for cell change detection.
+        See :func:`~nvalchemi.models._utils.cell_cache_needs_update`.
+    atol : float or None, optional
+        Absolute tolerance for cell change detection.
+        See :func:`~nvalchemi.models._utils.cell_cache_needs_update`.
 
     Attributes
     ----------
@@ -133,6 +149,9 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         accuracy: float = 1e-6,
         coulomb_constant: float = 14.3996,
         hybrid_forces: bool = True,
+        slab_correction: bool = False,
+        rtol: float = 1e-5,
+        atol: float | None = None,
     ) -> None:
         super().__init__()
         self.cutoff = cutoff
@@ -143,6 +162,9 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         self.accuracy = accuracy
         self.coulomb_constant = coulomb_constant
         self.hybrid_forces = hybrid_forces
+        self.slab_correction = slab_correction
+        self.rtol = rtol
+        self.atol = atol
         self.model_config = ModelConfig(
             outputs=frozenset({"energy", "forces", "stress"}),
             active_outputs={"energy", "forces"},
@@ -390,10 +412,14 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         Returns
         -------
         set[str]
-            ``{"positions", "charges", "neighbor_matrix", "num_neighbors"}``.
+            ``{"positions", "charges", "neighbor_matrix", "num_neighbors"}``,
+            plus ``"pbc"`` when ``slab_correction=True``.
             Notably excludes ``atomic_numbers``, which PME does not use.
         """
-        return {"positions", "charges", "neighbor_matrix", "num_neighbors"}
+        keys = {"positions", "charges", "neighbor_matrix", "num_neighbors"}
+        if self.slab_correction:
+            keys.add("pbc")
+        return keys
 
     # ------------------------------------------------------------------
     # Cache management
@@ -519,6 +545,11 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         for key in self.input_data():
             value = getattr(data, key, None)
             if value is None:
+                if key == "pbc" and self.slab_correction:
+                    raise ValueError(
+                        "PMEModelWrapper with slab_correction=True requires periodic "
+                        "boundary condition flags (data.pbc must be present)."
+                    )
                 raise KeyError(f"'{key}' required but not found in input data.")
             input_dict[key] = value
 
@@ -535,6 +566,15 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
                 "PMEModelWrapper requires periodic boundary conditions "
                 "(data.cell must be present)."
             )
+
+        if self.slab_correction:
+            pbc = getattr(data, "pbc", None)
+            if pbc is None:
+                raise ValueError(
+                    "PMEModelWrapper with slab_correction=True requires periodic "
+                    "boundary condition flags (data.pbc must be present)."
+                )
+            input_dict["pbc"] = pbc  # (B, 3)
 
         # Neighbor data is collected by the input_data() loop above; the
         # pipeline adapts it to this model's cutoff/format before forward().
@@ -628,7 +668,7 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
             OrderedDict with keys ``"energy"`` (shape ``[B, 1]``, eV),
             ``"forces"`` (shape ``[N, 3]``, eV/Å), and optionally
             ``"stress"`` (shape ``[B, 3, 3]``, eV/Å³ — Cauchy stress
-            ``W/V``).
+            ``-W/V``).
         """
         from nvalchemi.models._ops.electrostatics.pme import (  # lazy, PLC0415
             particle_mesh_ewald_from_total_charge,
@@ -645,20 +685,23 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         B: int = inp["num_graphs"]
         neighbor_matrix = inp["neighbor_matrix"].contiguous()
         neighbor_matrix_shifts = inp.get("neighbor_matrix_shifts")
+        pbc = inp.get("pbc")
 
         compute_forces = "forces" in self.model_config.active_outputs
         compute_stresses = "stress" in self.model_config.active_outputs
 
-        # With analytical forces the kernel needs no autograd tape; detach so
-        # its backward registration does not expect one when the inputs arrive
-        # grad-requiring (e.g. from a strain-enabled pipeline).
+        # hybrid_forces=True: the kernel detaches positions and cell
+        # internally and computes analytical forces/virial without a Warp
+        # tape.  Detach here too so that nvalchemiops' backward registration
+        # (_register_runtime_state) does not expect a tape when inputs have
+        # requires_grad=True (e.g. from prepare_strain in a pipeline).
         if self.hybrid_forces:
             positions = positions.detach()
             cell = cell.detach()
 
-        # Invalidate the cache when the cell changes (e.g. NPT).
-        if self._cached_cell is None or not torch.allclose(
-            cell, self._cached_cell, rtol=1e-6, atol=1e-9
+        # Automatically invalidate cache when cell changes (e.g. NPT simulation).
+        if cell_cache_needs_update(
+            cell, self._cached_cell, rtol=self.rtol, atol=self.atol
         ):
             self._cached_cell = cell.detach().clone()
             self._cache_valid = False
@@ -719,6 +762,8 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
             compute_virial=compute_stresses,
             accuracy=self.accuracy,
             hybrid_forces=self.hybrid_forces,
+            pbc=pbc,
+            slab_correction=self.slab_correction,
         )
 
         # Unpack tuple: (energies, [forces], [virial]).
@@ -769,9 +814,9 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
         if forces is not None:
             model_output["forces"] = forces
         if virial is not None:
-            # Cauchy stress ``sigma = W / V`` (eV/Å³).
+            # Tensile-positive Cauchy stress sigma = -W/V (eV/A^3).
             volume = torch.det(data.cell).abs().view(-1, 1, 1)
-            model_output["stress"] = virial / volume
+            model_output["stress"] = -virial / volume
         elif compute_stresses:
             raise RuntimeError(
                 "stress was requested but the kernel did not return a virial"

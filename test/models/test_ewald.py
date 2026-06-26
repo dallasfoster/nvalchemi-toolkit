@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Tests for EwaldModelWrapper.
 
 Strategy
@@ -27,7 +26,6 @@ Strategy
 from __future__ import annotations
 
 from collections import OrderedDict
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -209,6 +207,11 @@ class TestEwaldInputOutput:
         assert "charges" in keys
         assert "neighbor_matrix" in keys
         assert "num_neighbors" in keys
+
+    def test_input_data_includes_pbc_for_slab_correction(self):
+        """Slab-enabled Ewald declares pbc as a required input."""
+        w = _make_ewald(slab_correction=True)
+        assert "pbc" in w.input_data()
 
     def test_output_data_with_forces(self):
         w = _make_ewald()
@@ -514,8 +517,8 @@ class TestEwaldIntegration:
         assert "stress" in out
         assert out["stress"].shape == (1, 3, 3)
 
-    def test_forward_stress_is_virial_over_volume(self):
-        """Stress == virial / volume (Cauchy stress, eV/A^3)."""
+    def test_forward_stress_is_negative_virial_over_volume(self):
+        """Tensile-positive stress == -virial / volume (eV/A^3)."""
         import nvalchemi.models.ewald as _emod
 
         w = _make_ewald()
@@ -532,14 +535,14 @@ class TestEwaldIntegration:
                 "forces": torch.zeros(N, 3),
             }
             volume = torch.det(data.cell).abs().view(-1, 1, 1)
-            model_output["stress"] = known_virial / volume
+            model_output["stress"] = -known_virial / volume
             return self_inner.adapt_output(model_output, data)
 
         with patch.object(_emod.EwaldModelWrapper, "forward", patched_forward):
             out = w.forward(batch)
 
         volume = torch.det(batch.cell).abs().view(-1, 1, 1)
-        torch.testing.assert_close(out["stress"], known_virial / volume)
+        torch.testing.assert_close(out["stress"], -known_virial / volume)
 
     def test_forward_raises_when_virial_none(self):
         """RuntimeError when stress is requested but kernels return no virial."""
@@ -616,6 +619,32 @@ class TestEwaldIntegration:
         # y and z components should be ~0 by symmetry
         assert out["forces"][:, 1].abs().max() < 1e-4
         assert out["forces"][:, 2].abs().max() < 1e-4
+
+    def test_energies_buffer_detached_after_forward(self):
+        """`_energies_buf` has no `grad_fn` after a grad-carrying forward (#82)."""
+        w = _make_ewald()
+        batch = _make_charged_batch()
+        batch.charges = batch.charges.detach().requires_grad_(True)
+        self._build_nl(batch, w)
+        out = w(batch)
+        assert out["energy"].grad_fn is not None
+        assert w._energies_buf.grad_fn is None
+        assert not w._energies_buf.requires_grad
+
+    def test_consecutive_forwards_storage_independent(self):
+        """Energy from forward N and N+1 do not alias the same storage (#82)."""
+        w = _make_ewald()
+        batch = _make_charged_batch()
+        self._build_nl(batch, w)
+        e1 = w(batch)["energy"]
+        snapshot = e1.detach().clone()
+        # Perturb so the next forward yields different values — a no-clone
+        # view of the persistent buffer would silently mutate e1.
+        batch.charges = batch.charges * 2.0
+        e2 = w(batch)["energy"]
+        assert e1.untyped_storage().data_ptr() != e2.untyped_storage().data_ptr()
+        assert torch.equal(e1, snapshot)
+        assert not torch.equal(e1, e2)
 
 
 # ===========================================================================
@@ -830,155 +859,8 @@ class TestEwaldHybridForces:
         v_real = real_result[1]
         v_recip = recip_result[1]
         volume = torch.det(batch.cell).abs().view(-1, 1, 1)
-        expected_stress = (v_real + v_recip) * w.coulomb_constant / volume
+        expected_stress = -(v_real + v_recip) * w.coulomb_constant / volume
 
         torch.testing.assert_close(
             out_hybrid["stress"], expected_stress, atol=1e-5, rtol=1e-5
         )
-
-
-# ===========================================================================
-# Distribution wiring — spec / setup / teardown / single-GPU pass-through
-# ===========================================================================
-
-
-class TestEwaldDistributionWiring:
-    """Structural tests for EwaldModelWrapper's distribution surface.
-
-    These exercise the spec shape, the handler registration lifecycle
-    (``distributed_setup`` → ``distributed_teardown``), and that the
-    single-GPU forward path is unaffected by the presence of the
-    distribution machinery. They do not require a distributed backend
-    — the handlers are installed into the dispatcher and then cleared
-    without firing on any ShardTensor. Multi-GPU equivalence lives in
-    ``test/distributed/test_ewald_multigpu.py``.
-    """
-
-    def test_distribution_spec_storage_modes(self):
-        """Spec carries halo storage + scatter/gather modes from the preset."""
-        from nvalchemi.distributed._core.storage_policy import HaloStoragePolicy
-
-        w = _make_ewald()
-        spec = w.distribution_spec
-        policy = spec.distribution.policy
-        assert isinstance(policy, HaloStoragePolicy)
-        assert policy.scatter_mode == "halo_correction"
-        assert policy.gather_mode == "halo_read"
-        assert spec.system_reductions is True
-
-    def test_distribution_spec_registers_both_fill_ops(self):
-        """Both single + batched partial-structure-factor ops are listed."""
-        import torch as _torch
-
-        w = _make_ewald()
-        spec = w.distribution_spec
-        assert len(spec.custom_ops) == 2
-        op_names = {str(os.op) for os in spec.custom_ops}
-        expected = {
-            str(_torch.ops.alchemiops._ewald_compute_partial_structure_factors.default),
-            str(
-                _torch.ops.alchemiops._batch_ewald_compute_partial_structure_factors.default
-            ),
-        }
-        assert op_names == expected
-
-    def test_distribution_spec_owned_slice_and_all_reduce(self):
-        """Single: slice (positions, charges); batched: + batch_idx at idx 5."""
-        w = _make_ewald()
-        spec = w.distribution_spec
-        for op_spec in spec.custom_ops:
-            name = str(op_spec.op)
-            # Both variants all-reduce (real_sf, imag_sf, total_charge).
-            assert op_spec.all_reduce_outputs == (0, 1, 2), (
-                f"expected all_reduce_outputs=(0,1,2) on {name}, "
-                f"got {op_spec.all_reduce_outputs}"
-            )
-            assert op_spec.gather_inputs == ()
-            assert op_spec.scatter_outputs == ()
-            if "_batch_" in name:
-                assert op_spec.owned_slice_inputs == (0, 1, 5), (
-                    f"expected owned_slice_inputs=(0,1,5) on batched variant, "
-                    f"got {op_spec.owned_slice_inputs}"
-                )
-            else:
-                assert op_spec.owned_slice_inputs == (0, 1), (
-                    f"expected owned_slice_inputs=(0,1) on single-system variant, "
-                    f"got {op_spec.owned_slice_inputs}"
-                )
-
-    def test_distributed_setup_stashes_halo_metadata(self):
-        """After setup, wrapper carries the sharded_batch's meta/cfg/n_systems."""
-        w = _make_ewald()
-        assert w._halo_meta is None
-        assert w._halo_cfg is None
-        assert w._n_systems_global is None
-
-        stub = SimpleNamespace(meta=object(), config=object(), n_systems=3)
-        w.distributed_setup(mesh=None, sharded_batch=stub)
-        assert w._halo_meta is stub.meta
-        assert w._halo_cfg is stub.config
-        assert w._n_systems_global == 3
-
-        w.distributed_teardown()
-        assert w._halo_meta is None
-        assert w._halo_cfg is None
-        assert w._n_systems_global is None
-
-    def test_setup_stashes_metadata_teardown_clears_it(self):
-        """Wrapper-side setup/teardown is now metadata-only — handler
-        registration is :class:`DistributedModel`'s job (driven by the
-        spec it holds). The wrapper just stashes per-run halo metadata
-        so :meth:`adapt_input` can read it.
-        """
-        w = _make_ewald()
-        assert w._halo_meta is None
-        assert w._n_global_atoms is None
-
-        sentinel_meta = object()
-        sentinel_cfg = object()
-        stub = SimpleNamespace(
-            meta=sentinel_meta,
-            config=sentinel_cfg,
-            n_systems=2,
-            n_atoms_total=256,
-        )
-        w.distributed_setup(mesh=None, sharded_batch=stub)
-        assert w._halo_meta is sentinel_meta
-        assert w._halo_cfg is sentinel_cfg
-        assert w._n_systems_global == 2
-        assert w._n_global_atoms == 256
-
-        w.distributed_teardown()
-        assert w._halo_meta is None
-        assert w._halo_cfg is None
-        assert w._n_systems_global is None
-        assert w._n_global_atoms is None
-
-    @pytest.mark.skipif(
-        not pytest.importorskip(
-            "nvalchemiops", reason="nvalchemiops not available"
-        ).__name__.startswith("nvalchemiops"),
-        reason="placeholder — importorskip handles it",
-    )
-    def test_single_gpu_forward_unaffected_by_distribution_wiring(self):
-        """With handlers installed but no ShardTensor inputs, forward is
-        bit-identical to the baseline — the handler only fires for
-        ShardTensor dispatch, and plain tensors pass through."""
-        from nvalchemi.neighbors import compute_neighbors
-
-        w = _make_ewald()
-        batch = _make_charged_batch(n_atoms=8, box_size=8.0)
-        compute_neighbors(batch, config=w.model_config.neighbor_config)
-
-        ref = w(batch)["energy"].detach().clone()
-
-        # Install handlers then run again — shouldn't change anything
-        # because batch contains plain tensors (not ShardTensor).
-        stub = SimpleNamespace(meta=object(), config=object(), n_systems=1)
-        try:
-            w.distributed_setup(mesh=None, sharded_batch=stub)
-            wired = w(batch)["energy"].detach().clone()
-        finally:
-            w.distributed_teardown()
-
-        torch.testing.assert_close(wired, ref, atol=0.0, rtol=0.0)

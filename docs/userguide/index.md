@@ -26,13 +26,18 @@ $ python -c "import nvalchemi; print(nvalchemi.__version__)"
 
 - [Install](about/install)
 - [Introduction](about/intro)
+- [Conventions](about/conventions)
 
 ## Core Components
 
 - [AtomicData and Batch](data)
 - [Data Loading Pipeline](datapipes)
 - {doc}`Models: Wrapping ML Interatomic Potentials <models>`
+- {doc}`Training: Strategy and Runtime <training>`
+- {doc}`Losses: Composable Training Terms <losses>`
+- {doc}`Fine-Tuning Pretrained Models <finetuning>`
 - {doc}`Hooks: Observe & Modify <hooks>`
+- {doc}`Reporting: Summaries and Dashboards <reporting>`
 - [Dynamics: Optimization and MD](dynamics)
 
 ## Distributed Simulations
@@ -44,8 +49,9 @@ $ python -c "import nvalchemi; print(nvalchemi.__version__)"
 
 ## Advanced Usage
 
+- [Distributed Training](distributed_training)
 - [Zarr Compression Tuning](zarr_compression)
-- [Agent Skills](agent_skills)
+- {doc}`Agent Skills <agent_skills>`
 
 ```{toctree}
 :caption: About
@@ -54,6 +60,7 @@ $ python -c "import nvalchemi; print(nvalchemi.__version__)"
 
 about/install
 about/intro
+about/conventions
 about/faq
 about/contributing
 
@@ -67,7 +74,11 @@ about/contributing
 data
 datapipes
 models
+training
+losses
+finetuning
 hooks
+reporting
 dynamics
 ```
 
@@ -87,6 +98,7 @@ distributed_byo
 :maxdepth: 1
 :hidden:
 
+distributed_training
 zarr_compression
 agent_skills
 ```

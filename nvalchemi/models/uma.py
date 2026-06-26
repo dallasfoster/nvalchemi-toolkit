@@ -54,12 +54,20 @@ Notes
 
 ``torch.compile``
 -----------------
-The UMA wrapper has no ``compile_model`` flag: fairchem owns compilation
-through the ``compile`` field on ``InferenceSettings``, reached via
-:meth:`from_checkpoint`'s ``inference_settings`` argument. Use
-``inference_settings="turbo"`` for fairchem's optimized preset (also enables
-tf32 / merge_mole, changing numerics), or pass an ``InferenceSettings`` instance
-with only ``compile=True`` for a pure compile toggle::
+Unlike :class:`~nvalchemi.models.mace.MACEWrapper` /
+:class:`~nvalchemi.models.aimnet2.AIMNet2Wrapper`, the UMA wrapper does
+**not** expose a ``compile_model`` flag. fairchem owns compilation
+internally: it is a field on ``fairchem.core.units.mlip_unit.api.inference.InferenceSettings``
+(``compile: bool``), not a ``torch.compile(model)`` call. Reach it
+through :meth:`from_checkpoint`'s ``inference_settings`` argument:
+
+* ``inference_settings="turbo"`` — fairchem's optimized preset, which
+  sets ``compile=True`` **and** ``tf32=True`` / ``merge_mole=True`` /
+  ``activation_checkpointing=False``. Best for long simulations with
+  fixed atomic composition; it changes numerics relative to ``"default"``.
+* For a pure compile toggle, pass an ``InferenceSettings`` instance with
+  ``compile=True`` and the other fields left at their ``"default"``
+  values::
 
       from fairchem.core.units.mlip_unit.api.inference import (
           InferenceSettings,
@@ -77,7 +85,7 @@ from __future__ import annotations
 
 import contextlib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import torch
 from torch import nn
@@ -100,13 +108,19 @@ from nvalchemi.models.base import (
     NeighborListFormat,
 )
 
-__all__ = ["UMAWrapper"]
+if TYPE_CHECKING:
+    from fairchem.core.units.mlip_unit import MLIPPredictUnit
+    from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
+
+__all__ = ["UMATask", "UMAWrapper"]
 
 
-# UMA task names; module-level so the wrapper can validate and tests can iterate.
-_UMA_TASKS: tuple[str, ...] = ("omol", "omat", "oc20", "odac", "omc")
+# UMA task heads. The ``Literal`` is the single source of truth for valid task
+# names; the membership set is derived from it.
+UMATask = Literal["omol", "omat", "oc20", "odac", "omc"]
+_UMA_TASKS: frozenset[str] = frozenset(get_args(UMATask))
 
-# Periodic tasks (stress supported); ``omol`` is molecular (no stress).
+# Tasks that declare PBC (stress supported). ``omol`` is molecular — no stress.
 _PBC_TASKS: frozenset[str] = frozenset({"omat", "oc20", "odac", "omc"})
 
 
@@ -613,6 +627,10 @@ class UMAWrapper(nn.Module, BaseModelMixin):
         UMA task: one of ``_UMA_TASKS``. Determines which per-task head
         in the multi-task model is used and which inputs (charge, spin)
         must be populated.
+    train : bool
+        ``False`` (default) freezes all weights for inference (lossless for
+        autograd forces); ``True`` keeps fairchem's trainable/frozen split
+        so weights stay exposed for fine-tuning.
 
     Attributes
     ----------
@@ -622,15 +640,20 @@ class UMAWrapper(nn.Module, BaseModelMixin):
         The UMA task this wrapper is pinned to.
     """
 
-    def __init__(self, predict_unit: Any, task_name: str = "omol") -> None:
+    def __init__(
+        self,
+        predict_unit: "MLIPPredictUnit",
+        task_name: UMATask = "omol",
+        train: bool = False,
+    ) -> None:
         super().__init__()
         if task_name not in _UMA_TASKS:
             raise ValueError(
-                f"UMAWrapper task_name {task_name!r} must be one of {_UMA_TASKS}"
+                f"UMAWrapper task_name {task_name!r} must be one of {get_args(UMATask)}"
             )
 
-        # Validate the checkpoint supports this task at construction, not on
-        # first forward.
+        # Validate that the checkpoint actually supports this task —
+        # surface the error at construction, not on first forward.
         available = list(predict_unit.dataset_to_tasks.keys())
         if task_name not in available:
             raise ValueError(
@@ -672,6 +695,16 @@ class UMAWrapper(nn.Module, BaseModelMixin):
             active_outputs=active_outputs,
         )
 
+        # Inference (train=False): freeze all weights — conservative forces
+        # come from autograd w.r.t. positions, so this is lossless and avoids
+        # building a weight-grad graph each forward. Training: leave fairchem's
+        # loaded trainable/frozen split intact so weights stay exposed.
+        self._train = train
+        if not train:
+            for p in self.predict_unit.model.parameters():
+                p.requires_grad_(False)
+        self.train(train)
+
     # ------------------------------------------------------------------
     # Construction
     # ------------------------------------------------------------------
@@ -680,10 +713,11 @@ class UMAWrapper(nn.Module, BaseModelMixin):
     def from_checkpoint(
         cls,
         name_or_path: str | Path,
-        task_name: str = "omol",
+        task_name: UMATask = "omol",
         device: str | torch.device = "cpu",
-        inference_settings: Any = "default",
+        inference_settings: "InferenceSettings | str" = "default",
         overrides: dict | None = None,
+        train: bool = False,
     ) -> "UMAWrapper":
         """Resolve and load a UMA checkpoint.
 
@@ -716,6 +750,14 @@ class UMAWrapper(nn.Module, BaseModelMixin):
         overrides : dict | None
             Optional overrides forwarded to fairchem's inference-settings
             builder.
+        train : bool
+            If ``False`` (default), freeze all weights for inference —
+            lossless, since conservative forces come from autograd on
+            positions. If ``True``, keep fairchem's loaded trainable/frozen
+            split so weights remain exposed for fine-tuning. Note: the
+            ``forward`` path goes through fairchem's inference ``predict``
+            (eval mode, detached forces); gradient-based training requires a
+            separate path through the raw model.
 
         Returns
         -------
@@ -755,9 +797,9 @@ class UMAWrapper(nn.Module, BaseModelMixin):
             raise ValueError(
                 f"{name_str!r} is neither a registered model name nor a "
                 f"local file path. Known names: "
-                f"{sorted(pretrained_mlip.available_models)[:6]}..."
+                f"{sorted(pretrained_mlip.available_models)}"
             )
-        return cls(predict_unit, task_name=task_name)
+        return cls(predict_unit, task_name=task_name, train=train)
 
     def _extract_cutoff(self) -> float:
         """Pull the radial cutoff from the loaded backbone.
@@ -961,7 +1003,10 @@ class UMAWrapper(nn.Module, BaseModelMixin):
         ``data.positions.device``, preserving GPU residency and autograd.
         ``edge_index`` is left empty ``(2, 0)`` so fairchem's ``MLIPPredictUnit``
         rebuilds the graph internally, matching the default ``FAIRChemCalculator``
-        path. Charge/spin default to per-system zeros unless provided on the batch.
+        path (``r_edges=False``), so outputs are equivalent. Charge/spin default
+        per the ASE-calculator convention (per-system LongTensors; spin defaults
+        to the closed-shell singlet for OMol, 0 for periodic tasks) unless the
+        caller provides them on the batch.
 
         Parameters
         ----------
@@ -1014,8 +1059,8 @@ class UMAWrapper(nn.Module, BaseModelMixin):
         else:
             pbc = pbc.to(torch.bool)
 
-        # charge/spin: typed fields are float (B, 1); fairchem wants per-system
-        # long (B,), so flatten + cast.
+        # charge/spin: the typed AtomicData fields are float (B, 1); fairchem
+        # wants per-system long (B,), so flatten + cast (also handles raw (B,)).
         charge = getattr(data, "charge", None)
         if charge is None:
             charge = torch.zeros(n_systems, dtype=torch.long, device=device)
@@ -1024,7 +1069,13 @@ class UMAWrapper(nn.Module, BaseModelMixin):
 
         spin = getattr(data, "spin", None)
         if spin is None:
-            spin = torch.zeros(n_systems, dtype=torch.long, device=device)
+            # spin is the multiplicity (only used by the OMol head); default to
+            # the closed-shell singlet (1), matching FAIRChemCalculator. Open-
+            # shell systems must set it explicitly. Periodic heads ignore spin.
+            spin_default = 0 if self._is_pbc_task else 1
+            spin = torch.full(
+                (n_systems,), spin_default, dtype=torch.long, device=device
+            )
         else:
             spin = spin.to(torch.long).reshape(n_systems)
 
@@ -1034,9 +1085,16 @@ class UMAWrapper(nn.Module, BaseModelMixin):
         nedges = torch.zeros(n_systems, dtype=torch.long, device=device)
 
         fixed = torch.zeros(total_atoms, dtype=torch.long, device=device)
-        tags = torch.zeros(total_atoms, dtype=torch.long, device=device)
 
-        fc_data = FCAtomicData(
+        # fairchem tags = nvalchemi atom_categories (sub-surface/surface/
+        # adsorbate for OC20/ODAC); defaults to zeros when unset.
+        cats = getattr(data, "atom_categories", None)
+        if cats is None:
+            tags = torch.zeros(total_atoms, dtype=torch.long, device=device)
+        else:
+            tags = cats.to(torch.long).reshape(total_atoms)
+
+        return FCAtomicData(
             pos=pos,
             atomic_numbers=atomic_numbers,
             cell=cell,
@@ -1053,8 +1111,6 @@ class UMAWrapper(nn.Module, BaseModelMixin):
             sid=[""] * n_systems,
             dataset=[self.task_name] * n_systems,
         )
-
-        return fc_data
 
     def adapt_output(
         self, raw: dict, data: AtomicData | Batch | None = None

@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """AIMNet2 model wrapper.
 
 Wraps an AIMNet2 ``nn.Module`` as a
@@ -73,7 +72,11 @@ from nvalchemi.distributed.helpers import (
     system_sum,
     to_local,
 )
-from nvalchemi.models._utils import prepare_strain
+from nvalchemi.models._utils import (
+    autograd_forces_and_stresses,
+    autograd_stresses,
+    prepare_strain,
+)
 from nvalchemi.models.base import (
     BaseModelMixin,
     ModelConfig,
@@ -170,6 +173,15 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
         An AIMNet2 model (loaded from checkpoint or instantiated
         directly).  Use :meth:`from_checkpoint` for the common
         construction path.
+    compile_model : bool, optional
+        ``torch.compile`` the AIMNet2 module forward via the calculator's
+        kernel-aware compile path (single-process inference). Distributed
+        compilation is a separate switch, ``DistributedModel(..., compile=True)``.
+    compile_kwargs : dict[str, Any] | None, optional
+        Forwarded to ``torch.compile`` when ``compile_model=True``.
+    train : bool | None, optional
+        Whether AIMNet2Calculator should keep the model trainable. Defaults
+        to the wrapped module's current training mode.
 
     Attributes
     ----------
@@ -189,11 +201,13 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
         *,
         compile_model: bool = False,
         compile_kwargs: dict[str, Any] | None = None,
+        train: bool | None = None,
     ) -> None:
         from aimnet.calculators import AIMNet2Calculator
 
         super().__init__()
         self.model = model
+        calculator_train = model.training if train is None else train
 
         # Build a calculator for its pad/unpad utilities and its own
         # kernel-aware ``torch.compile`` of the module forward (``compile_model``).
@@ -204,7 +218,7 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
             needs_dispersion=False,
             compile_model=compile_model,
             compile_kwargs=compile_kwargs,
-            train=False,
+            train=calculator_train,
         )
 
         # Detect NSE (Neutral Spin Equilibrated) models.
@@ -281,7 +295,9 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
         from aimnet.calculators import AIMNet2Calculator
 
         # Resolve + load the checkpoint only; the raw module is extracted and
-        # this calculator discarded, so it never compiles.
+        # this calculator discarded, so it never compiles. The wrapper's own
+        # calculator performs the compile (via ``compile_model``).
+        train = not compile_model
         calc = AIMNet2Calculator(
             model=str(checkpoint_path),
             device=str(device),
@@ -300,6 +316,7 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
             raw_model,
             compile_model=compile_model,
             compile_kwargs=dict(compile_kwargs) if compile_kwargs else None,
+            train=train,
         )
 
     @staticmethod
@@ -465,6 +482,9 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
         # Optional PBC cell.
         cell = getattr(data, "cell", None)
         if cell is not None:
+            # AIMNet2 expects one cell matrix per system, even for single systems.
+            if cell.ndim == 2:
+                cell = cell.unsqueeze(0)
             result["cell"] = cell.to(torch.float32)
 
         # NSE multiplicity.
@@ -570,6 +590,10 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
         :func:`~nvalchemi.models._utils.prepare_strain` scales positions and cell
         through a displacement tensor so ``dE/d(displacement)`` gives the strain.
 
+        In a pipeline with ``use_autograd=True``, the pipeline handles
+        derivative computation externally — it strips forces/stresses
+        from ``active_outputs`` so this method only computes energy.
+
         Parameters
         ----------
         data : AtomicData | Batch
@@ -629,27 +653,39 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
         if "spin_charges" in self.model_config.active_outputs:
             result["spin_charges"] = raw_output.get("spin_charges")
 
-        # Autograd-derived forces.
-        if compute_forces:
+        # Autograd-derived forces/stresses. Under domain decomposition the
+        # framework computes forces externally (FRAMEWORK_FROM_GLOBAL_ENERGY),
+        # so this eager autograd block only runs in single-process / pipeline
+        # use_autograd=False paths.
+        if compute_forces and compute_stresses and displacement is not None:
+            energy = result["energy"]
+            forces, stress = autograd_forces_and_stresses(
+                energy,
+                data.positions,
+                displacement,
+                orig_cell,
+                data.num_graphs,
+                training=self.training,
+            )
+            result["forces"] = forces
+            result["stress"] = stress
+        elif compute_forces:
             energy = result["energy"]
             forces = -torch.autograd.grad(
                 energy,
                 data.positions,
                 grad_outputs=torch.ones_like(energy),
-                create_graph=False,
-                retain_graph=compute_stresses,
+                create_graph=self.training,
+                retain_graph=compute_stresses or self.training,
             )[0]
             result["forces"] = forces
-
-        # Autograd-derived stresses via the affine strain trick.
-        if compute_stresses and displacement is not None:
-            from nvalchemi.models._utils import autograd_stresses
-
+        elif compute_stresses and displacement is not None:
             result["stress"] = autograd_stresses(
                 result["energy"],
                 displacement,
                 orig_cell,
                 data.num_graphs,
+                training=self.training,
             )
 
         # Restore original positions/cell if strain was applied.
