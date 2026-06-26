@@ -32,7 +32,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from nvalchemi.dynamics.hooks.neighbor_list import NeighborListHook
+from nvalchemi.hooks.neighbor_list import NeighborListHook
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.distributed.config import DomainConfig
