@@ -400,7 +400,7 @@ def test_e2e_diagnostic_flags_unwrapped_mol_sum():
 
     report = trace_and_validate(
         _make_aimnet2_only_calc_masks,
-        _make_octane_chain(n_atoms=8),
+        _make_octane_chain(n_atoms=24),
         world_size=2,
         device="cuda:0",
         atol=1e-5,
@@ -452,7 +452,7 @@ def test_e2e_diagnostic_silent_on_correctly_wrapped():
 
     report = trace_and_validate(
         _make_aimnet2_correct,
-        _make_octane_chain(n_atoms=8),
+        _make_octane_chain(n_atoms=24),
         world_size=2,
         device="cuda:0",
         atol=1e-5,
