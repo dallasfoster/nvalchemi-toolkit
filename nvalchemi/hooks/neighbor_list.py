@@ -149,6 +149,14 @@ class _NLGraphCache:
         self._wp_stream = _wp.Stream(cuda_stream=self._stream.cuda_stream)
         self._graph: torch.cuda.CUDAGraph | None = None
         self._key: tuple | None = None
+        # Latches True if a capture attempt fails. Once set, the cache
+        # permanently declines to (re-)capture and the hook stays on the
+        # eager path: a failed ``torch.cuda.graph`` leaves the capture
+        # stream poisoned, so retrying every step would re-poison the
+        # context and cascade ``cudaErrorStreamCaptureInvalidated`` into
+        # unrelated work. The eager dispatch is correct on its own; the
+        # graph is only a replay optimisation.
+        self._capture_disabled: bool = False
 
     @staticmethod
     def make_key(
@@ -177,32 +185,73 @@ class _NLGraphCache:
             self._graph.replay()  # type: ignore[union-attr]
         current.wait_stream(self._stream)
 
-    def capture(self, fn, key: tuple) -> None:
+    def capture(self, fn, key: tuple) -> bool:
         """Capture ``fn()`` into a fresh CUDA graph for this key.
 
         The caller must have already invoked ``fn`` once eagerly outside
         the captured region so any warmup-only work (kernel JIT,
         first-build adaptive-K resize) finishes before capture freezes
         the launch dim.
+
+        Returns ``True`` on a successful capture and ``False`` if capture
+        failed (in which case the cache permanently disables capture and
+        the caller stays on the eager path). A failed
+        ``torch.cuda.graph`` can leave the capture stream in an aborted
+        stream-capture state that poisons every later CUDA call with
+        ``cudaErrorStreamCaptureInvalidated`` / "Offset increment outside
+        graph capture"; on failure we abort the partial graph and hard-
+        synchronise the device so the context is clean for subsequent
+        (unrelated) work.
         """
+        if self._capture_disabled:
+            return False
         graph = torch.cuda.CUDAGraph()
         current = torch.cuda.current_stream(self._device)
         self._stream.wait_stream(current)
-        with self._wp.ScopedStream(self._wp_stream):
-            with torch.cuda.stream(self._stream):
-                # Warmup-in-stream so the warp kernel modules are
-                # loaded for the captured stream's CUDA context. The
-                # first such load goes through ``cuModuleLoadData``,
-                # which isn't capture-safe — running once outside
-                # ``torch.cuda.graph`` ensures the cache hits inside.
-                fn()
-                torch.cuda.synchronize(self._device)
-                with torch.cuda.graph(graph, stream=self._stream):
+        try:
+            with self._wp.ScopedStream(self._wp_stream):
+                with torch.cuda.stream(self._stream):
+                    # Warmup-in-stream so the warp kernel modules are
+                    # loaded for the captured stream's CUDA context. The
+                    # first such load goes through ``cuModuleLoadData``,
+                    # which isn't capture-safe — running once outside
+                    # ``torch.cuda.graph`` ensures the cache hits inside.
                     fn()
-        current.wait_stream(self._stream)
-        torch.cuda.synchronize(self._device)
+                    torch.cuda.synchronize(self._device)
+                    with torch.cuda.graph(graph, stream=self._stream):
+                        fn()
+            current.wait_stream(self._stream)
+            torch.cuda.synchronize(self._device)
+        except Exception:  # noqa: BLE001 — any capture failure → eager fallback
+            # Permanently disable capture for this cache and drop any
+            # partially-built graph, then resynchronise so the aborted
+            # stream-capture state cannot leak into later CUDA work.
+            self._capture_disabled = True
+            self._graph = None
+            self._key = None
+            del graph
+            self._resync_after_failed_capture()
+            return False
         self._graph = graph
         self._key = key
+        return True
+
+    def _resync_after_failed_capture(self) -> None:
+        """Drain both the capture stream and the device after an aborted
+        capture so the poisoned stream-capture state is cleared before any
+        further (unrelated) CUDA work runs.
+
+        Best-effort: each step is guarded so a secondary error while
+        recovering can't mask the original fallback.
+        """
+        try:
+            self._stream.synchronize()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            torch.cuda.synchronize(self._device)
+        except Exception:  # noqa: BLE001
+            pass
 
     def invalidate(self) -> None:
         """Drop the captured graph; next call will re-capture."""
@@ -617,12 +666,16 @@ class NeighborListHook:
                 cache_key = self._make_graph_cache_key(N, B, positions.dtype, pbc, cell)
 
             # Capture the dispatch into a CUDA graph for replay on
-            # subsequent steps. Skipped when the cache is disabled, the
+            # subsequent steps. Skipped when the cache is disabled, a prior
+            # capture failed (``_capture_disabled`` — stay eager), the
             # dispatch chose the naive path (whose dispatcher chain
             # doesn't yet thread the wrap-scratch kwargs through), or
-            # first-build adaptive-K hasn't settled.
+            # first-build adaptive-K hasn't settled. ``capture`` returns
+            # False on failure (and self-heals the CUDA context); the eager
+            # results already in the buffers are used regardless.
             if (
                 self._graph_cache is not None
+                and not self._graph_cache._capture_disabled
                 and not self._first_build
                 and self._using_cell_list_path
             ):
