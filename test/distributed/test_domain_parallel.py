@@ -479,7 +479,13 @@ def _build_lj_cluster(n_per_side: int = 5, dtype: torch.dtype = torch.float64):
     velocities = velocities - velocities.mean(dim=0, keepdim=True)
     atomic_numbers = torch.full((n,), 18, dtype=torch.long)
     masses = torch.full((n,), 39.948, dtype=dtype)
-    box = n_per_side * spacing + 10.0
+    # Open cell sized to the cluster extent plus one lattice spacing of margin.
+    # A large fixed pad (the old ``+ 10.0``) left the atoms bunched in one
+    # corner of an oversized box, so a spatial bisection put every atom on one
+    # side and the other rank was assigned 0 owned atoms — a degenerate
+    # partition the framework (correctly) rejects. Sizing the box to the atoms
+    # makes the partition split real owned atoms onto every rank.
+    box = (n_per_side - 1) * spacing + spacing
     cell = torch.eye(3, dtype=dtype) * box
     pbc = torch.zeros(3, dtype=torch.bool)
     return positions, velocities, atomic_numbers, masses, cell, pbc

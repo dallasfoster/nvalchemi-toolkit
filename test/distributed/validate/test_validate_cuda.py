@@ -458,7 +458,15 @@ def _make_octane_chain_for_aimnet2(n_atoms: int = 8, bond: float = 1.5):
         dim=1,
     ).contiguous()
     atomic_numbers = torch.full((n_atoms,), 6, dtype=torch.long)
+    # The partitioner's domain box is the cell. A fixed 100 Å cube works for a
+    # short chain, but a long chain (n_atoms * bond can far exceed 100 Å, e.g.
+    # 1024 atoms => ~1536 Å) would spill outside the box and bisect to a
+    # degenerate partition (one rank assigned 0 owned atoms). Size the box to
+    # the chain extent along x (plus a margin) so the split puts owned atoms on
+    # every rank; the off-axis dims stay generous.
+    x_extent = 0.5 + n_atoms * bond
     cell = torch.eye(3, dtype=dtype) * 100.0
+    cell[0, 0] = max(100.0, x_extent)
     pbc = torch.zeros(3, dtype=torch.bool)
     data = AtomicData(
         positions=positions.cuda(),

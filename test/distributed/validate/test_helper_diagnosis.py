@@ -221,7 +221,14 @@ def _make_octane_chain(n_atoms: int = 8):
         dim=1,
     ).contiguous()
     atomic_numbers = torch.full((n_atoms,), 6, dtype=torch.long)
+    # Size the domain box (the partitioner uses the cell) to the chain extent
+    # along x so a 2-rank bisection assigns owned atoms to BOTH ranks. A fixed
+    # 100 Å cube leaves the short chain bunched in one corner, so the split
+    # gives one rank 0 owned atoms — a degenerate partition the framework
+    # rejects (masking the helper-diagnosis behaviour under test).
+    x_extent = 0.5 + n_atoms * 1.5
     cell = torch.eye(3, dtype=dtype) * 100.0
+    cell[0, 0] = x_extent
     pbc = torch.zeros(3, dtype=torch.bool)
     data = AtomicData(
         positions=positions.cuda(),
