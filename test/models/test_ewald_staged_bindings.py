@@ -136,11 +136,20 @@ def _nacl_batched(
 
 
 def _ewald_params_single(box: float, accuracy: float = 1e-6) -> tuple[float, float]:
-    """Real + reciprocal cutoffs + alpha for the given box. Returns (alpha, k_cutoff)."""
-    # Pick a real-space cutoff that fits inside the minimum-image cell.
-    rs_cutoff = box * 0.45
-    params = estimate_ewald_parameters(rs_cutoff=rs_cutoff, accuracy=accuracy)
-    return float(params.alpha), float(params.reciprocal_space_cutoff)
+    """Alpha + reciprocal cutoff for the given box. Returns (alpha, k_cutoff).
+
+    ``estimate_ewald_parameters`` derives the splitting from the cell volume and
+    atom count (Kolafa-Perram), so it takes ``(positions, cell)`` rather than a
+    real-space cutoff. Reconstruct the representative 8-atom cubic NaCl cell for
+    this box and read the estimator's per-system alpha / reciprocal cutoff.
+    """
+    data = _nacl_single(device="cuda", box=box)
+    params = estimate_ewald_parameters(
+        data["positions"], data["cell"], batch_idx=None, accuracy=accuracy
+    )
+    return float(params.alpha.reshape(-1)[0]), float(
+        params.reciprocal_space_cutoff.reshape(-1)[0]
+    )
 
 
 def _monolithic_energy_single(data: dict) -> torch.Tensor:

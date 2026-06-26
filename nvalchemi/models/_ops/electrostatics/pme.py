@@ -679,6 +679,8 @@ def particle_mesh_ewald_from_total_charge(
     compute_virial: bool = False,
     accuracy: float = 1e-6,
     hybrid_forces: bool = False,
+    pbc: torch.Tensor | None = None,
+    slab_correction: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     r"""Top-level PME with externally-provided ``total_charges``.
 
@@ -688,6 +690,14 @@ def particle_mesh_ewald_from_total_charge(
     multiply, IFFT, spline gather — is unchanged. Real space uses the neighbor
     list directly (pair contributions, no global sum), so it is halo-correct
     without distribution-specific plumbing.
+
+    When ``slab_correction=True`` the Yeh-Berkowitz slab term (with the
+    Ballenegger non-neutral extension) is added element-wise into the result
+    tuple. Its global per-system moments are computed owned-only and all-reduced
+    across ranks via
+    :func:`~nvalchemi.models._ops.electrostatics.slab.slab_compute_partial_moments`,
+    so the correction is halo-correct (``pbc`` is the per-system ``(B, 3)`` bool
+    mask; rows with exactly one ``False`` are slab systems).
     """
     num_atoms = positions.shape[0]
 
@@ -752,6 +762,31 @@ def particle_mesh_ewald_from_total_charge(
     rec_tuple = rec if isinstance(rec, tuple) else (rec,)
 
     results = [r + s for r, s in zip(rs_tuple, rec_tuple)]
+
+    if slab_correction:
+        from nvalchemi.models._ops.electrostatics.slab import (  # noqa: PLC0415
+            compute_slab_correction_from_moments,
+        )
+
+        # The slab tuple follows the same (energy, [forces], [charge_grads],
+        # [virial]) ordering as the PME result, so it adds element-wise. Its
+        # per-atom energy is float64 while rs/rec energies are too, so the sum
+        # stays float64.
+        slab = compute_slab_correction_from_moments(
+            positions=positions,
+            charges=charges,
+            cell=cell,
+            pbc=pbc,
+            batch_idx=batch_idx,
+            compute_forces=compute_forces,
+            compute_charge_gradients=compute_charge_gradients,
+            compute_virial=compute_virial,
+        )
+        slab_tuple = slab if isinstance(slab, tuple) else (slab,)
+        results = [
+            r + s.to(r.dtype) for r, s in zip(results, slab_tuple)
+        ]
+
     if len(results) == 1:
         return results[0]
     return tuple(results)

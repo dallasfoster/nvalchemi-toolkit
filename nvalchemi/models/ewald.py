@@ -218,6 +218,10 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         from nvalchemi.models._ops.electrostatics.ewald import (  # noqa: F401, PLC0415
             ewald_compute_partial_structure_factors,
         )
+        from nvalchemi.models._ops.electrostatics.slab import (  # noqa: F401, PLC0415
+            _batch_slab_compute_partial_moments,
+            _slab_compute_partial_moments,
+        )
 
         ops = torch.ops.alchemiops  # type: ignore[attr-defined]
         custom_ops = (
@@ -237,6 +241,26 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
                     1: SliceOwned(),  # charges
                     5: SliceOwned(),  # batch_idx
                 },
+                output_transforms={
+                    0: AllReduceSum(),
+                    1: AllReduceSum(),
+                    2: AllReduceSum(),
+                },
+            ),
+            # Slab-correction moments: owned-slice partial (M, M2, Q) then
+            # all-reduce into the global moments (mirrors the PME wrapper).
+            OpAdapter(
+                op=ops._slab_compute_partial_moments,  # (z, charges)
+                arg_transforms={0: SliceOwned(), 1: SliceOwned()},
+                output_transforms={
+                    0: AllReduceSum(),
+                    1: AllReduceSum(),
+                    2: AllReduceSum(),
+                },
+            ),
+            OpAdapter(
+                op=ops._batch_slab_compute_partial_moments,  # (z, charges, batch_idx)
+                arg_transforms={0: SliceOwned(), 1: SliceOwned(), 2: SliceOwned()},
                 output_transforms={
                     0: AllReduceSum(),
                     1: AllReduceSum(),
@@ -649,6 +673,7 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
         B: int = inp["num_graphs"]
         neighbor_matrix = inp["neighbor_matrix"].contiguous()
         neighbor_matrix_shifts = inp.get("neighbor_matrix_shifts")
+        pbc = inp.get("pbc")
 
         compute_forces = "forces" in self.model_config.active_outputs
         compute_stresses = "stress" in self.model_config.active_outputs
@@ -743,16 +768,56 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
             hybrid_forces=self.hybrid_forces,
         )
 
-        # Sum real + reciprocal; scale by the Coulomb constant.
-        per_atom_energies = (e_real + e_recip).to(positions.dtype) * self.coulomb_constant
+        # --- Slab correction (2D-periodic / Yeh-Berkowitz) ---
+        # Added as a separate additive correction consistent with the real +
+        # reciprocal split. Its global per-system moments are reduced owned-only
+        # and all-reduced across ranks inside the helper, so it is halo-correct
+        # under domain decomposition. Per-atom energy / force / virial follow the
+        # analytical slab formulas (machine-precision-equal to the warp kernel).
+        e_slab = torch.zeros_like(e_real)
+        f_slab: torch.Tensor | None = None
+        v_slab: torch.Tensor | None = None
+        if self.slab_correction:
+            from nvalchemi.models._ops.electrostatics.slab import (  # noqa: PLC0415
+                compute_slab_correction_from_moments,
+            )
+
+            slab = compute_slab_correction_from_moments(
+                positions=positions,
+                charges=charges,
+                cell=cell,
+                pbc=pbc,
+                batch_idx=batch_idx,
+                compute_forces=compute_forces,
+                compute_virial=compute_stresses,
+            )
+            slab_tuple = slab if isinstance(slab, tuple) else (slab,)
+            e_slab = slab_tuple[0]
+            idx = 1
+            if compute_forces:
+                f_slab = slab_tuple[idx]
+                idx += 1
+            if compute_stresses:
+                v_slab = slab_tuple[idx]
+
+        # Sum real + reciprocal + slab; scale by the Coulomb constant.
+        per_atom_energies = (
+            (e_real + e_recip + e_slab).to(positions.dtype) * self.coulomb_constant
+        )
 
         forces: torch.Tensor | None = None
         if compute_forces and f_real is not None and f_recip is not None:
-            forces = (f_real + f_recip) * self.coulomb_constant
+            forces = f_real + f_recip
+            if f_slab is not None:
+                forces = forces + f_slab
+            forces = forces * self.coulomb_constant
 
         virial: torch.Tensor | None = None
         if compute_stresses and v_real is not None and v_recip is not None:
-            virial = (v_real + v_recip) * self.coulomb_constant
+            virial = v_real + v_recip
+            if v_slab is not None:
+                virial = virial + v_slab
+            virial = virial * self.coulomb_constant
 
         per_atom_energies = per_atom_energies.to(torch.float64)
         model_output: dict[str, Any] = {}

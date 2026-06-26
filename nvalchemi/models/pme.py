@@ -254,6 +254,10 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
             _batch_pme_compute_partial_total_charge,
             _pme_compute_partial_total_charge,
         )
+        from nvalchemi.models._ops.electrostatics.slab import (  # noqa: F401, PLC0415
+            _batch_slab_compute_partial_moments,
+            _slab_compute_partial_moments,
+        )
 
         # Each adapter slices its per-atom inputs to owned and all-reduces the
         # partial output (charge mesh / total charge) to global.
@@ -283,6 +287,26 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
                 op=ops._batch_pme_compute_partial_total_charge,  # (charges, batch_idx)
                 arg_transforms={0: SliceOwned(), 1: SliceOwned()},
                 output_transforms={0: AllReduceSum()},
+            ),
+            # Slab-correction moments: each rank's partial (M, M2, Q) is summed
+            # over its owned atoms then all-reduced into the true global moments.
+            OpAdapter(
+                op=ops._slab_compute_partial_moments,  # (z, charges)
+                arg_transforms={0: SliceOwned(), 1: SliceOwned()},
+                output_transforms={
+                    0: AllReduceSum(),  # mz
+                    1: AllReduceSum(),  # mz2
+                    2: AllReduceSum(),  # qtotal
+                },
+            ),
+            OpAdapter(
+                op=ops._batch_slab_compute_partial_moments,  # (z, charges, batch_idx)
+                arg_transforms={0: SliceOwned(), 1: SliceOwned(), 2: SliceOwned()},
+                output_transforms={
+                    0: AllReduceSum(),
+                    1: AllReduceSum(),
+                    2: AllReduceSum(),
+                },
             ),
         )
         import dataclasses  # noqa: PLC0415
