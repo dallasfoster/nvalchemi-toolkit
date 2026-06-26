@@ -32,12 +32,12 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from nvalchemi.hooks.neighbor_list import NeighborListHook
 
 from nvalchemi.data import AtomicData, Batch
 from nvalchemi.distributed.config import DomainConfig
 from nvalchemi.distributed.domain_parallel import DomainParallel
 from nvalchemi.dynamics.integrators.nve import NVE
+from nvalchemi.hooks.neighbor_list import NeighborListHook
 from nvalchemi.models.lj import LennardJonesModelWrapper
 
 WORLD_SIZE = 2

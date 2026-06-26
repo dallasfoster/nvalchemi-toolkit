@@ -1149,7 +1149,7 @@ def _warp_cudagraph_capture_supported() -> bool:
     import sys
 
     try:
-        rc = subprocess.run(
+        rc = subprocess.run(  # noqa: S603
             [sys.executable, "-c", _CAPTURE_PROBE_SRC],
             capture_output=True,
             timeout=180,

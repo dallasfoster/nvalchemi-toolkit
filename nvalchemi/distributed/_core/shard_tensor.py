@@ -1036,7 +1036,7 @@ def _under_compile_trace(args: Any) -> bool:
 
         if detect_fake_mode(args) is not None:
             return True
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001, S110
         pass
     from torch._subclasses.fake_tensor import FakeTensor  # noqa: PLC0415
 

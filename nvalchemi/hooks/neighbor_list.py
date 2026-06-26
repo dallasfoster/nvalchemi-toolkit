@@ -246,11 +246,11 @@ class _NLGraphCache:
         """
         try:
             self._stream.synchronize()
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110
             pass
         try:
             torch.cuda.synchronize(self._device)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110
             pass
 
     def invalidate(self) -> None:
