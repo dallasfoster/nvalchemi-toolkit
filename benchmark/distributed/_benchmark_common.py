@@ -223,9 +223,12 @@ def time_step(
 ) -> Timing:
     """Time ``fn`` (returns ``(energy_scalar, forces)``) — mean wall ms.
 
-    Also records CUDA peak allocated memory (in MiB) observed across
-    warmup + timed iterations. Peak is reset at entry so each
-    :func:`time_step` call reports a clean per-(model, size) peak.
+    Also records CUDA peak allocated memory (in MiB) observed over the **timed**
+    iterations only. Peak is reset at entry AND again after warmup, so the one-
+    time ``torch.compile`` / inductor-autotuning transient (which can be far
+    larger than steady state — it clones mutated kernel args while benchmarking)
+    is excluded. The reported peak is the per-step memory the model actually uses
+    in a loop (MD), not the compile spike.
     """
     _reset_peak_mem(device)
 
@@ -233,6 +236,8 @@ def time_step(
         out = fn()
         del out
     _sync(device)
+    # Drop the compile/autotuning transient from the peak — measure steady state.
+    _reset_peak_mem(device)
 
     total = 0.0
     last_energy = float("nan")
@@ -838,6 +843,19 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Skip the multi-rank run (single-rank baseline only).",
     )
     parser.add_argument(
+        "--run-reference",
+        action="store_true",
+        help=(
+            "In multi-rank runs, also compute the single-rank full-system "
+            "reference + equivalence check. OFF by default: the multi-rank leg "
+            "runs DD-only, so no rank builds the whole system — required for a "
+            "scaling sweep (otherwise every rank holds the full system, which "
+            "pollutes the multi-rank peak memory and caps max-N at the "
+            "single-GPU OOM ceiling). Single-rank (``world_size==1``) runs are "
+            "unaffected — they are the reference."
+        ),
+    )
+    parser.add_argument(
         "--tolerance",
         type=float,
         default=1e-4,
@@ -950,49 +968,60 @@ def run_sweep_one_size(
     single_reason = ""
     multi_reason = ""
 
-    try:
-        step_single, n_actual, positions_global, cell, pbc, _ = build_harness(
-            wrapper,
-            n_atoms,
-            device,
-            dtype,
-            distributed=False,
-        )
-        trace_single = (
-            profile_trace_path(profile_dir, model_name, n_actual, rank=0, world_size=1)
-            if args.profile and rank == 0
-            else None
-        )
-        single_timing = time_step(step_single, device, args.iters, args.warmup)
-        single_out = step_single()
-        e_single = single_out[0]
-        f_single = single_out[1]
-        s_single = single_out[2] if len(single_out) >= 3 else None
-        e_single_val = float(e_single.detach().item())
-        f_single_full = f_single.detach().clone()
-        s_single_full = s_single.detach().clone() if s_single is not None else None
-        del e_single, f_single, s_single, single_out
-        if trace_single is not None:
-            profile_step(step_single, device, trace_single, args.profile_steps)
-    except Exception as exc:  # noqa: BLE001 — broad catch is the point
-        if not _is_oom(exc):
-            # Non-OOM failure: still broadcast so ranks sync on the
-            # skip, then re-raise so the user sees the full trace.
-            _broadcast_failure(True, device, group=group)
-            raise
-        single_failed = True
-        single_reason = f"single-rank OOM: {exc}"
-        traceback.print_exc()
-        _recover_from_oom(device)
+    # The single-rank full-system reference runs only when it IS the measurement
+    # (``world_size == 1``) or when explicitly requested (``--run-reference``).
+    # Otherwise the multi-rank leg is DD-only: no rank builds the whole system,
+    # so the multi-rank peak reflects the per-GPU shard and max-N is bounded by
+    # the shard, not the single-GPU OOM ceiling. ``run_ref`` is identical on
+    # every rank (same args + world_size), so the collectives below stay
+    # symmetric.
+    run_ref = world_size == 1 or getattr(args, "run_reference", False)
+    if run_ref:
+        try:
+            step_single, n_actual, positions_global, cell, pbc, _ = build_harness(
+                wrapper,
+                n_atoms,
+                device,
+                dtype,
+                distributed=False,
+            )
+            trace_single = (
+                profile_trace_path(
+                    profile_dir, model_name, n_actual, rank=0, world_size=1
+                )
+                if args.profile and rank == 0
+                else None
+            )
+            single_timing = time_step(step_single, device, args.iters, args.warmup)
+            single_out = step_single()
+            e_single = single_out[0]
+            f_single = single_out[1]
+            s_single = single_out[2] if len(single_out) >= 3 else None
+            e_single_val = float(e_single.detach().item())
+            f_single_full = f_single.detach().clone()
+            s_single_full = s_single.detach().clone() if s_single is not None else None
+            del e_single, f_single, s_single, single_out
+            if trace_single is not None:
+                profile_step(step_single, device, trace_single, args.profile_steps)
+        except Exception as exc:  # noqa: BLE001 — broad catch is the point
+            if not _is_oom(exc):
+                # Non-OOM failure: still broadcast so ranks sync on the
+                # skip, then re-raise so the user sees the full trace.
+                _broadcast_failure(True, device, group=group)
+                raise
+            single_failed = True
+            single_reason = f"single-rank OOM: {exc}"
+            traceback.print_exc()
+            _recover_from_oom(device)
 
-    # Cross-rank sync on single-rank status — every rank must agree
-    # before we attempt the multi-rank branch, or collectives will hang.
-    # We still run the multi-rank leg when the single-rank reference
-    # OOM'd: the whole point of domain-parallel inference is that it
-    # fits systems the single-GPU path can't, so those are precisely
-    # the sizes the user cares most about. Equivalence is skipped
-    # downstream (no reference), but timings + peak memory still print.
-    single_failed = _broadcast_failure(single_failed, device, group=group)
+        # Cross-rank sync on single-rank status — every rank must agree
+        # before we attempt the multi-rank branch, or collectives will hang.
+        # We still run the multi-rank leg when the single-rank reference
+        # OOM'd: the whole point of domain-parallel inference is that it
+        # fits systems the single-GPU path can't, so those are precisely
+        # the sizes the user cares most about. Equivalence is skipped
+        # downstream (no reference), but timings + peak memory still print.
+        single_failed = _broadcast_failure(single_failed, device, group=group)
 
     if args.single_only or world_size == 1:
         return SweepResult(
@@ -1076,7 +1105,7 @@ def run_sweep_one_size(
         and dist_pbc is not None
         and dist_positions is not None
     )
-    if can_gather and not single_failed:
+    if run_ref and can_gather and not single_failed:
         try:
             from nvalchemi.distributed.partitioner import SpatialPartitioner
 
