@@ -875,8 +875,26 @@ class DistributedModel:
         self._dist_ctx.owned_offset = 0
         _mark("meta_setup")
 
-        with activate_dd_context(self._dist_ctx):
-            output = self._wrapper(batch_r)
+        # Publish the static node-partition all-gather routing so the per-layer
+        # ``refresh_neighbors`` inside the model's compiled forward uses the
+        # fullgraph-traceable fixed gather (fetch every node from its owner). The
+        # routing is index-based and constant across MD steps, so it is read as
+        # trace-time constants without recompiling. Eager forwards ignore it
+        # (``refresh_neighbors`` gates the fixed gather on ``is_compiling``).
+        from nvalchemi.distributed._core.compile_routing import (  # noqa: PLC0415
+            clear_gp_compile_routing,
+            set_gp_compile_routing,
+        )
+
+        gi = torch.arange(n_atoms, device=pos.device)
+        set_gp_compile_routing(
+            gi, meta.owner_rank, meta.local_index, max(counts), world, mesh
+        )
+        try:
+            with activate_dd_context(self._dist_ctx):
+                output = self._wrapper(batch_r)
+        finally:
+            clear_gp_compile_routing()
         _mark("wrapper_forward")
 
         grp = (

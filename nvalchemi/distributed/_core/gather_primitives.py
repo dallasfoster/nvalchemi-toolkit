@@ -826,6 +826,30 @@ def gather_to_replicate(
     return _GatherToReplicate.apply(local_rows, rank_sizes, group)
 
 
+def fixed_gather_to_replicate(
+    owned_rows: torch.Tensor,
+    global_indices: torch.Tensor,
+    owner_rank: torch.Tensor,
+    local_index: torch.Tensor,
+    cap: int,
+    world_size: int,
+    mesh: Any,
+) -> torch.Tensor:
+    """``fullgraph``-traceable all-gather of owned node rows to the full tensor.
+
+    The graph-parallel (node-partition) analog of :func:`gather_to_replicate`
+    for the compiled forward: fetch every node (``global_indices = arange(N)``)
+    from its owner via the fixed-size all-to-all gather, so the whole replicate
+    traces inside the model's compiled region (no graph break). Autograd-aware —
+    the adjoint is the reduce-scatter-sum (:func:`funcol_fixed_scatter_add`),
+    routing each node's feature gradient to its owner exactly once. ``cap`` is the
+    max owned-row count over ranks (a graph constant); the node-partition routing
+    is static across MD steps, so it never recompiles at fixed ``N``."""
+    return _FixedDistributedIndexSelect.apply(
+        owned_rows, global_indices, owner_rank, local_index, cap, world_size, mesh,
+    )
+
+
 class _FixedDistributedIndexSelect(torch.autograd.Function):
     """``fullgraph``-compilable gather (fixed-size all_to_all).
 

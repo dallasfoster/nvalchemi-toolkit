@@ -32,6 +32,9 @@ __all__ = [
     "get_compile_routing",
     "clear_compile_routing",
     "compile_routing_active",
+    "set_gp_compile_routing",
+    "get_gp_compile_routing",
+    "clear_gp_compile_routing",
 ]
 
 # Single-slot holder. ``None`` = not inside a compiled DD region (helpers use
@@ -68,3 +71,40 @@ def clear_compile_routing() -> None:
 def compile_routing_active() -> bool:
     """True iff in-compile routing is currently published."""
     return _COMPILE_ROUTING[0] is not None
+
+
+# Separate single-slot holder for the graph-parallel (node-partition) per-layer
+# all-gather. ``None`` = not active. A 6-tuple ``(global_indices, owner_rank,
+# local_index, cap, world_size, mesh)`` drives the fullgraph-traceable fixed
+# gather. Unlike the halo routing this is STATIC across MD steps (index-based
+# partition, no atom migration), so the in-region refresh may read it as
+# trace-time constants without recompiling.
+_GP_COMPILE_ROUTING: list[Any] = [None]
+
+
+def set_gp_compile_routing(
+    global_indices: Any,
+    owner_rank: Any,
+    local_index: Any,
+    cap: int,
+    world_size: int,
+    mesh: Any,
+) -> None:
+    """Publish the graph-parallel all-gather routing for the in-region refresh.
+
+    Set eagerly before the (model-internal) compiled forward; the static routing
+    is read back inside the compiled Edgewise via :func:`get_gp_compile_routing`.
+    """
+    _GP_COMPILE_ROUTING[0] = (
+        global_indices, owner_rank, local_index, cap, world_size, mesh,
+    )
+
+
+def get_gp_compile_routing() -> Any:
+    """Return the graph-parallel all-gather routing tuple, or ``None``."""
+    return _GP_COMPILE_ROUTING[0]
+
+
+def clear_gp_compile_routing() -> None:
+    """Reset the graph-parallel routing holder to ``None`` after the forward."""
+    _GP_COMPILE_ROUTING[0] = None

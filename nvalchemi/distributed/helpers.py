@@ -35,9 +35,11 @@ import torch
 from nvalchemi.distributed._core.compile_routing import (
     compile_routing_active,
     get_compile_routing,
+    get_gp_compile_routing,
 )
 from nvalchemi.distributed._core.context import current_dd_context
 from nvalchemi.distributed._core.enums import Scope
+from nvalchemi.distributed._core.gather_primitives import fixed_gather_to_replicate
 from nvalchemi.distributed._core.particle_halo import (
     halo_forward_static_op,
     halo_scatter_correct_static_op,
@@ -215,6 +217,16 @@ def refresh_neighbors(x: torch.Tensor) -> torch.Tensor:
     if routing is not None:
         si, rd, rr, no, ws = routing
         return halo_forward_static_op(x, si, rd, rr, no, ws)
+    # Graph-parallel (node-partition) under a model-internal compiled forward:
+    # the fullgraph-traceable fixed all-gather, so the per-layer node replicate
+    # fuses into the compiled region. Gated on ``is_compiling`` so the eager path
+    # keeps the (faster, exact-size) ``policy.replicate`` all-gather; the routing
+    # is static (index partition), so reading it as trace-time constants never
+    # recompiles.
+    gp = get_gp_compile_routing()
+    if gp is not None and torch.compiler.is_compiling():
+        gi, owner, local, cap, ws, mesh = gp
+        return fixed_gather_to_replicate(x, gi, owner, local, cap, ws, mesh)
     ctx = current_dd_context()
     if not ctx.is_distributed:
         return x
