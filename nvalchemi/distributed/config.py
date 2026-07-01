@@ -28,6 +28,30 @@ from typing import Any
 from pydantic import BaseModel
 
 
+class StrategyKind(str, Enum):
+    """Which parallelization strategy a distributed scope runs under.
+
+    Selected on :class:`DomainConfig` (config-driven, not an env var). The model's
+    ``distribution_spec(strategy)`` returns the ``(policy, adapters, shard_fields,
+    consolidation)`` bundle for the chosen strategy; the framework builds the live
+    :class:`~nvalchemi.distributed.strategy.ParallelizationStrategy` from the
+    resulting storage policy.
+
+    Attributes
+    ----------
+    HALO : str
+        Spatial domain decomposition (owned atoms + ghost halo). Default.
+    GRAPH_REPLICATE : str
+        Node-replicate graph parallel (full node set per rank, edges sharded).
+    GRAPH_PARTITION : str
+        Node-partition graph parallel (owned node slice per rank).
+    """
+
+    HALO = "halo"
+    GRAPH_REPLICATE = "graph_replicate"
+    GRAPH_PARTITION = "graph_partition"
+
+
 class HookScope(Enum):
     """Determines which ranks execute a hook callback.
 
@@ -86,6 +110,7 @@ class DomainConfig(BaseModel):
     cutoff: float
     skin: float = 0.0
     ghost_width: float | None = None
+    strategy: StrategyKind = StrategyKind.HALO
     mesh: Any = None  # DeviceMesh at runtime
     mesh_dim: str = "domain"
     grid_dims: tuple[int, int, int] | None = None
@@ -126,4 +151,5 @@ class DomainConfig(BaseModel):
 __all__ = [
     "HookScope",
     "DomainConfig",
+    "StrategyKind",
 ]

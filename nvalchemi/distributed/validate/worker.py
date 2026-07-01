@@ -190,7 +190,9 @@ def _worker_main(
             # inside the property, and ``from_dict`` needs those op
             # qualnames already in ``torch.ops``.
             wrapper = model_factory().to(device_str)
-            _ = getattr(wrapper, "distribution_spec", None)
+            _ds = getattr(wrapper, "distribution_spec", None)
+            if callable(_ds):
+                _ds()
 
             spec = MLIPSpec.from_dict(spec_dict)
             sample_batch = _payload_to_batch(sample_payload, device=device_str)

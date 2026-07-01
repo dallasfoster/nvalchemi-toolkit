@@ -34,7 +34,7 @@ import torch.multiprocessing as mp
 
 from nvalchemi.data.atomic_data import AtomicData
 from nvalchemi.data.batch import Batch
-from nvalchemi.distributed.config import DomainConfig
+from nvalchemi.distributed.config import DomainConfig, StrategyKind
 
 
 def _build_pbc_argon(reps=(8, 3, 3), dtype=torch.float64, seed=0):
@@ -61,7 +61,6 @@ def _build_pbc_argon(reps=(8, 3, 3), dtype=torch.float64, seed=0):
 def _worker(rank: int, world_size: int) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29906"
-    os.environ["NVALCHEMI_MACE_GP"] = "1"
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     try:
@@ -115,7 +114,7 @@ def _worker(rank: int, world_size: int) -> None:
             "small", device=device, dtype=dtype, enable_cueq=False
         )
         mesh = DeviceMesh("cuda", list(range(world_size)), mesh_dim_names=("domain",))
-        cfg = DomainConfig(cutoff=float(wrapper.cutoff), skin=0.0, mesh=mesh)
+        cfg = DomainConfig(cutoff=float(wrapper.cutoff), skin=0.0, mesh=mesh, strategy=StrategyKind.GRAPH_REPLICATE)
         full = _mk_batch() if rank == 0 else None
         sharded = ShardedBatch.from_batch(
             full, mesh=mesh, config=cfg, src=0, partition_mode="contiguous_block"

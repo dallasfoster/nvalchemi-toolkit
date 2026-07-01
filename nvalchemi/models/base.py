@@ -535,17 +535,28 @@ class BaseModelMixin(abc.ABC):
     # Distributed hooks
     # ------------------------------------------------------------------
 
-    @property
-    def distribution_spec(self) -> Any:
-        """Return the :class:`MLIPSpec` describing the primitives
-        this model needs under domain parallelism.
+    def distribution_spec(self, strategy: Any = None) -> Any:
+        """Return the :class:`MLIPSpec` describing the primitives this model
+        needs under domain parallelism *for the given parallelization strategy*.
 
-        Default ``None`` = model doesn't declare distributed support.
-        ``DomainParallel`` will raise if it's asked to shard a model
-        whose ``distribution_spec`` is ``None``.
+        Parameters
+        ----------
+        strategy
+            The :class:`~nvalchemi.distributed.config.StrategyKind` the scope runs
+            under (``HALO`` / ``GRAPH_REPLICATE`` / ``GRAPH_PARTITION``); ``None``
+            is treated as ``HALO``. The framework passes the config-selected
+            strategy — models must not sniff the environment. The spec content is a
+            joint ``(model × strategy)`` product, so a model that supports graph
+            parallel returns a different ``(policy, adapters, shard_fields,
+            consolidation)`` bundle per strategy.
 
-        Per-model wrappers override to return one of the presets
-        (``SPEC_MPNN_HALO`` / ``SPEC_UMA_HALO``) or a custom spec.
+        Returns
+        -------
+        MLIPSpec | None
+            Default ``None`` = model doesn't declare distributed support.
+            ``DomainParallel`` raises if asked to shard a model whose spec is
+            ``None``. Per-model wrappers override to return a preset
+            (``SPEC_MPNN_HALO`` / ``SPEC_UMA_HALO``) or a custom spec.
         """
         return None
 

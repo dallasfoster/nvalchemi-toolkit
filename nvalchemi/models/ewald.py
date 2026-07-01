@@ -178,9 +178,11 @@ class EwaldModelWrapper(nn.Module, BaseModelMixin):
     # BaseModelMixin required properties
     # ------------------------------------------------------------------
 
-    @property
-    def distribution_spec(self) -> Any:
+    def distribution_spec(self, strategy: Any = None) -> Any:
         """MLIPSpec for Ewald electrostatics under domain decomposition.
+
+        Halo-only; the ``strategy`` argument is accepted for the framework
+        contract and ignored.
 
         The real-space pair kernel runs on halo-padded inputs. Reciprocal-space
         is declared via the two structure-factor ops (single-system + batched)

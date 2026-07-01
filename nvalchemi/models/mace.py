@@ -650,8 +650,7 @@ class MACEWrapper(nn.Module, BaseModelMixin):
             "graph_embeddings": (hidden_dim,),
         }
 
-    @property
-    def distribution_spec(self) -> Any:
+    def distribution_spec(self, strategy: Any = None) -> Any:
         """MLIPSpec for MACE under domain decomposition.
 
         MACE uses the MPNN halo spec: every message-passing layer scatters over
@@ -674,15 +673,22 @@ class MACEWrapper(nn.Module, BaseModelMixin):
         """
         import os  # noqa: PLC0415
 
-        # Opt-in node-replicate graph-parallel strategy: full nodes per rank,
-        # sharded edges, the conv message recombined by an all-reduce on each
-        # interaction's output (vs. the default spatial-halo storage).
-        if os.environ.get("NVALCHEMI_MACE_GP") == "1":
+        from nvalchemi.distributed.config import StrategyKind  # noqa: PLC0415
+
+        # Node-replicate graph parallel: full nodes per rank, sharded edges, the
+        # conv message recombined by an all-reduce on each interaction's output
+        # (vs. the default spatial-halo storage). Strategy is config-selected.
+        if strategy == StrategyKind.GRAPH_REPLICATE:
             cached_gp = getattr(self, "_dist_spec_gp_cache", None)
             if cached_gp is None:
                 cached_gp = _mace_gp_replicate_spec(self.model)
                 self._dist_spec_gp_cache = cached_gp
             return cached_gp
+        if strategy == StrategyKind.GRAPH_PARTITION:
+            raise NotImplementedError(
+                "MACE supports halo and graph-replicate strategies; "
+                "graph-partition is not implemented for MACE."
+            )
 
         cached = getattr(self, "_dist_spec_cache", None)
         if cached is None:

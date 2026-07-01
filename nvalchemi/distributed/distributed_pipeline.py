@@ -132,8 +132,12 @@ class DistributedPipelineModel:
 
     @staticmethod
     def _compile_capable(step: Any) -> bool:
-        """Whether a sub-model declares an autograd-force compiled path."""
-        spec = getattr(step.model, "distribution_spec", None)
+        """Whether a sub-model declares an autograd-force compiled path.
+
+        Compile capability is a model property (strategy-agnostic), so the
+        default (halo) spec is sufficient here."""
+        _ds = getattr(step.model, "distribution_spec", None)
+        spec = _ds() if callable(_ds) else _ds
         cp = getattr(spec, "compile", None)
         return bool(cp is not None and getattr(cp, "forces_via_autograd", False))
 

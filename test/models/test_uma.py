@@ -431,7 +431,7 @@ class TestMLIPSpec:
         """
         from nvalchemi.distributed._core.storage_policy import HaloStoragePolicy
 
-        spec = mock_omol.distribution_spec
+        spec = mock_omol.distribution_spec()
         policy = spec.distribution.policy
         assert isinstance(policy, HaloStoragePolicy)
         assert policy.gather_mode == "halo_read"
@@ -439,7 +439,7 @@ class TestMLIPSpec:
 
     def test_registers_five_triton_ops(self, mock_omol):
         """All five ``torch.ops.fairchem._kernel_*`` ops appear in custom_ops."""
-        spec = mock_omol.distribution_spec
+        spec = mock_omol.distribution_spec()
         assert len(spec.distribution.custom_ops) == 5
         names = {str(op.op).split(".")[-1] for op in spec.distribution.custom_ops}
         expected = {
@@ -456,7 +456,7 @@ class TestMLIPSpec:
         a ``gather_inputs`` would double-pad it (the bug the halo-dispatch fix
         removed). Correction happens on the OUTPUT via ``ScatterOutputs``.
         """
-        spec = mock_omol.distribution_spec
+        spec = mock_omol.distribution_spec()
         scatter_corrected = [
             op for op in spec.distribution.custom_ops if op.scatter_outputs == (0,)
         ]

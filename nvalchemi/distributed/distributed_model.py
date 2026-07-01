@@ -46,9 +46,6 @@ from nvalchemi.distributed._core.context import (
 )
 from nvalchemi.distributed._core.particle_halo import ParticleHaloConfig
 from nvalchemi.distributed.config import DomainConfig
-from nvalchemi.distributed.output_consolidation import (
-    consolidate_padded_outputs,
-)
 from nvalchemi.distributed.partitioner import SpatialPartitioner
 from nvalchemi.neighbors import compute_neighbors
 
@@ -297,9 +294,15 @@ class DistributedModel:
                 "DistributedPipelineModel([...])."
             )
 
-        # Explicit ``spec=`` wins, else fall back to ``wrapper.distribution_spec``.
+        # Explicit ``spec=`` wins, else ask the wrapper for the spec matching the
+        # config-selected strategy (the spec is a joint model×strategy product).
         if spec is None:
-            spec = getattr(wrapper, "distribution_spec", None)
+            _ds = getattr(wrapper, "distribution_spec", None)
+            spec = (
+                _ds(getattr(domain_config, "strategy", None))
+                if callable(_ds)
+                else _ds
+            )
         if spec is None:
             raise DistributionError(
                 f"{type(wrapper).__name__} has distribution_spec=None and no "
@@ -335,6 +338,9 @@ class DistributedModel:
             getattr(_compile_policy, "graph_padder", None) or COOPadder()
         )
         self._setup_called = False
+        # The parallelization strategy owning this model's distributed forward;
+        # built lazily from the resolved storage policy (see ``_strategy``).
+        self._strategy_obj: Any = None
         # Installs/restores the spec's custom_ops + third_party_helpers.
         # Populated on first forward; restored in ``close()``.
         self.adapter_registry: AdapterRegistry = AdapterRegistry()
@@ -414,11 +420,25 @@ class DistributedModel:
 
         self._ensure_initialized(sharded)
 
-        # Each storage policy owns its distributed forward, so a new strategy
-        # plugs in without a framework type-switch.
-        return self._spec.distribution.policy.run_forward(
-            self, sharded, wired_fields
-        )
+        # The parallelization strategy owns its distributed forward; this model
+        # is the shared forward toolkit it drives. A new strategy plugs in as a
+        # new class, without a framework type-switch here.
+        return self._strategy().run_forward(self, sharded, wired_fields)
+
+    def _strategy(self) -> Any:
+        """The :class:`ParallelizationStrategy` for this model's storage policy
+        (built once, cached)."""
+        if self._strategy_obj is None:
+            from nvalchemi.distributed.strategy import (  # noqa: PLC0415
+                strategy_for_policy,
+            )
+
+            mesh = self._config.mesh
+            rank = mesh.get_local_rank() if mesh is not None else 0
+            self._strategy_obj = strategy_for_policy(
+                self._spec.distribution.policy, self._config, rank
+            )
+        return self._strategy_obj
 
     def from_batch(self, batch: "Batch | None", *, src: int = 0) -> dict[str, Any]:
         """One-call distributed inference from a full ``Batch``.
@@ -682,110 +702,6 @@ class DistributedModel:
         keep = owner[dst_g] == rank
         return torch.stack([src_g[keep], local[dst_g[keep]]], dim=1)
 
-    def _call_graph_parallel(
-        self,
-        sharded: "ShardedBatch",
-        wired_fields: "dict[str, Any] | None" = None,
-    ) -> dict[str, Any]:
-        """Graph-parallel forward.
-
-        Each rank owns a balanced index slice of atoms plus the edges into them.
-        The node features are all-gathered to a replicated tensor per
-        message-passing layer (``refresh_neighbors`` → the policy's replicate) so
-        every edge sees its source, and the per-graph node-energy sum drops to
-        owners and all-reduces. Forces come from autograd over the owned
-        positions: the all-gather's reduce-scatter adjoint routes each owned
-        atom's cross-rank gradient back, so they're globally-correct on their
-        owning rank with no halo reverse.
-        """
-        if wired_fields:
-            raise NotImplementedError(
-                "wired_fields (cross-model field injection) is not supported on "
-                "the graph-parallel path."
-            )
-        _cp = self._spec.compile
-        if _cp is None or not _cp.forces_via_autograd:
-            # The model computes its own forces internally (e.g. UMA's autograd
-            # force head, which consumes + frees the energy graph), so it cannot
-            # hand the framework a differentiable energy to grad over the owned
-            # leaf. Take the node-partition internal path: full geometry, the
-            # model's own forces, cross-rank SUM consolidation.
-            return self._graph_parallel_internal(sharded)
-        import torch.distributed as dist  # noqa: PLC0415
-
-        from nvalchemi.distributed._core.placement import (  # noqa: PLC0415
-            ShardRouting,
-        )
-        from nvalchemi.distributed.output_consolidation import (  # noqa: PLC0415
-            consolidate_sharded_outputs,
-        )
-
-        mesh = self._config.mesh
-        rank = mesh.get_local_rank() if mesh is not None else 0
-        world = self._world_size or 1
-
-        # Global<->owned index map for the balanced partition.
-        assignment = sharded.rank_assignment
-        meta = ShardRouting.from_assignment(assignment, rank, world)
-        meta.n_systems_global = sharded.num_graphs
-
-        nl = self._graph_parallel_owned_edges(sharded, meta, rank)
-
-        # Owned rows as a plain batch carrying the prepared edges; positions
-        # become a fresh autograd leaf for the energy-force grad.
-        owned = sharded.local_batch_with_edges({"neighbor_list": nl})
-        atoms = owned._atoms_group
-        pos = atoms["positions"]
-        pos = (pos.to_local() if hasattr(pos, "to_local") else pos).detach()
-        pos.requires_grad_(True)
-        atoms["positions"] = pos
-
-        # Publish the per-step routing + policy so the wrapper's intent verbs
-        # (refresh_neighbors / system_sum) resolve to the GP collectives.
-        self._dist_ctx.policy = self._spec.distribution.policy
-        self._dist_ctx.gather_meta = meta
-        self._dist_ctx.halo_meta = None
-
-        with activate_dd_context(self._dist_ctx):
-            output = self._wrapper(owned)
-            # The wrapper returns this rank's owned per-graph energy partial.
-            # Forces differentiate that partial: the per-layer node-gather's
-            # reduce-scatter adjoint already routes each owned atom's cross-rank
-            # gradient back, so the owned forces come out globally-correct.
-            energy_partial = output["energy"]
-            if self._needs_forces():
-                (grad,) = torch.autograd.grad(
-                    [energy_partial.sum()],
-                    [pos],
-                    create_graph=False,
-                    retain_graph=False,
-                    allow_unused=True,
-                )
-                output["forces"] = torch.zeros_like(pos) if grad is None else -grad
-            # Global energy for reporting: a plain SUM across ranks of the owned
-            # partials (every atom is owned once, so no double count). Detached —
-            # the force path is already complete, and an autograd-aware reduce
-            # would inflate a re-differentiated energy by the world size.
-            energy_global = energy_partial.detach().clone()
-            if dist.is_initialized() and world > 1:
-                from nvalchemi.distributed._core.gather_primitives import (  # noqa: PLC0415
-                    mesh_group,
-                )
-
-                dist.all_reduce(
-                    energy_global, op=dist.ReduceOp.SUM, group=mesh_group(mesh)
-                )
-            output["energy"] = energy_global
-
-        return consolidate_sharded_outputs(
-            output,
-            model_config=self._wrapper.model_config,
-            world_size=self._world_size,
-            owned_only_outputs=self._spec.owned_only_outputs,
-            all_reduce_outputs=self._spec.all_reduce_outputs,
-            halo_config=self._halo_config,
-        )
-
     def _graph_parallel_internal(
         self, sharded: "ShardedBatch"
     ) -> dict[str, Any]:
@@ -942,394 +858,6 @@ class DistributedModel:
             total = 1000 * (_marks[-1][1] - _marks[0][1])
             print(f"[dd-prof] total={total:.1f}ms | {segs}", flush=True)
         return out
-
-    def _call_graph_replicate(
-        self,
-        sharded: "ShardedBatch",
-        wired_fields: "dict[str, Any] | None" = None,
-    ) -> dict[str, Any]:
-        """Node-replicate graph-parallel forward for *opaque* models.
-
-        Every rank holds the full node set; the global edge list is sharded
-        across ranks; the model's forward runs unchanged on its edge slice and a
-        declared conv adapter all-reduces each layer's partial message
-        (``scatter_to_owners`` → :meth:`GraphReplicatePolicy.fold`) so the
-        nonlinear node-wise ops downstream see the complete node features. After
-        all layers the node features (hence per-node energy) are identical on
-        every rank, so the energy is taken as-is; forces are the rank-local
-        ``-dE/dx`` summed across ranks (each edge contributes on exactly one
-        rank — no double count, no division).
-        """
-        if wired_fields:
-            raise NotImplementedError(
-                "wired_fields (cross-model field injection) is not supported on "
-                "the graph-parallel path."
-            )
-        import torch.distributed as dist  # noqa: PLC0415
-
-        from nvalchemi.data.atomic_data import AtomicData  # noqa: PLC0415
-        from nvalchemi.data.batch import Batch as BatchCls  # noqa: PLC0415
-        from nvalchemi.distributed._core.gather_primitives import (  # noqa: PLC0415
-            mesh_group,
-        )
-        from nvalchemi.distributed.output_consolidation import (  # noqa: PLC0415
-            consolidate_sharded_outputs,
-        )
-
-        mesh = self._config.mesh
-        rank = mesh.get_local_rank() if mesh is not None else 0
-        world = self._world_size or 1
-
-        # Full node set on every rank; build the global graph; shard the edges.
-        full = sharded.to_global_batch()
-        with torch.no_grad():
-            compute_neighbors(
-                full, config=self._wrapper.model_config.neighbor_config
-            )
-        nl = full.neighbor_list
-        shifts = getattr(full, "neighbor_list_shifts", None)
-        n_edges = nl.shape[0]
-        lo = (n_edges * rank) // world
-        hi = (n_edges * (rank + 1)) // world
-
-        # Reassemble the per-rank batch: full atoms + this rank's edge slice.
-        # Positions become a fresh leaf for the force autograd. Build via
-        # ``model_construct`` (skip pydantic validation — the atoms came validated
-        # from ``to_global_batch``): the validating ``AtomicData(...)`` path runs
-        # the ``atom_categories`` Enum-coercion, which calls ``repr`` on CUDA
-        # tensors (per-element host syncs). Mirrors ``local_batch_with_edges``.
-        atoms = full._atoms_group
-        pos = atoms["positions"].detach().requires_grad_(True)
-        known = set(AtomicData.model_fields)
-        ctor: dict[str, Any] = {
-            "positions": pos,
-            "cell": full.cell if full.cell.ndim == 3 else full.cell.unsqueeze(0),
-            "pbc": full.pbc if full.pbc.ndim == 2 else full.pbc.unsqueeze(0),
-        }
-        extras: dict[str, Any] = {}
-        for name, t in atoms.items():
-            if name == "positions":
-                continue
-            (ctor if name in known else extras)[name] = t
-        data = AtomicData.model_construct(**ctor)
-        for name, t in extras.items():
-            data.add_node_property(name, t)
-        data.add_edge_property("neighbor_list", nl[lo:hi].contiguous())
-        if shifts is not None:
-            data.add_edge_property(
-                "neighbor_list_shifts", shifts[lo:hi].contiguous()
-            )
-        batch_r = BatchCls.from_data_list([data], device=pos.device)
-
-        self._dist_ctx.policy = self._spec.distribution.policy
-        self._dist_ctx.halo_meta = None
-
-        # Owned-node partition: a contiguous slice per rank over the full node
-        # set, the "owned" fiction the owned-only reductions sum over (distinct
-        # per rank → no double count when all-reduced).
-        n_atoms = pos.shape[0]
-        nlo = (n_atoms * rank) // world
-        nhi = (n_atoms * (rank + 1)) // world
-
-        # MODEL_INTERNAL strategy (e.g. UMA): the wrapper reduces its own energy
-        # (owned-slice + all-reduce via its declared adapters) and computes
-        # forces/stress by internal autograd. Run the full forward; consolidation
-        # corrects the autograd-inflated, edge-partitioned forces/stress via
-        # ``/world_size`` + all-reduce (the same accounting the halo path uses).
-        _cp = self._spec.compile
-        if _cp is None or not _cp.forces_via_autograd:
-            from nvalchemi.distributed._core.placement import (  # noqa: PLC0415
-                ShardRouting,
-            )
-
-            counts = [
-                (n_atoms * (r + 1)) // world - (n_atoms * r) // world
-                for r in range(world)
-            ]
-            assignment = torch.repeat_interleave(
-                torch.arange(world, device=pos.device),
-                torch.tensor(counts, device=pos.device),
-            )
-            meta = ShardRouting.from_assignment(assignment, rank, world)
-            meta.n_systems_global = sharded.num_graphs
-            self._dist_ctx.gather_meta = meta
-            self._dist_ctx.owned_offset = nlo
-            with activate_dd_context(self._dist_ctx):
-                output = self._wrapper(batch_r)
-            from types import SimpleNamespace  # noqa: PLC0415
-
-            return consolidate_sharded_outputs(
-                output,
-                model_config=self._wrapper.model_config,
-                world_size=self._world_size,
-                owned_only_outputs=self._spec.owned_only_outputs,
-                all_reduce_outputs=self._spec.all_reduce_outputs,
-                halo_config=SimpleNamespace(mesh=mesh),
-            )
-
-        self._dist_ctx.gather_meta = None
-        self._dist_ctx.owned_offset = 0
-
-        # Run energy-only: the wrapper emits per-node energies under
-        # ``node_energy_key`` and the framework takes the force autograd. Widen
-        # active outputs to that key for the forward; restored in ``finally``.
-        nek = self._spec.node_energy_key or "atomic_energies"
-        mc = self._wrapper.model_config
-        saved_active = None
-        if nek in mc.outputs and mc.active_outputs != {nek}:
-            saved_active = mc.active_outputs
-            mc.active_outputs = {nek}
-
-        # Compile the energy-only forward when requested. The per-layer message
-        # recombine (a mesh-static funcol all-reduce) traces inside the graph;
-        # there is no per-step routing to thread (unlike halo), so the region is
-        # just the wrapper forward. Forces autograd run outside, over the leaf.
-        _compile = bool(
-            self._dd_compile_requested
-            and self._spec.compile is not None
-            and self._spec.compile.forces_via_autograd
-        )
-        try:
-            with activate_dd_context(self._dist_ctx):
-                output = (
-                    self._gp_replicate_compiled_region()(batch_r)
-                    if _compile
-                    else self._wrapper(batch_r)
-                )
-        finally:
-            if saved_active is not None:
-                mc.active_outputs = saved_active
-
-        # Read the energy off this rank's OWNED node slice. Node features are
-        # identical on every rank after the per-layer recombine, so any contiguous
-        # owned partition is correct — and it makes each rank's energy gradient
-        # DISTINCT, so the conv recombine's all-reduce adjoint sums distinct
-        # partials (no replicated-energy over-count). Forces are the rank-local
-        # ``-dE/dx`` summed across ranks (edges partitioned → no double count);
-        # the reported energy is the owned partials summed (``nlo:nhi`` above).
-        atomic_e = output[nek]
-        batch_idx = batch_r.batch_idx.long()
-        owned_e = atomic_e[nlo:nhi]
-        energy_local = owned_e.new_zeros(int(batch_r.num_graphs)).index_add(
-            0, batch_idx[nlo:nhi], owned_e
-        )
-        if self._needs_forces():
-            (grad,) = torch.autograd.grad(
-                [energy_local.sum()],
-                [pos],
-                create_graph=False,
-                retain_graph=False,
-                allow_unused=True,
-            )
-            forces = torch.zeros_like(pos) if grad is None else -grad
-            if dist.is_initialized() and world > 1:
-                dist.all_reduce(forces, op=dist.ReduceOp.SUM, group=mesh_group(mesh))
-            output["forces"] = forces
-        energy_global = energy_local.detach().clone()
-        if dist.is_initialized() and world > 1:
-            dist.all_reduce(energy_global, op=dist.ReduceOp.SUM, group=mesh_group(mesh))
-        output["energy"] = energy_global
-
-        return consolidate_sharded_outputs(
-            output,
-            model_config=self._wrapper.model_config,
-            world_size=self._world_size,
-            owned_only_outputs=self._spec.owned_only_outputs,
-            all_reduce_outputs=self._spec.all_reduce_outputs,
-            halo_config=self._halo_config,
-        )
-
-    def _call_halo_storage(
-        self,
-        sharded: "ShardedBatch",
-        wired_fields: "dict[str, Any] | None" = None,
-    ) -> dict[str, Any]:
-        """Halo-storage forward.
-
-        Preconditions (typically set up by :class:`DomainParallel` via
-        ``HaloExchangeHook`` + ``NeighborListHook`` before each call, or
-        manually in benchmark / test harnesses):
-
-        - ``sharded.padded_batch`` is populated
-          (see :func:`nvalchemi.distributed.particle_halo.halo_exchange`).
-        - The padded batch has a neighbor list
-          (e.g. ``compute_neighbors(sharded.padded_batch, cfg)``).
-
-        If either is missing, the adapter falls back to doing both here
-        — convenient for one-shot calls but avoids the per-step NL cost
-        that makes skin-amortized NL worthwhile.
-        """
-        from nvalchemi.distributed.particle_halo import halo_exchange
-
-        compute_forces = self._needs_forces()
-
-        # Fallback: populate the padded view if the caller didn't.
-        if sharded.padded_batch is None:
-            halo_exchange(sharded, self._halo_config, compute_forces=compute_forces)
-
-        padded_batch = sharded.padded_batch
-        meta = sharded.halo_meta
-
-        # Flag a degenerate halo partition once, up front.
-        self._check_partition_health(meta, padded_batch.positions.device)
-
-        # Fallback: compute NL on the padded block if it isn't already there.
-        if (
-            getattr(padded_batch, "neighbor_matrix", None) is None
-            and getattr(padded_batch, "neighbor_list", None) is None
-        ):
-            compute_neighbors(
-                padded_batch, config=self._wrapper.model_config.neighbor_config
-            )
-        # Mark halo-receiver edges so the wrapper's ``(edge_index < n_atoms)``
-        # filter drops them; see the helper's docstring for the rationale.
-        _mark_halo_receiver_edges_as_padding(padded_batch, meta.n_owned)
-
-        # Update per-step ctx state so the wrapper's ``adapt_input`` reads it.
-        self._dist_ctx.policy = self._spec.distribution.policy
-        self._dist_ctx.halo_meta = meta
-        self._dist_ctx.halo_config = self._halo_config
-        # Expose the persistent cap dict so a wrapper that pads inside its own
-        # forward grows the same caps via current_dd_context().cap_state.
-        self._dist_ctx.cap_state = self._cap_state
-
-        # Fixed-shape padding (compile-only): pad to per-rank caps so the
-        # compiled energy graph sees static atom/edge counts. Active only when
-        # the model uses the energy-autograd force strategy and compile was
-        # requested; eager instances skip padding entirely.
-        _cp = self._spec.compile
-        _dd_compile = bool(
-            _cp is not None
-            and _cp.forces_via_autograd
-            and self._dd_compile_requested
-        )
-        if wired_fields and _dd_compile:
-            raise NotImplementedError(
-                "wired_fields (cross-model field injection) is only supported "
-                "on the eager distributed path, not compiled."
-            )
-        _pad_active = _dd_compile
-        _orig_atoms = _orig_edges = None
-        if _pad_active:
-            from nvalchemi.distributed.graph_padder import resolve_cap  # noqa: PLC0415
-
-            # max_send required this step. ``meta.send_sizes`` is identical on
-            # every rank, so ranks grow this cap in lockstep and the halo
-            # all_to_all sizes stay matched. It's a send-buffer cap, not a
-            # graph-shape cap (the graph padder owns those), so it lives here.
-            _ms_req = max((max(r) for r in meta.send_sizes), default=0)
-            resolve_cap(
-                self._cap_state, "max_send", _ms_req,
-                initial_factor=1.20, grow_factor=1.30, stride=16,
-            )
-            # The padded view is transient — only the compiled forward needs
-            # fixed shapes. Stash the real-sized storage groups to restore after
-            # the forward, since ``halo_exchange`` reuses ``padded_batch`` in
-            # place and a cap-sized buffer would mismatch next step.
-            _groups = padded_batch._storage.groups
-            _orig_atoms = _groups.get("atoms")
-            _orig_edges = _groups.get("edges")
-            # Pad to the atom/edge caps from ``self._cap_state`` (grow-only).
-            self._graph_padder.pad(padded_batch, self._cap_state)
-
-        # Make the live per-step context ambient for the wrapper's forward, so
-        # context-aware helpers and adapter bodies read it through
-        # ``current_dd_context()``.
-        if _dd_compile:
-            # Compiled energy-autograd forward, framework-owned: the wrapper runs
-            # energy-only on plain tensors with the halo routing threaded as
-            # graph inputs; the framework consolidates per-node energy and takes
-            # the force autograd.
-            with activate_dd_context(self._dist_ctx):
-                output = self._compiled_energy_autograd_forward(
-                    padded_batch, meta, sharded.num_graphs
-                )
-        else:
-            # Cross-model wired fields: overwrite named per-atom inputs with an
-            # upstream model's owned values, gathered into this model's ghost
-            # layout via the autograd-aware halo exchange. Runs before promotion
-            # so the gathered (grad-carrying) tensor is what gets wrapped; its
-            # backward scatter-adds ghost grads to the producing rank's owner.
-            if wired_fields:
-                from nvalchemi.distributed._core.particle_halo import (  # noqa: PLC0415
-                    halo_forward_exchange,
-                )
-
-                _atoms = padded_batch._atoms_group
-                for _name, _owned in wired_fields.items():
-                    _atoms[_name] = halo_forward_exchange(
-                        _owned, meta, self._halo_config
-                    )
-            # Eager: promote ``positions`` (and other primary per-atom inputs)
-            # to ShardTensors so custom ops see a ShardTensor input and the
-            # per-layer halo correction fires.
-            _promote_positions_to_shardtensor(
-                padded_batch, self._spec, meta, self._halo_config,
-                sharded.num_graphs, None,
-            )
-            # A model that builds + compiles its own graph declares a
-            # ``graph_padder`` without ``forces_via_autograd``: the framework
-            # can't pad the Batch (the graph only exists once ``adapt_input``
-            # runs), so it publishes the padder on the context for the wrapper to
-            # apply, then unpads after the forward.
-            _eager_padder = (
-                _cp.graph_padder
-                if (
-                    _cp is not None
-                    and _cp.graph_padder is not None
-                    and not _cp.forces_via_autograd
-                )
-                else None
-            )
-            self._dist_ctx.graph_padder = _eager_padder
-            # A wrapper that delegates its per-system energy reduction to the
-            # framework (``spec.node_energy_key``) emits raw per-node energies
-            # under that key; widen active outputs so the forward produces them,
-            # then reduce owned-aware below. Restored in ``finally``.
-            _nek = self._spec.node_energy_key
-            _mc = self._wrapper.model_config
-            _saved_active = None
-            if _nek is not None and _nek not in _mc.active_outputs:
-                _saved_active = _mc.active_outputs
-                _mc.active_outputs = set(_saved_active) | {_nek}
-            with activate_dd_context(self._dist_ctx):
-                try:
-                    output = self._wrapper(padded_batch)
-                    if _eager_padder is not None:
-                        output = _eager_padder.unpad(output)
-                    if _nek is not None and _nek in output:
-                        output = self._reduce_node_energy(
-                            output, _nek, padded_batch, sharded.num_graphs
-                        )
-                finally:
-                    if _eager_padder is not None:
-                        _eager_padder.restore()
-                    if _saved_active is not None:
-                        _mc.active_outputs = _saved_active
-        # Under compile, forces/stress come from autograd over the global
-        # energy, so they need the halo-reverse consolidation rather than the
-        # eager owned-only slice — drop them from owned_only. Eager keeps the
-        # declared slice.
-        owned_only = self._spec.owned_only_outputs
-        if _dd_compile:
-            owned_only = owned_only - self._wrapper.model_config.autograd_outputs
-        result = consolidate_padded_outputs(
-            output,
-            model_config=self._wrapper.model_config,
-            meta=meta,
-            halo_config=self._halo_config,
-            world_size=self._world_size,
-            owned_only_outputs=owned_only,
-            all_reduce_outputs=self._spec.all_reduce_outputs,
-            output_kinds=self._spec.output_kinds,
-        )
-        if _pad_active:
-            _groups = padded_batch._storage.groups
-            if _orig_atoms is not None:
-                _groups["atoms"] = _orig_atoms
-            if _orig_edges is not None:
-                _groups["edges"] = _orig_edges
-        return result
 
     def _reduce_node_energy(
         self,

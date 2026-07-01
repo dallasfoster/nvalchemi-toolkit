@@ -155,7 +155,7 @@ def _compile_worker(rank: int, world_size: int) -> None:
     dist.broadcast(f_ref, src=0)
 
     wrapper = PMEModelWrapper(cutoff=_PME_CUT, hybrid_forces=False)
-    cp = wrapper.distribution_spec.compile
+    cp = wrapper.distribution_spec().compile
     assert cp is not None and cp.forces_via_autograd, (
         "PME(hybrid_forces=False) must declare a forces_via_autograd CompilePolicy"
     )

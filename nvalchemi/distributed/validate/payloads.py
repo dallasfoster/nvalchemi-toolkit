@@ -104,6 +104,24 @@ def _extract_cutoff(wrapper: Any) -> float:
     return float(getattr(wrapper, "cutoff", 5.0))
 
 
+def _lexsort_rows(t: torch.Tensor) -> torch.Tensor:
+    """Sort the rows of ``t`` lexicographically by their full feature vector.
+
+    Permutation-invariant over the first (atom) dimension while keeping each
+    row's vector intact — so two outputs match only if the *set of per-atom
+    vectors* agrees, not merely the multiset of scalar values. 1-D inputs
+    (per-graph scalars) reduce to a plain value sort.
+    """
+    if t.dim() <= 1:
+        return t.sort().values
+    flat = t.reshape(t.shape[0], -1)
+    order = torch.arange(flat.shape[0], device=t.device)
+    # Stable sort by each column, last column first → lexicographic by row.
+    for col in range(flat.shape[1] - 1, -1, -1):
+        order = order[torch.argsort(flat[order, col], stable=True)]
+    return t[order]
+
+
 def _diff_outputs(
     ref: dict[str, torch.Tensor], got: dict[str, torch.Tensor]
 ) -> tuple[dict[str, float], dict[str, float]]:
@@ -153,12 +171,22 @@ def _diff_outputs(
         else:
             elem_diff = float((v64 - gv64).abs().max().item())
 
-        ref_flat_sorted = v64.flatten().sort().values
-        got_flat_sorted = gv64.flatten().sort().values
-        if ref_flat_sorted.shape != got_flat_sorted.shape:
+        # Permutation-invariant compare that PRESERVES the vector dimensions:
+        # sort whole rows lexicographically rather than flattening. Flattening
+        # mixed atoms and components together, so a force with values on the
+        # wrong axis (or wrong atom) could compare equal; row-sorting keeps each
+        # atom's vector intact, so a scrambled component no longer matches.
+        # (Full per-atom-ID matching — the strongest check — additionally needs a
+        # stable atom id threaded through the gather; tracked as a follow-up.)
+        if v64.shape[1:] != gv64.shape[1:]:
             agg_diff = float("inf")
         else:
-            agg_diff = float((ref_flat_sorted - got_flat_sorted).abs().max().item())
+            ref_sorted = _lexsort_rows(v64)
+            got_sorted = _lexsort_rows(gv64)
+            if ref_sorted.shape != got_sorted.shape:
+                agg_diff = float("inf")
+            else:
+                agg_diff = float((ref_sorted - got_sorted).abs().max().item())
 
         worst = min(elem_diff, agg_diff)
         abs_diff[k] = float(worst)

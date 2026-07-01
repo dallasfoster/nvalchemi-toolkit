@@ -70,15 +70,24 @@ import torch.distributed as dist
 from loguru import logger
 
 from nvalchemi.data import AtomicData, Batch
-from nvalchemi.distributed import DomainConfig, DomainParallel
+from nvalchemi.distributed import DomainConfig, DomainParallel, HookScope
 from nvalchemi.dynamics import HostMemory, NVTLangevin
 from nvalchemi.dynamics.base import DynamicsStage
 from nvalchemi.dynamics.hooks import SnapshotHook
 from nvalchemi.hooks import NeighborListHook
 
-# Reuse the SiO2 supercell builder from the benchmark suite — one
-# canonical periodic test system across the distributed examples.
-sys.path.insert(0, str(Path(__file__).parent))
+# Skip the heavy distributed launch during the Sphinx-Gallery docs build (it has
+# no torchrun environment), mirroring examples 01 and 02.
+_DOCS_BUILD = os.environ.get("NVALCHEMI_SPHINX_BUILD") == "1"
+_DISTRIBUTED_ENV = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+# Reuse the SiO2 supercell builder from the benchmark suite — one canonical
+# periodic test system across the distributed examples. The shared helper lives
+# under ``benchmark/distributed`` (repo_root/benchmark/distributed), so add THAT
+# to the path, not the example's own directory.
+sys.path.insert(
+    0, str(Path(__file__).resolve().parents[2] / "benchmark" / "distributed")
+)
 from _benchmark_common import build_sio2_supercell  # noqa: E402
 
 # ----------------------------------------------------------------------
@@ -191,6 +200,17 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Docs build / no torchrun: there is no process group to join, so skip the
+    # launch instead of failing in init_process_group (guard matches examples
+    # 01 and 02).
+    if _DOCS_BUILD or not _DISTRIBUTED_ENV:
+        logger.info(
+            "Not running under torchrun — skipping the distributed run. "
+            "Launch with: torchrun --nproc_per_node=N "
+            "examples/distributed/03_mace_nvt_distributed.py"
+        )
+        return
+
     # ----- Process group setup -----
     # ``torchrun`` populates RANK / WORLD_SIZE / LOCAL_RANK; we just
     # bind to the assigned device and init the process group.
@@ -297,6 +317,11 @@ def main() -> None:
         sink=trajectory_sink,
         frequency=args.snapshot_every,
     )
+    # RANK_ZERO scope: DomainParallel gathers the FULL system onto rank 0 and
+    # runs the hook only there, so the trajectory contains every atom. Without a
+    # scope the hook defaults to LOCAL and each rank would record only its own
+    # owned shard (rank 0's snapshot would be a fraction of the system).
+    snapshot_hook.scope = HookScope.RANK_ZERO
 
     # ----- Inner integrator -----
     # NVTLangevin owns the per-graph thermostat state and the

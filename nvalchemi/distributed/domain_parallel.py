@@ -31,14 +31,21 @@ import torch
 import torch.distributed as dist
 
 from nvalchemi.distributed._core.gather_primitives import mesh_group
+from nvalchemi.distributed._dynamics_coordinator import (
+    DynamicsDistributionCoordinator,
+)
 from nvalchemi.distributed.config import DomainConfig, HookScope
+from nvalchemi.distributed.strategy import (
+    MigrationPlan,
+    ParallelizationStrategy,
+    strategy_for_policy,
+)
 from nvalchemi.dynamics.base import BaseDynamics, DynamicsStage
 from nvalchemi.hooks._context import HookContext
 
 if TYPE_CHECKING:
     from nvalchemi.data.batch import Batch
     from nvalchemi.distributed.distributed_model import DistributedModel
-    from nvalchemi.distributed.partitioner import SpatialPartitioner
     from nvalchemi.distributed.sharded_batch import ShardedBatch
 
 logger = logging.getLogger(__name__)
@@ -84,8 +91,13 @@ class DomainParallel(BaseDynamics):
         self._dynamics: BaseDynamics = dynamics
         self._config: DomainConfig = config
 
+        # Globalizes thermodynamic state for NHC/NPT/NPH; inert for NVE/Langevin
+        # and the single-process / world-size-1 paths. Built in partition() once
+        # the strategy exists (it owns the reductions).
+        self._thermo: DynamicsDistributionCoordinator | None = None
+
         # Lazy-initialized in partition().
-        self._partitioner: SpatialPartitioner | None = None
+        self._strategy: ParallelizationStrategy | None = None
         self._sharded_batch: ShardedBatch | None = None
         self._dist_model: DistributedModel | None = None
 
@@ -93,14 +105,12 @@ class DomainParallel(BaseDynamics):
         self._n_owned: int = 0
         self._forces_primed: bool = False
 
-        # Deferred-migration state. The consensus all_reduce that decides
-        # whether to reshard is issued ``async_op=True`` at the END of step N
-        # and read at the START of step N+1, hiding its latency under the
-        # intervening hooks + pre_update. Migration ordering is unchanged in
-        # physical time: atoms that crossed at end-of-N still migrate before
-        # any compute in N+1.
-        self._pending_migrate_work: Any = None
-        self._pending_migrate_flag: torch.Tensor | None = None
+        # Deferred-migration state. The strategy issues an async consensus
+        # all_reduce at the END of step N and consumes it at the START of step
+        # N+1, hiding its latency under the intervening hooks + pre_update.
+        # Migration ordering is unchanged in physical time: atoms that crossed at
+        # end-of-N still migrate before any compute in N+1.
+        self._pending_plan: MigrationPlan | None = None
 
         # Rank resolution — prefer mesh, fall back to global dist rank, else 0.
         if config.mesh is not None:
@@ -153,7 +163,6 @@ class DomainParallel(BaseDynamics):
             ``.to_local()`` views of the ShardedBatch's ShardTensors).
         """
         from nvalchemi.distributed.distributed_model import DistributedModel
-        from nvalchemi.distributed.sharded_batch import ShardedBatch
 
         # Single-process fallback — no distribution, just pass through. Gate on
         # the default group's world size too (not just ``is_initialized``) so a
@@ -167,35 +176,33 @@ class DomainParallel(BaseDynamics):
 
         mesh = self._config.mesh
 
-        # Scatter the full batch. ``ShardedBatch.from_batch`` broadcasts
-        # cell/pbc from src and builds the partitioner from the config. Halo is
-        # the only storage policy, so the partition is always spatial.
-        partition_mode = "spatial"
-
-        self._sharded_batch = ShardedBatch.from_batch(
-            batch=batch,
-            mesh=mesh,
-            config=self._config,
-            src=0,
-            partition_mode=partition_mode,
-        )
-        self._n_owned = self._sharded_batch.n_owned
-
-        # Reuse the partitioner built by ``from_batch`` (same config +
-        # broadcast cell/pbc as we'd feed any re-construction). Shared
-        # with ``DistributedModel``'s halo config so migration and halo
-        # exchange can't disagree on domain boundaries.
-        from nvalchemi.distributed.partitioner import SpatialPartitioner
-
-        self._partitioner = self._sharded_batch.partitioner or SpatialPartitioner(
-            config=self._config,
-            cell_matrix=self._sharded_batch.cell,
-            pbc=self._sharded_batch.pbc,
-        )
-
         # Adapter around the inner dynamics' model. Owns halo exchange,
-        # NL rebuild, and output consolidation.
+        # NL rebuild, and output consolidation. Built first so the strategy can
+        # be selected from its resolved storage policy.
         self._dist_model = DistributedModel(self._dynamics.model, self._config)
+
+        # The parallelization strategy owns data layout, cell tracking,
+        # migration, and reductions for this run — selected from the model's
+        # storage policy so a new strategy plugs in without a driver type-switch.
+        self._strategy = strategy_for_policy(
+            self._dist_model._spec.distribution.policy,
+            self._config,
+            self._domain_rank,
+        )
+
+        # Coordinator globalizes NHC/NPT/NPH thermodynamic state via the
+        # strategy's reductions (integrator declares intent; inert otherwise).
+        self._thermo = DynamicsDistributionCoordinator(
+            self._dynamics, self._strategy
+        )
+
+        # Scatter the full batch across the mesh. The strategy chooses the
+        # partition layout (spatial for halo, contiguous-block for graph
+        # parallel); ``from_batch`` broadcasts cell/pbc from src and builds the
+        # partitioner. The persistent ShardedBatch is shared with the halo config
+        # so migration and halo exchange can't disagree on domain boundaries.
+        self._sharded_batch = self._strategy.scatter(batch, mesh, self._config, src=0)
+        self._n_owned = self._sharded_batch.n_owned
 
         return self._sharded_batch.local_batch
 
@@ -227,10 +234,15 @@ class DomainParallel(BaseDynamics):
 
         dyn = self._dynamics
         dyn._ensure_state_initialized(batch)
+        # Globalize per-shard DOF + derived controller masses once the inner
+        # state exists (no-op for NVE/Langevin and the single-process path).
+        self._thermo.globalize_dof(batch)
 
-        # 2. Pre-update on owned batch (velocity-Verlet half-kick).
+        # 2. Pre-update on owned batch (velocity-Verlet half-kick). The reduce
+        # scope makes NHC/NPT/NPH couple to mesh-global kinetic state.
         dyn._call_hooks(DynamicsStage.BEFORE_PRE_UPDATE, batch)
-        dyn.pre_update(batch)
+        with self._thermo.reduce_scope():
+            dyn.pre_update(batch)
         dyn._call_hooks(DynamicsStage.AFTER_PRE_UPDATE, batch)
 
         # 3. Wrap positions into the periodic box.
@@ -243,8 +255,11 @@ class DomainParallel(BaseDynamics):
 
         # 7. Post-update (velocity-Verlet finalize).
         dyn._call_hooks(DynamicsStage.BEFORE_POST_UPDATE, batch)
-        dyn.post_update(batch)
+        with self._thermo.reduce_scope():
+            dyn.post_update(batch)
         dyn._call_hooks(DynamicsStage.AFTER_POST_UPDATE, batch)
+        # Keep the replicated controller + cell state byte-identical across ranks.
+        self._thermo.broadcast_state(batch)
 
         # 8. Atom migration — DEFERRED. We dispatch the consensus
         # all_reduce here (async); the result is consumed at the start
@@ -261,6 +276,24 @@ class DomainParallel(BaseDynamics):
         dyn.step_count += 1
 
         converged = dyn._check_convergence(batch)
+        # Convergence must be a mesh-wide decision: each rank only sees its own
+        # atoms, so ranks can disagree and take divergent control flow (one stops
+        # while others continue → collective desync / hang). Reduce to the AND
+        # across the domain — converged only when EVERY rank is converged.
+        if (
+            converged is not None
+            and dist.is_initialized()
+            and self._config.mesh is not None
+        ):
+            flag = torch.tensor(
+                [1 if bool(converged) else 0],
+                device=batch.positions.device,
+                dtype=torch.int64,
+            )
+            dist.all_reduce(
+                flag, op=dist.ReduceOp.MIN, group=mesh_group(self._config.mesh)
+            )
+            converged = bool(flag.item())
         dyn._last_converged = converged
         if converged is not None:
             dyn._call_hooks(DynamicsStage.ON_CONVERGE, batch)
@@ -396,132 +429,39 @@ class DomainParallel(BaseDynamics):
     # ------------------------------------------------------------------
 
     def _dispatch_async_migrate_check(self, batch: Batch) -> None:
-        """Issue the consensus all_reduce that decides whether ANY rank's
-        atoms crossed a boundary this step. Result is consumed at the
-        START of the next step in :meth:`_resolve_pending_migrate`.
-
-        We deliberately discard ``new_rank`` here — it gets recomputed
-        fresh in the resolver if migration fires. Recomputation is cheap
-        (one cell-list ``floor(positions @ inv_cell)`` pass; the
-        ``inv_cell`` is cached on the partitioner) and avoids holding a
-        stale rank assignment across hook calls that could mutate
-        positions (barostats, freezers, etc.).
-
-        """
-        if self._partitioner is None or not dist.is_initialized():
+        """Ask the strategy to decide (async) whether atoms crossed a boundary
+        this step. The result is consumed at the START of the next step in
+        :meth:`_resolve_pending_migrate`. No-op for strategies that don't
+        migrate (graph parallel)."""
+        if self._strategy is None or self._sharded_batch is None:
             return
-        # Hysteresis-aware: flag migration only when an atom has LEFT this
-        # rank's domain expanded by the hysteresis margin (not merely crossed the
-        # bare boundary) — stops thrashing of atoms vibrating across the plane.
-        h = self._config.effective_migration_hysteresis()
-        leaving = ~self._partitioner.keeps_owner(
-            batch.positions, self._domain_rank, h
-        )
-        flag = leaving.any().to(torch.int32).view(1)
-        group = mesh_group(self._config.mesh)
-        work = dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=group, async_op=True)
-        self._pending_migrate_flag = flag
-        self._pending_migrate_work = work
+        self._pending_plan = self._strategy.plan_migration(self._sharded_batch, batch)
 
     def _resolve_pending_migrate(self, batch: Batch) -> Batch:
-        """Wait on the previous step's deferred migrate-or-not consensus
-        and migrate atoms if any crossed a boundary. Called at the START
+        """Consume the previous step's deferred migrate-or-not decision and let
+        the strategy reshard atoms that crossed a boundary. Called at the START
         of every step (after the first); a no-op until the first
-        ``_dispatch_async_migrate_check`` has run.
+        ``_dispatch_async_migrate_check`` has run and for non-migrating
+        strategies.
 
-        The async dispatch was issued at end-of-previous-step, so by the
-        time we get here the all_reduce has typically completed in the
-        background while the CPU was running AFTER_STEP hooks and the
-        next step's pre_update hooks. The ``.item()`` here is therefore
-        a near-instant memory fetch, not a forced GPU sync.
+        The async dispatch was issued at end-of-previous-step, so by the time we
+        get here the consensus has typically completed in the background while
+        the CPU ran AFTER_STEP + next-step pre_update hooks — a near-instant
+        memory fetch, not a forced GPU sync.
         """
-        if self._pending_migrate_work is None:
+        plan = self._pending_plan
+        if plan is None or not plan.is_pending or self._sharded_batch is None:
             return batch
-        self._pending_migrate_work.wait()
-        needs = bool(self._pending_migrate_flag.item())
-        self._pending_migrate_work = None
-        self._pending_migrate_flag = None
-        if not needs:
-            return batch
-
-        logger.info(
-            "[rank %d] step %d: migrating atoms (deferred consensus)",
-            self._domain_rank,
-            self.step_count,
-        )
-
-        from nvalchemi.distributed._core.reshard import reshard_by_destination
-
-        device = batch.positions.device
-        # Recompute the rank assignment from the latest positions —
-        # AFTER_STEP hooks could have nudged positions between dispatch
-        # and resolve, and we want the migration to be based on what's
-        # in batch right now.
-        # Hysteresis-aware destinations: atoms still within this rank's
-        # expanded domain KEEP this rank (else the reshard would move band atoms
-        # anyway, defeating hysteresis); only atoms that have left get their
-        # natural spatial rank.
-        h = self._config.effective_migration_hysteresis()
-        keep = self._partitioner.keeps_owner(batch.positions, self._domain_rank, h)
-        natural = self._partitioner.assign_atoms_to_ranks(batch.positions)
-        new_rank = torch.where(
-            keep,
-            torch.full_like(natural, self._domain_rank),
-            natural,
-        ).to(torch.int64)
-        mesh = self._config.mesh
-
-        # Reshard each per-atom field independently (preserves dtypes).
-        fields: dict[str, torch.Tensor] = {"positions": batch.positions}
-        for name in ("atomic_numbers", "atomic_masses", "velocities", "forces"):
-            val = getattr(batch, name, None)
-            if val is not None:
-                fields[name] = val
-
-        new_fields: dict[str, torch.Tensor] = {
-            name: reshard_by_destination(tensor, new_rank, mesh)
-            for name, tensor in fields.items()
-        }
-
-        new_batch = self._build_batch_from_fields(new_fields, device)
-        if getattr(batch, "cell", None) is not None:
-            new_batch.cell = batch.cell.clone()
-        if getattr(batch, "pbc", None) is not None:
-            new_batch.pbc = batch.pbc.clone()
-        if getattr(batch, "energy", None) is not None:
-            new_batch.energy = batch.energy.clone()
-
-        self._n_owned = new_fields["positions"].shape[0]
-
-        # Refresh the persistent ShardedBatch to match the new layout and
-        # invalidate the padded view — migration changes rank ownership,
-        # so the halo routing and any cached NL are stale.
-        if self._sharded_batch is not None:
-            self._sharded_batch.update_from_batch(new_batch)
-            self._sharded_batch.invalidate_padded_view()
-
+        self._pending_plan = None
+        new_batch = self._strategy.apply_migration(self._sharded_batch, batch, plan)
+        if new_batch is not batch:
+            self._n_owned = self._sharded_batch.n_owned
+            logger.info(
+                "[rank %d] step %d: migrated atoms (deferred consensus)",
+                self._domain_rank,
+                self.step_count,
+            )
         return new_batch
-
-    @staticmethod
-    def _build_batch_from_fields(
-        fields: dict[str, torch.Tensor], device: torch.device
-    ) -> Batch:
-        from nvalchemi.data.atomic_data import AtomicData
-        from nvalchemi.data.batch import Batch as BatchCls
-
-        data = AtomicData(
-            positions=fields["positions"],
-            atomic_numbers=fields.get(
-                "atomic_numbers", torch.zeros(0, dtype=torch.long, device=device)
-            ),
-        )
-        if "atomic_masses" in fields:
-            data.atomic_masses = fields["atomic_masses"]
-        if "velocities" in fields:
-            data.add_node_property("velocities", fields["velocities"])
-        if "forces" in fields:
-            data.add_node_property("forces", fields["forces"])
-        return BatchCls.from_data_list([data], device=device)
 
     # ------------------------------------------------------------------
     # Position wrapping
@@ -536,9 +476,13 @@ class DomainParallel(BaseDynamics):
         if cell is None or pbc is None or not pbc.any():
             return
 
+        # Convention is ``cart = frac @ cell`` (cell rows are lattice vectors),
+        # so the inverse is ``frac = cart @ inv(cell)`` — NOT ``inv(cell).T``.
+        # The two agree only for orthogonal cells (diagonal inverse); the ``.T``
+        # wrapped atoms incorrectly in skewed / triclinic cells.
         cell_3x3 = cell.squeeze(0)
         inv_cell = torch.linalg.inv(cell_3x3)
-        frac = batch.positions @ inv_cell.T
+        frac = batch.positions @ inv_cell
         pbc_mask = pbc.squeeze(0)
         frac[:, pbc_mask] = frac[:, pbc_mask] % 1.0
         batch.positions = frac @ cell_3x3
@@ -559,6 +503,21 @@ class DomainParallel(BaseDynamics):
         # Sync the latest local state into the ShardedBatch before gathering.
         self._sharded_batch.update_from_batch(local_batch)
         return self._sharded_batch.full_batch(dst=dst)
+
+    def _gather_all(self, local_batch: Batch) -> Batch:
+        """Gather the full system onto **every** rank (for GLOBAL-scope hooks).
+
+        Single-process fallback returns ``local_batch`` unchanged. The per-system
+        ``energy`` is already globally reduced + replicated by the forward, so it
+        is carried through as-is (never re-reduced).
+        """
+        if not dist.is_initialized() or self._sharded_batch is None:
+            return local_batch
+        self._sharded_batch.update_from_batch(local_batch)
+        full = self._sharded_batch.to_global_batch()
+        if getattr(local_batch, "energy", None) is not None:
+            full.energy = local_batch.energy.clone()
+        return full
 
     # ------------------------------------------------------------------
     # Hook overrides
@@ -599,9 +558,15 @@ class DomainParallel(BaseDynamics):
             scope = getattr(hook, "scope", HookScope.LOCAL)
 
             if scope == HookScope.GLOBAL:
-                if dist.is_initialized() and getattr(batch, "energy", None) is not None:
-                    dist.all_reduce(batch.energy, op=dist.ReduceOp.SUM)
-                hook(ctx, stage)
+                # GLOBAL means the hook sees the COMPLETE system. Gather the full
+                # batch onto every rank (not the local shard) and run the hook on
+                # the gathered batch. Do NOT re-reduce ``energy``: the forward's
+                # consolidation already all-reduced it to the global value and
+                # replicated it per rank, so summing again would multiply it by
+                # the rank count.
+                full = self._gather_all(batch)
+                ctx_full = self._build_context(full) if full is not None else ctx
+                hook(ctx_full, stage)
 
             elif scope == HookScope.RANK_ZERO:
                 full_batch = self.gather(batch, dst=0)
@@ -650,13 +615,12 @@ class DomainParallel(BaseDynamics):
         multiple times."""
         # Drain any pending deferred migrate-or-not all_reduce so the
         # NCCL work handle doesn't outlive the process group.
-        if self._pending_migrate_work is not None:
+        if self._pending_plan is not None and self._pending_plan.is_pending:
             try:
-                self._pending_migrate_work.wait()
+                self._pending_plan.work.wait()
             except Exception:  # noqa: S110 — teardown best-effort
                 pass
-            self._pending_migrate_work = None
-            self._pending_migrate_flag = None
+        self._pending_plan = None
         if self._dist_model is not None:
             self._dist_model.close()
 

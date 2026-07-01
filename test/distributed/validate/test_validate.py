@@ -138,7 +138,7 @@ class TestSpecSerialization:
         from nvalchemi.models.pme import PMEModelWrapper
 
         w = PMEModelWrapper(cutoff=5.0)
-        spec = w.distribution_spec
+        spec = w.distribution_spec()
         d = spec.to_dict()
         spec2 = MLIPSpec.from_dict(d)
 
@@ -336,7 +336,7 @@ class TestDistributedModelSpecArg:
         assert dm._spec is custom_spec
         assert dm._spec.distribution.policy.scatter_mode == "local"
         # Wrapper's own property is unchanged.
-        assert wrapper.distribution_spec.distribution.policy.scatter_mode == "halo_correction"
+        assert wrapper.distribution_spec().distribution.policy.scatter_mode == "halo_correction"
 
     def test_falls_back_to_wrapper_property_when_no_spec(self):
         from nvalchemi.distributed.config import DomainConfig

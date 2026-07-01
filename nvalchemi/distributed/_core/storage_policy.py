@@ -209,13 +209,6 @@ class StoragePolicy(Protocol):
         framework type-switch."""
         ...
 
-    def run_forward(
-        self, dist_model: Any, sharded: Any, wired_fields: Any
-    ) -> "dict[str, Any]":
-        """Run this strategy's distributed forward and return the consolidated
-        outputs. The framework dispatches the forward through here."""
-        ...
-
     def to_dict(self) -> dict[str, Any]:
         """JSON-friendly ``{"kind": ..., ...}`` record; inverse is the ``kind``
         registered via :func:`register_policy_kind`."""
@@ -297,13 +290,6 @@ class PlainShard:
         return out
 
     def build_topology(self, config: Any, sharded: Any) -> Any:
-        raise NotImplementedError(
-            "PlainShard is storage-only and not a selectable forward strategy."
-        )
-
-    def run_forward(
-        self, dist_model: Any, sharded: Any, wired_fields: Any
-    ) -> "dict[str, Any]":
         raise NotImplementedError(
             "PlainShard is storage-only and not a selectable forward strategy."
         )
@@ -458,11 +444,6 @@ class HaloStoragePolicy:
         )
         return partitioner, halo_config
 
-    def run_forward(
-        self, dist_model: Any, sharded: Any, wired_fields: Any
-    ) -> "dict[str, Any]":
-        return dist_model._call_halo_storage(sharded, wired_fields=wired_fields)
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "kind": "halo",
@@ -535,11 +516,6 @@ class GraphParallelPolicy(PlainShard):
 
         return IndexPartitioner(config=config), None
 
-    def run_forward(
-        self, dist_model: Any, sharded: Any, wired_fields: Any
-    ) -> "dict[str, Any]":
-        return dist_model._call_graph_parallel(sharded, wired_fields=wired_fields)
-
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "graph_parallel"}
 
@@ -584,11 +560,6 @@ class GraphReplicatePolicy(PlainShard):
         )
 
         return IndexPartitioner(config=config), None
-
-    def run_forward(
-        self, dist_model: Any, sharded: Any, wired_fields: Any
-    ) -> "dict[str, Any]":
-        return dist_model._call_graph_replicate(sharded, wired_fields=wired_fields)
 
     def to_dict(self) -> dict[str, Any]:
         return {"kind": "graph_replicate"}

@@ -267,7 +267,7 @@ class _LJWithWrongSpec:
     def distribution_spec(self):
         from dataclasses import replace
 
-        base = self._inner.distribution_spec
+        base = self._inner.distribution_spec()
         # Add a deliberately-wrong all_reduce_outputs.
         return replace(base, all_reduce_outputs=frozenset({"energy"}))
 

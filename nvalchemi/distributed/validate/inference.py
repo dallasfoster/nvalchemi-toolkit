@@ -60,7 +60,8 @@ def _infer_spec_from_trace(
     For wrappers that *don't* declare a spec, we fall back to a
     conservative default and rely on auto-fix to refine.
     """
-    spec = getattr(wrapper, "distribution_spec", None)
+    _ds = getattr(wrapper, "distribution_spec", None)
+    spec = _ds() if callable(_ds) else _ds
     if spec is not None:
         return spec
     # Conservative default for wrappers that haven't declared one.

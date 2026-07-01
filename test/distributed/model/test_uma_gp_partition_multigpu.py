@@ -38,7 +38,7 @@ import torch.multiprocessing as mp
 from ase.build import bulk
 
 from nvalchemi.data import AtomicData, Batch
-from nvalchemi.distributed.config import DomainConfig
+from nvalchemi.distributed.config import DomainConfig, StrategyKind
 
 _CKPT = os.environ.get("NVALCHEMI_UMA_CKPT", "uma-s-1p1")
 _TASK = os.environ.get("NVALCHEMI_UMA_TASK", "omat")
@@ -64,7 +64,6 @@ def _build_bcc_fe(dtype=torch.float32):
 def _worker(rank: int, world_size: int) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29909"
-    os.environ["NVALCHEMI_UMA_GP"] = "partition"
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl", rank=rank, world_size=world_size, timeout=_PG_TIMEOUT
@@ -127,7 +126,7 @@ def _worker(rank: int, world_size: int) -> None:
         )
 
         mesh = DeviceMesh("cuda", list(range(world_size)), mesh_dim_names=("domain",))
-        cfg = DomainConfig(cutoff=float(wrapper.cutoff), skin=0.0, mesh=mesh)
+        cfg = DomainConfig(cutoff=float(wrapper.cutoff), skin=0.0, mesh=mesh, strategy=StrategyKind.GRAPH_PARTITION)
         full = _mk() if rank == 0 else None
         sharded = ShardedBatch.from_batch(
             full, mesh=mesh, config=cfg, src=0, partition_mode="contiguous_block"

@@ -207,9 +207,11 @@ class PMEModelWrapper(nn.Module, BaseModelMixin):
     # BaseModelMixin required properties
     # ------------------------------------------------------------------
 
-    @property
-    def distribution_spec(self) -> Any:
+    def distribution_spec(self, strategy: Any = None) -> Any:
         """Domain-decomposition spec for the PME wrapper.
+
+        Halo-only; the ``strategy`` argument is accepted for the framework
+        contract and ignored.
 
         Four ops get owned-slice + all-reduce handlers so the reciprocal-space
         pathway sees globally-correct quantities: the spline-spread ops

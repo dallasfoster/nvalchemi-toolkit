@@ -1028,8 +1028,7 @@ class UMAWrapper(nn.Module, BaseModelMixin):
         """Radial cutoff (Å) for neighbor-list construction."""
         return self._cutoff
 
-    @property
-    def distribution_spec(self) -> Any:
+    def distribution_spec(self, strategy: Any = None) -> Any:
         """MLIPSpec for UMA under domain decomposition.
 
         Each rank computes a full forward over its ``owned + ghost`` atoms on plain
@@ -1045,15 +1044,15 @@ class UMAWrapper(nn.Module, BaseModelMixin):
             The memoized halo spec: boundary adapters, empty ``shard_fields``, and
             a :class:`CompilePolicy` carrying the graph padder.
         """
-        import os  # noqa: PLC0415
+        from nvalchemi.distributed.config import StrategyKind  # noqa: PLC0415
 
-        # Opt-in graph-parallel strategy. ``=1`` → node-replicate (full nodes,
-        # edge shard, per-layer all-reduce; same boundary adapters as halo).
-        # ``=partition`` → node-partition (owned node slice, per-layer node-feature
-        # all-gather; its own minimal adapter set). Each cached separately.
-        gp_mode = os.environ.get("NVALCHEMI_UMA_GP")
-        gp = gp_mode == "1"
-        partition = gp_mode == "partition"
+        # Config-selected graph-parallel strategy. GRAPH_REPLICATE → node-replicate
+        # (full nodes, edge shard, per-layer all-reduce; same boundary adapters as
+        # halo). GRAPH_PARTITION → node-partition (owned node slice, per-layer
+        # node-feature all-gather; its own minimal adapter set). Each cached
+        # separately.
+        gp = strategy == StrategyKind.GRAPH_REPLICATE
+        partition = strategy == StrategyKind.GRAPH_PARTITION
         cache_attr = (
             "_dist_spec_gp_part_cache"
             if partition

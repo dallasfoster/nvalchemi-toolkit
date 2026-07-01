@@ -345,9 +345,12 @@ class AIMNet2Wrapper(nn.Module, BaseModelMixin):
     # Distributed hooks
     # ------------------------------------------------------------------
 
-    @property
-    def distribution_spec(self) -> Any:
+    def distribution_spec(self, strategy: Any = None) -> Any:
         """MLIPSpec describing AIMNet2 under domain decomposition.
+
+        Halo-only for now (graph parallel is P1/P2, out of the essential gate);
+        the ``strategy`` argument is accepted for the framework contract and
+        ignored.
 
         Returns
         -------

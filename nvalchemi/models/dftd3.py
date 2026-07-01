@@ -540,9 +540,11 @@ class DFTD3ModelWrapper(nn.Module, BaseModelMixin):
     # BaseModelMixin required properties
     # ------------------------------------------------------------------
 
-    @property
-    def distribution_spec(self) -> Any:
+    def distribution_spec(self, strategy: Any = None) -> Any:
         """Domain-decomposition spec for DFT-D3(BJ).
+
+        Halo-only; the ``strategy`` argument is accepted for the framework
+        contract and ignored.
 
         DFTD3 has no global coupling (coordination numbers, C6 interpolation,
         and the dispersion sum are all within-cutoff), so it needs no cross-rank

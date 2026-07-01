@@ -186,7 +186,7 @@ def _nocueq_gate_worker(rank: int, world_size: int) -> None:
     wrapper = MACEWrapper.from_checkpoint(
         "small", device=device, dtype=dtype, enable_cueq=False
     )
-    _cp = wrapper.distribution_spec.compile
+    _cp = wrapper.distribution_spec().compile
     assert _cp is not None and _cp.forces_via_autograd, (
         "non-cueq MACE must declare the framework energy-autograd force strategy "
         "(CompilePolicy.force_strategy) that drives the COO caps path; the "

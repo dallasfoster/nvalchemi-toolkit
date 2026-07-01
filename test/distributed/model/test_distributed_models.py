@@ -180,7 +180,7 @@ def test_lj_wrapper_declares_halo_spec() -> None:
     kernels' outputs are wrapped back into halo ShardTensors under
     distribution."""
     wrapper = LennardJonesModelWrapper(epsilon=0.0104, sigma=3.40, cutoff=8.5)
-    spec = wrapper.distribution_spec
+    spec = wrapper.distribution_spec()
 
     # Still halo in the fundamentals.
     policy = spec.distribution.policy
@@ -198,7 +198,7 @@ def test_lj_wrapper_declares_halo_spec() -> None:
         assert op.gather_inputs == ()
 
     # Cached / stable across accesses (built once per call is fine; content equal).
-    assert wrapper.distribution_spec.distribution.custom_ops[0].op is spec.distribution.custom_ops[0].op
+    assert wrapper.distribution_spec().distribution.custom_ops[0].op is spec.distribution.custom_ops[0].op
 
 
 def test_mace_wrapper_declares_mpnn_halo_spec() -> None:
@@ -208,7 +208,7 @@ def test_mace_wrapper_declares_mpnn_halo_spec() -> None:
         from nvalchemi.models.mace import MACEWrapper
 
     wrapper = MACEWrapper.from_checkpoint("small", dtype=torch.float64)
-    spec = wrapper.distribution_spec
+    spec = wrapper.distribution_spec()
     # Same scatter-heavy MPNN halo fundamentals as SPEC_MPNN_HALO ...
     assert isinstance(spec.distribution.policy, HaloStoragePolicy)
     assert spec.distribution.policy == SPEC_MPNN_HALO.distribution.policy
@@ -232,17 +232,26 @@ def test_mace_wrapper_declares_mpnn_halo_spec() -> None:
         "marshal",
     ) in method_targets
     # Idempotent / cached on repeated access.
-    assert wrapper.distribution_spec is spec
+    assert wrapper.distribution_spec() is spec
 
 
 def test_mace_cueq_wrapper_declares_custom_ops_spec() -> None:
-    """``MACEWrapper(enable_cueq=True)`` returns a MACE-specific spec
-    that extends ``SPEC_MPNN_HALO`` with the four
-    ``torch.ops.cuequivariance.*`` kernels the cueq'd MACE forward
-    touches: ``fused_tensor_product`` (+ its two backwards, each with
-    ``scatter_outputs=(0,)`` for halo correction on the message tensor)
-    plus pass-through wraps for the node-local ops ``uniform_1d``,
+    """``MACEWrapper(enable_cueq=True)`` returns a MACE-specific spec that
+    extends ``SPEC_MPNN_HALO`` with the seven ``torch.ops.cuequivariance.*``
+    kernels the cueq'd MACE forward touches, **all as pass-through wraps**
+    (unwrap → run → re-wrap; ``gather_inputs=()`` / ``scatter_outputs=()``):
+    ``fused_tensor_product`` (+ its two backwards), ``uniform_1d``,
     ``indexed_linear_B/C``, ``segmented_transpose``.
+
+    The conv's cross-rank (halo) correction does **not** ride the fused
+    kernel's ``scatter_outputs``. It lives in the mode-dependent conv-unfuse
+    adapter (``_cueq_conv_unfuse_adapters``): under eager DD the conv is unfused
+    to the external gather + ``scatter_sum`` (the halo handler fires on that
+    external scatter, joining plain MACE); under compiled DD the conv stays
+    fused for memory parity and the per-layer refresh adapter's
+    ``scatter_to_owners`` carries correctness. Numerical DD correctness is gated
+    by ``test_mace_cueq_dist_model_equivalence_2ranks``; this test only asserts
+    the declared op-adapter structure.
     """
     pytest.importorskip("mace", reason="mace-torch not installed")
     pytest.importorskip("cuequivariance", reason="cuequivariance not installed")
@@ -277,22 +286,20 @@ def test_mace_cueq_wrapper_declares_custom_ops_spec() -> None:
     # But now with custom_ops populated (non-cueq variant has () ).
     assert len(spec.distribution.custom_ops) == 7
 
-    # Verify the conv_fusion ops have ``scatter_outputs=(0,)`` (halo
-    # correction on message tensor) and node-local ops are pass-through.
+    # Every cueq op is a pass-through wrap (no gather/scatter on the op itself):
+    # the conv's halo correction lives in the conv-unfuse adapter + the external
+    # scatter's halo handler, not on the fused kernel. (Pre-#104 the fused ops
+    # carried ``scatter_outputs=(0,)``; that message-tensor correction moved off
+    # the kernel when the conv-unfuse adapter took over — see the docstring.)
     by_op_name = {
         # OpOverload's name is e.g. "cuequivariance::fused_tensor_product"
         str(op_spec.op._schema.name): op_spec
         for op_spec in spec.distribution.custom_ops
     }
-    assert by_op_name["cuequivariance::fused_tensor_product"].scatter_outputs == (0,)
-    assert by_op_name["cuequivariance::fused_tensor_product_bwd"].scatter_outputs == (
-        0,
-    )
-    assert by_op_name[
-        "cuequivariance::fused_tensor_product_bwd_bwd"
-    ].scatter_outputs == (0,)
-    # Node-local — no halo work.
     for name in (
+        "cuequivariance::fused_tensor_product",
+        "cuequivariance::fused_tensor_product_bwd",
+        "cuequivariance::fused_tensor_product_bwd_bwd",
         "cuequivariance::uniform_1d",
         "cuequivariance::indexed_linear_B",
         "cuequivariance::indexed_linear_C",
@@ -913,7 +920,7 @@ def _dist_model_equivalence_worker(
     # Partition mode tracks the wrapper's storage policy — spatial for
     # halo-storage (LJ, MACE), contiguous-block for sharded-storage
     # (AIMNet2).
-    _policy = dist_wrapper.distribution_spec.distribution.policy
+    _policy = dist_wrapper.distribution_spec().distribution.policy
     _storage = "halo" if isinstance(_policy, HaloStoragePolicy) else "sharded"
     sharded, local_mask, domain_config = _sharded_batch_for_system(
         positions,
@@ -1402,7 +1409,7 @@ def test_aimnet2_wrapper_declares_halo_spec() -> None:
 
     # AIMNet2 is halo-only: local-neighbor storage with declared per-layer
     # ghost-refresh (ConvSV / Coulomb heads) + owned-only mol_sum reduce.
-    spec = wrapper.distribution_spec
+    spec = wrapper.distribution_spec()
     assert isinstance(spec.distribution.policy, HaloStoragePolicy)
     # The halo refresh/reduce adapters ride third_party_helpers (mol_sum +
     # ConvSV + LRCoulomb + SRCoulomb), with no gather custom_ops.

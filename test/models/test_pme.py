@@ -931,7 +931,7 @@ class TestPMEDistributionWiring:
         from nvalchemi.distributed._core.storage_policy import HaloStoragePolicy
 
         w = _make_pme()
-        spec = w.distribution_spec
+        spec = w.distribution_spec()
         policy = spec.distribution.policy
         assert isinstance(policy, HaloStoragePolicy)
         assert policy.scatter_mode == "halo_correction"
@@ -946,7 +946,7 @@ class TestPMEDistributionWiring:
         two slab-correction moment ops — single + batched for each family.
         """
         w = _make_pme()
-        spec = w.distribution_spec
+        spec = w.distribution_spec()
         assert len(spec.distribution.custom_ops) == 6
         op_names = {str(os.op) for os in spec.distribution.custom_ops}
         expected = {
@@ -968,7 +968,7 @@ class TestPMEDistributionWiring:
         all-reduce three (mz, mz2, qtotal).
         """
         w = _make_pme()
-        spec = w.distribution_spec
+        spec = w.distribution_spec()
         expected = {
             "nvalchemiops.spline_spread.default": ((0, 1), (0,)),
             "nvalchemiops.batch_spline_spread.default": ((0, 1, 2), (0,)),

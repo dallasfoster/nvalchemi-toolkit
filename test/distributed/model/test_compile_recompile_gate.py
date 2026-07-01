@@ -124,7 +124,7 @@ def _recompile_gate_worker(rank: int, world_size: int) -> None:
     wrapper = MACEWrapper.from_checkpoint(
         "small", device=device, dtype=dtype, enable_cueq=True
     )
-    _cp = wrapper.distribution_spec.compile
+    _cp = wrapper.distribution_spec().compile
     assert _cp is not None and _cp.forces_via_autograd, (
         "this gate must exercise the framework caps path — MACE must declare a "
         "framework energy-autograd CompilePolicy (force_strategy); the spec "

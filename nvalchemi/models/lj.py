@@ -153,9 +153,11 @@ class LennardJonesModelWrapper(nn.Module, BaseModelMixin):
     # Distributed hook
     # ------------------------------------------------------------------
 
-    @property
-    def distribution_spec(self) -> Any:
+    def distribution_spec(self, strategy: Any = None) -> Any:
         """MLIPSpec for the Lennard-Jones wrapper under domain decomposition.
+
+        Halo-only; the ``strategy`` argument is accepted for the framework
+        contract and ignored (LJ ships no graph-parallel spec).
 
         The LJ Warp kernels are opaque to sharded tensors, so each is wrapped
         in an :class:`OpAdapter` that unwraps to local tensors for the kernel

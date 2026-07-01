@@ -162,7 +162,6 @@ class ShardedBatch(ShardedCollection):
         cell: torch.Tensor,
         pbc: torch.Tensor,
         n_global: int,
-        partitioner: SpatialPartitioner | None = None,
         partition_mode: str = "spatial",
     ) -> None:
         super().__init__(
@@ -173,23 +172,12 @@ class ShardedBatch(ShardedCollection):
         self.cell = cell
         self.pbc = pbc
         self._n_global = n_global
-        # Spatial decomposition built from the broadcast geometry during
-        # :meth:`from_batch`. Cached here so downstream consumers
-        # (``DomainParallel`` for atom migration, ``DistributedModel``
-        # for halo config) don't re-build it from the same inputs.
-        self._partitioner = partitioner
         # Storage flavour. ``"spatial"`` / ``"contiguous_block"`` both use
         # ShardTensor with ``Shard(0)`` placement (per-rank ``n_owned`` rows);
-        # they differ only in how the rank assignment is computed.
+        # they differ only in how the rank assignment is computed. The
+        # spatial-halo layout (ghost padding, partitioner) is the concern of the
+        # :class:`HaloShardState` subclass, not this generic base.
         self._partition_mode = partition_mode
-        # Per-rank local padded view (owned + halo rows). Populated by
-        # :func:`nvalchemi.distributed.particle_halo.halo_exchange`. Holds
-        # plain tensors (not ShardTensors) packed into a standard ``Batch``
-        # — models consume it via ``DistributedModel`` exactly like a
-        # single-system Batch, and ``compute_neighbors`` / ``NeighborListHook``
-        # operate on it unchanged. ``None`` until ``halo_exchange`` runs.
-        self.padded_batch: Batch | None = None
-        self.halo_meta: ParticleHaloMetadata | None = None
 
     @staticmethod
     def _policies_for(field_names: list[str]) -> dict[str, StoragePolicy]:
@@ -201,54 +189,6 @@ class ShardedBatch(ShardedCollection):
         assignment is computed upstream, not in the storage policy.
         """
         return {name: PlainShard() for name in field_names}
-
-    # ------------------------------------------------------------------
-    # Padded view management (halo-storage path)
-    # ------------------------------------------------------------------
-
-    def invalidate_padded_view(self) -> None:
-        """Drop the cached padded view and halo metadata. Called after
-        atom migration or any operation that changes which atoms are
-        owned by which rank. Next ``halo_exchange`` will repopulate."""
-        self.padded_batch = None
-        self.halo_meta = None
-
-    def pad_padded_view_to_caps(self, n_pad_max: int, e_max: int) -> None:
-        """Pad the halo-padded view to fixed shapes for ``torch.compile``.
-
-        Pads per-atom fields to ``n_pad_max`` atoms and per-edge fields to
-        ``e_max`` edges on the generic Batch storage, so the compiled DD graph
-        sees static atom/edge counts across steps (otherwise per-step migration
-        / NL-rebuild vary the counts and trigger per-rank recompiles).
-
-        Parameters
-        ----------
-        n_pad_max : int
-            Fixed per-atom row count to pad to.
-        e_max : int
-            Fixed per-edge row count to pad to.
-
-        Notes
-        -----
-        Pad rows (``[n_padded, n_pad_max)``) carry zero values and join the
-        last graph; their node outputs are dropped by the owned-only
-        consolidation. Invalid edges and edge fill are routed to an isolated
-        dead node (row ``n_pad_max - 1``) as self-loops, with
-        ``neighbor_list_shifts`` set to the ``[1, 0, 0]`` image so the edge
-        vector is non-degenerate (a zero vector NaNs through MLIP spherical
-        harmonics). Per-rank caps are safe: the cross-rank halo collectives key
-        on the consensus ``max_send``, not on ``n_pad_max``. Raises on cap
-        overflow (grow-on-overflow is layered on by the caller). A thin
-        delegator to :class:`~nvalchemi.distributed.graph_padder.COOPadder` for
-        callers that hold a ``ShardedBatch`` and have resolved explicit caps.
-        """
-        from nvalchemi.distributed.graph_padder import (  # noqa: PLC0415
-            _pad_coo_to_caps,
-        )
-
-        if self.padded_batch is None:
-            return
-        _pad_coo_to_caps(self.padded_batch, n_pad_max, e_max)
 
     # ------------------------------------------------------------------
     # Properties
@@ -305,19 +245,6 @@ class ShardedBatch(ShardedCollection):
         """Number of graphs (systems) — replicated across ranks. Currently
         inferred as 1 for the single-system domain-decomposition case."""
         return 1
-
-    @property
-    def partitioner(self) -> SpatialPartitioner | None:
-        """Spatial decomposition built from the broadcast geometry during
-        :meth:`from_batch`. Shared by downstream consumers that would
-        otherwise re-build it from the same ``config`` / ``cell`` / ``pbc``.
-
-        Returns ``None`` when the ShardedBatch was constructed outside
-        :meth:`from_batch` (e.g. gloo-harness test helpers). Consumers should
-        fall back to building a partitioner from ``config`` + ``self.cell`` /
-        ``pbc`` in that case.
-        """
-        return self._partitioner
 
     @property
     def rank_assignment(self) -> torch.Tensor:
@@ -447,11 +374,14 @@ class ShardedBatch(ShardedCollection):
         n_global = int(n_global_t.item())
 
         # --- Build partitioner from broadcast geometry + config ---
-        # Only used in ``spatial`` mode, but retained on the returned
-        # ShardedBatch unconditionally so downstream code that consults
-        # ``sharded.partitioner`` (skin tracking, ghost padding) still
-        # has something to read in ``contiguous_block`` mode too.
-        partitioner = SpatialPartitioner(config=config, cell_matrix=cell, pbc=pbc)
+        # Spatial (halo) mode only: the ghost partition + skin/migration tracking
+        # live on the returned :class:`HaloShardState`. ``contiguous_block``
+        # (graph parallel) is geometry-free and never consults a partitioner.
+        partitioner = (
+            SpatialPartitioner(config=config, cell_matrix=cell, pbc=pbc)
+            if partition_mode == "spatial"
+            else None
+        )
 
         # --- Chemistry prep on src: assign atoms to ranks, order the
         # per-atom fields to match, declare each field's storage policy.
@@ -526,15 +456,20 @@ class ShardedBatch(ShardedCollection):
             src=src,
         )
 
-        return ShardedBatch(
+        # Each strategy gets its natural ShardState: the spatial-halo layout
+        # carries the partitioner + ghost view (:class:`HaloShardState`); graph
+        # parallel gets the generic base (no halo baggage).
+        common = dict(
             mesh=mesh,
             atom_fields=coll.fields,
             cell=cell,
             pbc=pbc,
             n_global=n_global,
-            partitioner=partitioner,
             partition_mode=partition_mode,
         )
+        if partition_mode == "spatial":
+            return HaloShardState(partitioner=partitioner, **common)
+        return ShardedBatch(**common)
 
     # ------------------------------------------------------------------
     # Local view: per-rank owned rows as a plain Batch
@@ -648,6 +583,10 @@ class ShardedBatch(ShardedCollection):
     # Syncing back: replaced tensors → ShardTensor storage
     # ------------------------------------------------------------------
 
+    def _on_cell_synced(self) -> None:
+        """Hook after :meth:`update_from_batch` refreshes ``self.cell``. No-op on
+        the generic base; :class:`HaloShardState` re-tracks its partitioner."""
+
     def update_from_batch(self, batch: Batch) -> None:
         """Sync non-in-place tensor replacements from *batch* back into
         the ``ShardTensor`` backing storage.
@@ -659,6 +598,18 @@ class ShardedBatch(ShardedCollection):
         from torch.distributed.tensor import Shard
 
         from nvalchemi.distributed._core._st_backend import ShardTensor
+
+        # Sync the per-graph cell back too: a barostat (NPT/NPH) mutates
+        # ``batch.cell`` each step, and the persistent ShardedBatch's cell drives
+        # both the gathered/global batch and downstream halo/neighbor builds. Left
+        # stale at the partition-time value, the gather would report the initial
+        # cell and the compute would use the wrong PBC box.
+        cell = getattr(batch, "cell", None)
+        if cell is not None:
+            self.cell = cell.detach().clone()
+            # Halo tracks the deformed box on its partitioner (see
+            # :meth:`HaloShardState._on_cell_synced`); the generic base no-ops.
+            self._on_cell_synced()
 
         # Atom migration can change this rank's local row count, invalidating
         # the old ``sharding_shapes``. Whether n_owned drifted is per-rank
@@ -716,3 +667,90 @@ class ShardedBatch(ShardedCollection):
         out = torch.empty(world_size, dtype=torch.long, device=device)
         dist.all_gather_into_tensor(out, my_t, group=group)
         return [int(x) for x in out.tolist()]
+
+
+class HaloShardState(ShardedBatch):
+    """Spatial-halo :class:`ShardedBatch`: owned rows + a ghost-padded view.
+
+    The concretion the :class:`~nvalchemi.distributed.strategy.HaloStrategy`
+    produces. It adds the halo-specific state on top of the generic base: the
+    :class:`~nvalchemi.distributed.partitioner.SpatialPartitioner` (rank
+    assignment + skin/migration tracking), and the per-rank ``padded_batch`` /
+    ``halo_meta`` populated by
+    :func:`~nvalchemi.distributed.particle_halo.halo_exchange`. Graph-parallel
+    strategies use the plain base and never carry any of this.
+    """
+
+    def __init__(
+        self,
+        mesh: DeviceMesh,
+        atom_fields: dict[str, Any],
+        cell: torch.Tensor,
+        pbc: torch.Tensor,
+        n_global: int,
+        partitioner: SpatialPartitioner | None = None,
+        partition_mode: str = "spatial",
+    ) -> None:
+        super().__init__(
+            mesh=mesh,
+            atom_fields=atom_fields,
+            cell=cell,
+            pbc=pbc,
+            n_global=n_global,
+            partition_mode=partition_mode,
+        )
+        # Spatial decomposition built from the broadcast geometry during
+        # :meth:`ShardedBatch.from_batch`. Cached so downstream consumers
+        # (``DomainParallel`` migration, ``DistributedModel`` halo config)
+        # don't re-build it from the same inputs.
+        self._partitioner = partitioner
+        # Per-rank local padded view (owned + halo rows). Populated by
+        # :func:`nvalchemi.distributed.particle_halo.halo_exchange`. Holds plain
+        # tensors packed into a standard ``Batch`` — models consume it via
+        # ``DistributedModel`` exactly like a single-system Batch, and
+        # ``compute_neighbors`` / ``NeighborListHook`` operate on it unchanged.
+        # ``None`` until ``halo_exchange`` runs.
+        self.padded_batch: Batch | None = None
+        self.halo_meta: ParticleHaloMetadata | None = None
+
+    @property
+    def partitioner(self) -> SpatialPartitioner | None:
+        """Spatial decomposition built from the broadcast geometry during
+        :meth:`ShardedBatch.from_batch`. ``None`` when constructed outside
+        ``from_batch`` (e.g. gloo-harness helpers); consumers then rebuild it
+        from ``config`` + ``self.cell`` / ``pbc``.
+        """
+        return self._partitioner
+
+    def _on_cell_synced(self) -> None:
+        # A barostat deforms the box, so the partitioner (used by halo exchange
+        # + migration) must track it — else ghost regions and rank assignment
+        # use the stale partition-time cell.
+        if self._partitioner is not None:
+            self._partitioner.update_cell(self.cell)
+
+    def invalidate_padded_view(self) -> None:
+        """Drop the cached padded view and halo metadata. Called after atom
+        migration or any operation that changes which atoms are owned by which
+        rank. Next ``halo_exchange`` will repopulate."""
+        self.padded_batch = None
+        self.halo_meta = None
+
+    def pad_padded_view_to_caps(self, n_pad_max: int, e_max: int) -> None:
+        """Pad the halo-padded view to fixed shapes for ``torch.compile``.
+
+        Pads per-atom fields to ``n_pad_max`` atoms and per-edge fields to
+        ``e_max`` edges on the generic Batch storage, so the compiled DD graph
+        sees static atom/edge counts across steps (otherwise per-step migration
+        / NL-rebuild vary the counts and trigger per-rank recompiles). A thin
+        delegator to :func:`~nvalchemi.distributed.graph_padder._pad_coo_to_caps`
+        for callers that hold a ``HaloShardState`` and have resolved explicit
+        caps; no-op until the padded view exists.
+        """
+        from nvalchemi.distributed.graph_padder import (  # noqa: PLC0415
+            _pad_coo_to_caps,
+        )
+
+        if self.padded_batch is None:
+            return
+        _pad_coo_to_caps(self.padded_batch, n_pad_max, e_max)

@@ -365,7 +365,7 @@ def _make_aimnet2_only_calc_masks():
     from nvalchemi.distributed.spec import MLIPSpec
 
     inner = _make_real_aimnet2()
-    base_spec = inner.distribution_spec
+    base_spec = inner.distribution_spec()
     spoof_core = dataclasses.replace(
         base_spec.distribution,
         third_party_helpers=(

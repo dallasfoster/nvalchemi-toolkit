@@ -83,8 +83,7 @@ Worked example::
     def _envelopes_plain(r, cutoff):
         return ((r < cutoff).float() * (1 - r / cutoff) ** 2)
 
-    @property
-    def distribution_spec(self):
+    def distribution_spec(self, strategy=None):
         return MLIPSpec(
             distribution=DistributionSpec(
                 policy=HaloStoragePolicy(),

@@ -103,6 +103,27 @@ class SpatialPartitioner:
         # ``.to(device=, dtype=)`` is a no-op when device+dtype already match.
         self._inv_cell: torch.Tensor = torch.linalg.inv(self.cell_matrix)
 
+    def update_cell(self, cell_matrix: torch.Tensor) -> None:
+        """Refresh the physical cell when a barostat (NPT/NPH) deforms the box.
+
+        Recomputes ``cell_matrix`` and its cached inverse; the fractional cell
+        grid (``cells_per_dim``) and rank layout are intentionally kept fixed so
+        rank assignment stays consistent as the box scales — only the physical
+        size of each grid cell changes. Halo regions (``rank_to_cell_bounds`` →
+        cartesian via ``cell_matrix``) and the fractional ghost width scale with
+        the updated cell automatically. Without this, the partitioner keeps the
+        partition-time box: as the cell grows, wrapped positions fall outside it
+        (fractional coords ≥ 1) and ``assign_atoms_to_ranks`` misroutes atoms.
+
+        Note: this handles cell *scaling* (the fix for barostat expansion). Large
+        *contraction* additionally needs the cell grid / neighbor-rank set to
+        adapt (the ghost region spans more grid cells as the box shrinks); that
+        adaptive-grid work is not covered here.
+        """
+        cm = cell_matrix.squeeze(0) if cell_matrix.ndim == 3 else cell_matrix
+        self.cell_matrix = cm.detach()
+        self._inv_cell = torch.linalg.inv(self.cell_matrix)
+
     # ------------------------------------------------------------------
     # Initialization helpers
     # ------------------------------------------------------------------
