@@ -74,7 +74,7 @@
 | uvicorn                            | 0.49.0     | BSD-3-Clause                                           | https://uvicorn.dev/                                                                                        |
 | websockets                         | 16.0       | BSD-3-Clause                                           | https://github.com/python-websockets/websockets                                                             |
 | Werkzeug                           | 3.1.8      | BSD-3-Clause                                           | https://github.com/pallets/werkzeug/                                                                        |
-| psycopg2-binary                    | 2.9.12     | GNU Library or Lesser General Public License (LGPL)    | https://psycopg.org/                                                                                        |
+| psycopg2-binary                    | 2.9.12     | LGPL-3.0-or-later                                      | https://psycopg.org/                                                                                        |
 | ase_db_backends                    | 0.11.0     | LGPL-2.1-or-later                                      | UNKNOWN                                                                                                     |
 | bibtexparser                       | 1.4.4      | LGPLv3 or BSD                                          | https://github.com/sciunto-org/python-bibtexparser                                                          |
 | nvidia-libnvcomp-cu12              | 5.1.0.21   | LICENSE AGREEMENT FOR NVIDIA SOFTWARE DEVELOPMENT KITS | https://developer.nvidia.com/nvcomp                                                                         |

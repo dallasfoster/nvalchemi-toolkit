@@ -17571,7 +17571,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 psycopg2-binary
 2.9.12
-GNU Library or Lesser General Public License (LGPL)
+LGPL-3.0-or-later
 /home/dallasf/code/nvalchemi-toolkit/.venv-licenses/lib/python3.11/site-packages/psycopg2_binary-2.9.12.dist-info/licenses/LICENSE
 psycopg2 and the LGPL
 ---------------------

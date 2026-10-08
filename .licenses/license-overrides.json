@@ -57,6 +57,10 @@
     "clusterscope": {
       "license": "MIT",
       "evidence": "bundled LICENSE: MIT License (Copyright 2020 Facebook)"
+    },
+    "psycopg2-binary": {
+      "license": "LGPL-3.0-or-later",
+      "evidence": "bundled LICENSE: 'GNU Lesser General Public License ... version 3 ... or (at your option) any later version' with OpenSSL linking exception; https://www.gnu.org/licenses/lgpl-3.0.en.html"
     }
   }
 }
